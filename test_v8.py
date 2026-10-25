@@ -242,7 +242,7 @@ class ProjectGroupingRegressions(unittest.TestCase):
             ("PR #41-43 複查", "/tmp/review-pr41-43/run.log"),
             ("pai 合併後狀態同步", "/tmp/pai-sync/run.log"),
             ("personal-ai-os 狀態整理", "/tmp/work/run.log"),
-            ("c1-runtime 清理", "/tmp/work/run.log"),
+            ("example-runtime 清理", "/tmp/personal-ai-os/example-runtime/run.log"),
             ("c2-migration 檢查", "/tmp/work/run.log"),
             ("雜項任務", "/tmp/personal-ai-os/run.log"),
             ("雜項任務", "/tmp/pr-43-fix/run.log"),
