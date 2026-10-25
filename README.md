@@ -145,14 +145,14 @@ name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model
 | `log_path` | yes | Log file to tail; `/dev/null` is allowed |
 | `last_report_path` | yes | `LAST.md` / `REPORT.md` style result file |
 | `pid` | no | Process id; a live PID means "running" |
-| `harness` | no | Display label, for example `Codex` |
-| `model` | no | Display label, for example `sonnet` |
+| `harness` | no | Display label, for example `agent-a` |
+| `model` | no | Display label, for example `model-x` |
 
 Example:
 
 ```text
-nightly build	20261025/build/run.log	20261025/build/LAST.md	48213	Codex	gpt-5
-docs pass	20261025/docs/run.log	20261025/docs/REPORT.md
+example-project build	example-project/build/run.log	example-project/build/LAST.md	48213	agent-a	model-x
+docs pass	example-project/docs/run.log	example-project/docs/REPORT.md
 ```
 
 Project grouping and the architecture tab are configured in `arch.json`. Point
@@ -182,7 +182,7 @@ test_v8.py                status and quota regression tests
 tests/test_night_watch.sh bash tests for scripts/night-watch.sh
 tests/fixtures/           quota JSON fixtures
 scripts/night-watch.sh    PID/result-report helper
-shots/                    text snapshot fixtures
+shots/                    neutral example output snapshots
 ARCH-HISTORY.md           design history of the architecture tab
 ```
 

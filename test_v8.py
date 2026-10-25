@@ -25,11 +25,11 @@ class StatusRegressions(unittest.TestCase):
 
     def test_real_partial_first_lines_override_completed_body(self):
         cases = {
-            "sc-pkg2": "判定：**PARTIAL**——轉換器已完成\n18/18 PASS\n",
-            "sc-pkg3": "判定：**PARTIAL** — 兩份捷徑已寫好\n已完成測試\n",
-            "sc-pkg3b": "判定：**PARTIAL** — 未完成建置\n20/20 通過\n",
-            "sc-pkg4": "判定：**PARTIAL**；已完成本機 commit\n",
-            "K1-F": "判定：**PARTIAL**；本輪未套用 live\n",
+            "pkg-2": "判定：**PARTIAL**——轉換器已完成\n18/18 PASS\n",
+            "pkg-3": "判定：**PARTIAL** — 兩份檔案已寫好\n已完成測試\n",
+            "pkg-3b": "判定：**PARTIAL** — 未完成建置\n20/20 通過\n",
+            "pkg-4": "判定：**PARTIAL**；已完成本機 commit\n",
+            "task-f": "判定：**PARTIAL**；本輪未套用 live\n",
         }
         for name, content in cases.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
@@ -37,7 +37,7 @@ class StatusRegressions(unittest.TestCase):
                 self.assertEqual(a.status, "partial")
                 self.assertIn("PARTIAL", a.latest)
 
-    def test_done_report_survives_missing_log_magpie(self):
+    def test_done_report_survives_missing_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = self.load(Path(tmp), "DONE\n正確報告\n", log=None)[0]
             self.assertEqual(a.status, "complete")
@@ -235,52 +235,65 @@ class QuotaRegressions(unittest.TestCase):
 class ProjectGroupingRegressions(unittest.TestCase):
     """Every configured grouping rule gets at least one concrete example."""
 
-    def test_personal_ai_os_rules(self):
+    def test_project_a_rules(self):
         cases = (
-            ("C1 退役備份（步驟 1-3a）", "/tmp/c1-retire/run.log"),
+            ("alpha 退役備份（步驟 1-3a）", "/tmp/alpha-retire/run.log"),
             ("PR #42 第二輪修正", "/tmp/fix2-pr42/run.log"),
             ("PR #41-43 複查", "/tmp/review-pr41-43/run.log"),
-            ("pai 合併後狀態同步", "/tmp/pai-sync/run.log"),
-            ("personal-ai-os 狀態整理", "/tmp/work/run.log"),
-            ("example-runtime 清理", "/tmp/personal-ai-os/example-runtime/run.log"),
-            ("c2-migration 檢查", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/personal-ai-os/run.log"),
+            ("pa 合併後狀態同步", "/tmp/pa-sync/run.log"),
+            ("project-a 狀態整理", "/tmp/work/run.log"),
+            ("example-runtime 清理", "/tmp/project-a/example-runtime/run.log"),
+            ("alpha-migration 檢查", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/project-a/run.log"),
             ("雜項任務", "/tmp/pr-43-fix/run.log"),
         )
         for name, log_path in cases:
             with self.subTest(name=name, log_path=log_path):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "personal-ai-os"
+                    watch.infer_project(name, Path(log_path)), "project-a"
                 )
 
-    def test_agent_watch_rule(self):
+    def test_example_project_rule(self):
         self.assertEqual(
-            watch.infer_project("agent-watch v8.1 修正", Path("/tmp/run.log")),
-            "agent-watch",
+            watch.infer_project("example-project v8.1 修正", Path("/tmp/run.log")),
+            "example-project",
         )
 
-    def test_ios_shortcuts_rules(self):
+    def test_project_b_rules(self):
         cases = (
             ("sc-pkg6 通知觸發", "/tmp/work/run.log"),
-            ("捷徑編譯修復", "/tmp/work/run.log"),
+            ("shortcut 編譯修復", "/tmp/work/run.log"),
             ("shortcut 匯入檢查", "/tmp/work/run.log"),
-            ("mac-intake 收件流程", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/ios-shortcut/run.log"),
+            ("project-b 收件流程", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/project-b/run.log"),
         )
         for name, log_path in cases:
             with self.subTest(name=name, log_path=log_path):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "ios-shortcuts"
+                    watch.infer_project(name, Path(log_path)), "project-b"
                 )
 
-    def test_k1_rule(self):
+    def test_project_c_rules(self):
         cases = (
-            ("K1 卡片回報規則", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/k1-report/run.log"),
+            ("kanban 卡片回報規則", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/project-c/run.log"),
         )
         for name, log_path in cases:
             with self.subTest(name=name, log_path=log_path):
-                self.assertEqual(watch.infer_project(name, Path(log_path)), "k1")
+                self.assertEqual(
+                    watch.infer_project(name, Path(log_path)), "project-c"
+                )
+
+    def test_project_d_rule(self):
+        cases = (
+            ("quota 新增工作組", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/project-d/run.log"),
+        )
+        for name, log_path in cases:
+            with self.subTest(name=name, log_path=log_path):
+                self.assertEqual(
+                    watch.infer_project(name, Path(log_path)), "project-d"
+                )
 
     def test_unmatched_task_stays_other(self):
         self.assertEqual(

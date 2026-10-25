@@ -107,9 +107,9 @@ class TestAgentWatch(unittest.TestCase):
     def test_command_identity_reads_executable_and_model_options_only(self):
         cases = (
             (
-                "/opt/homebrew/bin/opencode run --model opencode-go/deepseek-v4.1-flash "
+                "/opt/homebrew/bin/opencode run --model provider-a/model-x "
                 "'astra is only the task name'",
-                ("OpenCode", "opencode-go/deepseek-v4.1-flash"),
+                ("OpenCode", "provider-a/model-x"),
             ),
             ("claude --model sonnet 'please do not use --model astra'", ("Claude Code", "sonnet")),
             ("pi -m qwen3-coder 'implement a task'", ("Pi Agent", "qwen3-coder")),
@@ -128,13 +128,13 @@ class TestAgentWatch(unittest.TestCase):
             structured.write_text(
                 "# run metadata\n"
                 "# harness: OpenCode\n"
-                "# model: opencode-go/deepseek-v4.1-flash\n"
+                "# model: provider-a/model-x\n"
                 "task prompt: model: astra\n",
                 encoding="utf-8",
             )
             self.assertEqual(
                 read_log_metadata(structured),
-                ("OpenCode", "opencode-go/deepseek-v4.1-flash"),
+                ("OpenCode", "provider-a/model-x"),
             )
 
             ordinary = root / "ordinary.log"
@@ -149,7 +149,7 @@ class TestAgentWatch(unittest.TestCase):
                 returncode=0,
                 stdout=(
                     "/opt/homebrew/bin/opencode run --model "
-                    "opencode-go/deepseek-v4.1-flash 'prompt says model: astra'\n"
+                    "provider-a/model-x 'prompt says model: astra'\n"
                 ),
             )
             with patch("watch.subprocess.run", return_value=result) as run:
@@ -228,7 +228,7 @@ class TestAgentWatch(unittest.TestCase):
             log_path=Path("/tmp/run.log"),
             last_path=Path("/tmp/REPORT.md"),
             status="running",
-            model="opencode-go/deepseek-v4.1-flash",
+            model="provider-a/model-x",
             start_time=None,
             elapsed="時間未知",
             latest="正在整理報告",
@@ -237,12 +237,12 @@ class TestAgentWatch(unittest.TestCase):
         )
         for rendered in (render_active_flow([agent]), render_done_tasks([agent])):
             self.assertIn("OpenCode", rendered)
-            self.assertIn("opencode-go/deepseek-v4.1-flash", rendered)
+            self.assertIn("provider-a/model-x", rendered)
             self.assertIn("P2 核對模型來源", rendered)
 
     def test_is_valid_model(self):
         self.assertTrue(is_valid_model("gemini-3.8-flash"))
-        self.assertTrue(is_valid_model("group/sub-all-smart"))
+        self.assertTrue(is_valid_model("provider-b/model-y"))
         self.assertTrue(is_valid_model("claude-3-7-sonnet-20250219"))
         self.assertFalse(is_valid_model("model"))
         self.assertFalse(is_valid_model("snapshot.model"))
@@ -394,7 +394,7 @@ class TestAgentWatch(unittest.TestCase):
             log1 = tmppath / "agent1.log"
             log1.write_text(
                 "2026-10-24T10:00:00Z Session start\n"
-                "model: group/sub-all-smart\n"
+                "model: provider-b/model-y\n"
                 "Step 1: processing data\n"
                 "model = snapshot.model\n"
                 "10:05:00 Step 2: finishing up\n",
@@ -652,13 +652,13 @@ class TestAgentWatch(unittest.TestCase):
 
     def test_project_inference_uses_declared_table_and_safe_token_match(self):
         cases = (
-            ("agent-watch v8 修正", "/tmp/agent-watch-ui/v8/run.log", "agent-watch"),
-            ("pai 合併後狀態同步", "/tmp/pai-sync/run.log", "personal-ai-os"),
-            ("夜跑A：Mac 捷徑編譯修復", "/tmp/cherri-diag/run.log", "ios-shortcuts"),
-            ("K1 卡片回報規則", "/tmp/k1-report/run.log", "k1"),
-            ("magpie 新增工作組", "/tmp/magpie/run.log", "magpie"),
+            ("example-project build", "/tmp/example-project/run.log", "example-project"),
+            ("pa 合併後狀態同步", "/tmp/pa-sync/run.log", "project-a"),
+            ("shortcut 編譯修復", "/tmp/shortcut-diag/run.log", "project-b"),
+            ("kanban 卡片回報規則", "/tmp/project-c-report/run.log", "project-c"),
+            ("quota 新增工作組", "/tmp/quota/run.log", "project-d"),
             ("pair task", "/tmp/other/run.log", "other"),
-            ("PR #41 第二輪修正", "/tmp/fix2-pr41/run.log", "personal-ai-os"),
+            ("PR #41 第二輪修正", "/tmp/fix2-pr41/run.log", "project-a"),
         )
         for name, log_path, expected in cases:
             with self.subTest(name=name):
@@ -667,58 +667,58 @@ class TestAgentWatch(unittest.TestCase):
     def test_recent_done_is_top_highlighted_and_grouped(self):
         now = 1_700_200_000.0
         recent_agent = AgentInfo(
-            name="agent-watch 剛完成",
-            log_path=Path("/tmp/agent-watch-ui/v8/run.log"),
-            last_path=Path("/tmp/agent-watch-ui/v8/LAST.md"),
+            name="example-project 剛完成",
+            log_path=Path("/tmp/example-project/run.log"),
+            last_path=Path("/tmp/example-project/LAST.md"),
             status="complete",
-            model="gpt-5",
+            model="model-x",
             start_time=now - 300,
             elapsed="00:05:00",
             latest="DONE",
             harness="Codex",
             completion_time=now - 60,
-            project="agent-watch",
+            project="example-project",
         )
         older_agent = AgentInfo(
-            name="magpie 舊完成",
-            log_path=Path("/tmp/magpie/run.log"),
-            last_path=Path("/tmp/magpie/LAST.md"),
+            name="project-d 舊完成",
+            log_path=Path("/tmp/project-d/run.log"),
+            last_path=Path("/tmp/project-d/LAST.md"),
             status="complete",
-            model="gpt-5",
+            model="model-x",
             start_time=now - 20_000,
             elapsed="01:00:00",
             latest="DONE",
             harness="Codex",
             completion_time=now - RECENT_DONE_SECONDS - 1,
-            project="magpie",
+            project="project-d",
         )
         recent_magpie_agent = AgentInfo(
-            name="magpie 也剛完成",
-            log_path=Path("/tmp/magpie/run.log"),
-            last_path=Path("/tmp/magpie/LAST.md"),
+            name="project-d 也剛完成",
+            log_path=Path("/tmp/project-d/run.log"),
+            last_path=Path("/tmp/project-d/LAST.md"),
             status="complete",
-            model="gpt-5",
+            model="model-x",
             start_time=now - 300,
             elapsed="00:05:00",
             latest="DONE",
             harness="Codex",
             completion_time=now - 120,
-            project="magpie",
+            project="project-d",
         )
         recent, older = split_recent_done([older_agent, recent_magpie_agent, recent_agent], now)
         self.assertEqual(
             [agent.name for agent in recent],
-            ["agent-watch 剛完成", "magpie 也剛完成"],
+            ["example-project 剛完成", "project-d 也剛完成"],
         )
-        self.assertEqual([agent.name for agent in older], ["magpie 舊完成"])
+        self.assertEqual([agent.name for agent in older], ["project-d 舊完成"])
 
         markup = render_recent_done_tasks([older_agent, recent_magpie_agent, recent_agent], now=now)
         self.assertIn("剛完成", markup)
-        self.assertIn("agent-watch (1)", markup)
+        self.assertIn("example-project (1)", markup)
         self.assertIn("剛完成 [/]", markup)
-        self.assertLess(markup.index("agent-watch 剛完成"), markup.index("magpie 也剛完成"))
-        self.assertNotIn("magpie 舊完成", markup)
-        self.assertIn("magpie (1)", render_done_tasks(older))
+        self.assertLess(markup.index("example-project 剛完成"), markup.index("project-d 也剛完成"))
+        self.assertNotIn("project-d 舊完成", markup)
+        self.assertIn("Project D (1)", render_done_tasks(older))
 
     def test_active_work_is_grouped_by_project(self):
         agents = [
@@ -727,21 +727,21 @@ class TestAgentWatch(unittest.TestCase):
                 log_path=Path(f"/tmp/{project}/run.log"),
                 last_path=Path(f"/tmp/{project}/LAST.md"),
                 status="running",
-                model="gpt-5",
+                model="model-x",
                 start_time=None,
                 elapsed="時間未知",
                 latest="執行中",
                 project=project,
             )
             for name, project in (
-                ("agent-watch task", "agent-watch"),
-                ("magpie task", "magpie"),
+                ("example-project task", "example-project"),
+                ("project-d task", "project-d"),
             )
         ]
         markup = render_active_flow(agents)
-        self.assertIn("agent-watch (1)", markup)
-        self.assertIn("magpie (1)", markup)
-        self.assertLess(markup.index("agent-watch (1)"), markup.index("magpie (1)"))
+        self.assertIn("example-project (1)", markup)
+        self.assertIn("Project D (1)", markup)
+        self.assertLess(markup.index("example-project (1)"), markup.index("Project D (1)"))
 
     def test_live_pid_overrides_failed_report_and_log_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -991,9 +991,9 @@ class TestAgentWatch(unittest.TestCase):
                     await pilot.press("2")
                     self.assertEqual(tc.active, "tab-arch")
                     self.assertEqual(app.architecture_view_id, "now")
-                    self.assertEqual(app.architecture_project_id, "agent-watch")
+                    self.assertEqual(app.architecture_project_id, "example-project")
                     await pilot.press("p")
-                    self.assertEqual(app.architecture_project_id, "personal-ai-os")
+                    self.assertEqual(app.architecture_project_id, "project-a")
                     await pilot.press("f")
                     self.assertEqual(app.architecture_view_id, "future")
                     await pilot.press("n")
@@ -1025,11 +1025,11 @@ class TestAgentWatch(unittest.TestCase):
             runs = root / "runs.tsv"
             done = root / "done.tsv"
             runs.write_text(
-                f"agent-watch active\t{active_log}\t{active_last}\t\tCodex\tgroup/codex-sol-flash\n",
+                f"example-project active\t{active_log}\t{active_last}\t\tAgent A\tmodel-x\n",
                 encoding="utf-8",
             )
             done.write_text(
-                f"agent-watch review\t{done_log}\t{done_last}\t\tClaude Code\tsonnet\n",
+                f"example-project review\t{done_log}\t{done_last}\t\tReviewer\tmodel-w\n",
                 encoding="utf-8",
             )
             set_mtime(active_log, now + 1)
@@ -1086,9 +1086,9 @@ class TestAgentWatch(unittest.TestCase):
         future80_text = html.unescape(exported["arch-future-80x30.svg"]).replace("\xa0", " ")
         quota_text = html.unescape(exported["quota-100x35.svg"]).replace("\xa0", " ")
         self.assertIn("現在", arch_text)
-        self.assertIn("Grok Bot", arch_text)
-        self.assertIn("Hermes chief", arch_text)
-        self.assertIn("run-watcher.sh", arch_text)
+        self.assertIn("Coordinator", arch_text)
+        self.assertIn("Mobile entry", arch_text)
+        self.assertIn("watcher.sh", arch_text)
         self.assertIn("┌", arch_text)
         self.assertIn("▼", arch_text)
         self.assertIn("未來", future_text)
@@ -1096,10 +1096,10 @@ class TestAgentWatch(unittest.TestCase):
         self.assertIn("┌", future_text)
         self.assertIn("▼", future_text)
         self.assertIn("現在", arch80_text)
-        self.assertIn("Grok Bot", arch80_text)
+        self.assertIn("Coordinator", arch80_text)
         self.assertIn("┌", arch80_text)
         self.assertIn("▼", arch80_text)
-        self.assertIn("Claude Code · Planner", future80_text)
+        self.assertIn("Planner", future80_text)
         self.assertIn("┌", future80_text)
         self.assertIn("▼", future80_text)
         self.assertIn("服務額度用量", quota_text)
@@ -1132,137 +1132,137 @@ class TestAgentWatch(unittest.TestCase):
         """Architecture labels remain readable at 80 columns and narrow widths."""
         empty: List[AgentInfo] = []
         wide = render_architecture_view(
-            empty, width=100, view_id="future", project_id="agent-watch"
+            empty, width=100, view_id="future", project_id="example-project"
         )
-        self.assertIn("Claude Code · Planner", wide)
-        self.assertIn("Claude Code · Reviewer", wide)
+        self.assertIn("Planner", wide)
+        self.assertIn("Reviewer", wide)
 
         normal = render_architecture_view(
-            empty, width=80, view_id="future", project_id="agent-watch"
+            empty, width=80, view_id="future", project_id="example-project"
         )
-        self.assertIn("Claude Code · Planner", normal)
-        self.assertIn("Claude Code · Reviewer", normal)
+        self.assertIn("Planner", normal)
+        self.assertIn("Reviewer", normal)
         for line in normal.splitlines():
             plain = re.sub(r"\[/?[^\[\]]*\]", "", line)
             self.assertLessEqual(display_width(plain), 80)
 
         narrow = render_architecture_view(
-            empty, width=26, view_id="future", project_id="agent-watch"
+            empty, width=26, view_id="future", project_id="example-project"
         )
         self.assertIn("Planner", narrow)
         self.assertIn("┌", narrow)
 
         now_80 = render_architecture_view(
-            empty, width=80, view_id="now", project_id="agent-watch"
+            empty, width=80, view_id="now", project_id="example-project"
         )
-        self.assertIn("Claude Code", now_80)
-        self.assertIn("Codex", now_80)
-        self.assertIn("OpenCode", now_80)
-        self.assertIn("Grok Bot", now_80)
-        self.assertIn("run-watcher.sh", now_80)
+        self.assertIn("Worker A", now_80)
+        self.assertIn("Worker B", now_80)
+        self.assertIn("Worker C", now_80)
+        self.assertIn("Coordinator", now_80)
+        self.assertIn("watcher.sh", now_80)
 
     def test_architecture_node_status(self):
         """Verify worker state, model, role and progress come from TSV agents."""
         dummy_agents = [
             AgentInfo(
-                name="agent-watch Codex sol",
+                name="example-project Worker A",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="running",
-                harness="Codex",
-                model="group/codex-sol-flash",
+                harness="Agent A",
+                model="model-x",
                 start_time=100.0,
                 elapsed="00:10:00",
                 latest="修正架構圖",
                 stage="P4 架構",
-                project="agent-watch",
+                project="example-project",
             ),
             AgentInfo(
-                name="agent-watch Codex main",
+                name="example-project Worker B",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="complete",
-                harness="Codex",
-                model="group/codex-main",
+                harness="Agent B",
+                model="model-y",
                 start_time=100.0,
                 elapsed="00:08:00",
                 latest="主要實作完成",
                 stage="P3 實作",
                 completion_time=200.0,
-                project="agent-watch",
+                project="example-project",
             ),
             AgentInfo(
-                name="agent-watch OpenCode audit",
+                name="example-project Worker C audit",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="running",
-                harness="OpenCode",
-                model="opencode-go/deepseek-v4.1-flash",
+                harness="Agent C",
+                model="model-z",
                 start_time=100.0,
                 elapsed="00:05:00",
                 latest="updating parser",
                 stage="P2 調查",
-                project="agent-watch",
+                project="example-project",
             ),
             AgentInfo(
-                name="agent-watch Claude review",
+                name="example-project Reviewer",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="complete",
-                harness="Claude Code",
-                model="sonnet",
+                harness="Reviewer",
+                model="model-w",
                 start_time=100.0,
                 elapsed="00:03:00",
                 latest="done",
                 completion_time=300.0,
-                project="agent-watch",
+                project="example-project",
             ),
         ]
 
-        codex_active, codex_count, codex_text = get_worker_status("codex-sol", dummy_agents)
-        self.assertTrue(codex_active)
-        self.assertEqual(codex_count, 1)
-        self.assertIn("執行中", codex_text)
-        self.assertTrue(is_node_active("codex-sol", dummy_agents))
+        worker_a_active, worker_a_count, worker_a_text = get_worker_status("worker-a", dummy_agents)
+        self.assertTrue(worker_a_active)
+        self.assertEqual(worker_a_count, 1)
+        self.assertIn("執行中", worker_a_text)
+        self.assertTrue(is_node_active("worker-a", dummy_agents))
 
-        claude_active, claude_count, claude_text = get_worker_status("claude", dummy_agents)
-        self.assertFalse(claude_active)
-        self.assertEqual(claude_count, 0)
-        self.assertIn("待命中", claude_text)
-        self.assertFalse(is_node_active("claude", dummy_agents))
+        reviewer_active, reviewer_count, reviewer_text = get_worker_status("reviewer", dummy_agents)
+        self.assertFalse(reviewer_active)
+        self.assertEqual(reviewer_count, 0)
+        self.assertIn("待命中", reviewer_text)
+        self.assertFalse(is_node_active("reviewer", dummy_agents))
 
-        opencode_active, opencode_count, _ = get_worker_status("opencode", dummy_agents)
-        self.assertTrue(opencode_active)
-        self.assertEqual(opencode_count, 1)
-        self.assertTrue(is_node_active("opencode", dummy_agents))
+        worker_c_active, worker_c_count, _ = get_worker_status("worker-c", dummy_agents)
+        self.assertTrue(worker_c_active)
+        self.assertEqual(worker_c_count, 1)
+        self.assertTrue(is_node_active("worker-c", dummy_agents))
 
         now_text = render_architecture_view(
-            dummy_agents, width=80, view_id="now", project_id="agent-watch"
+            dummy_agents, width=80, view_id="now", project_id="example-project"
         )
         wide_text = render_architecture_view(
-            dummy_agents, width=180, view_id="now", project_id="agent-watch"
+            dummy_agents, width=180, view_id="now", project_id="example-project"
         )
         future_text = render_architecture_view(
-            dummy_agents, width=80, view_id="future", project_id="agent-watch"
+            dummy_agents, width=80, view_id="future", project_id="example-project"
         )
-        self.assertIn("Grok Bot", now_text)
-        self.assertIn("Hermes chief", now_text)
-        self.assertIn("run-watcher.sh", now_text)
+        self.assertIn("Coordinator", now_text)
+        self.assertIn("Mobile entry", now_text)
+        self.assertIn("watcher.sh", now_text)
         self.assertIn("● running", now_text)
         self.assertIn("✓ done", now_text)
         self.assertIn("P4 架構", now_text)
-        self.assertIn("group/codex-sol-flash", wide_text)
-        self.assertIn("便宜實作與修正", wide_text)
-        self.assertIn("opencode-go/deepseek-v4.1-flash", wide_text)
+        self.assertIn("model-x", wide_text)
+        self.assertIn("實作與修正", wide_text)
+        self.assertIn("model-z", wide_text)
         self.assertIn("獨立審查", wide_text)
         self.assertIn("最近事件", now_text)
         self.assertIn("修正架構圖", now_text)
         self.assertIn("┌", now_text)
         self.assertIn("▼", now_text)
         self.assertIn("▲", now_text)
-        self.assertIn("Claude Code · Planner", future_text)
-        self.assertIn("Claude Code · Reviewer", future_text)
-        self.assertIn("Pi Agent", future_text)
+        self.assertIn("Planner", future_text)
+        self.assertIn("Reviewer", future_text)
+        self.assertIn("Worker D", future_text)
         self.assertIn("┌", future_text)
         self.assertIn("▼", future_text)
 
@@ -1272,19 +1272,19 @@ class TestAgentWatch(unittest.TestCase):
         self.assertEqual(set(data["architectures"]), {"now", "future"})
         self.assertEqual(
             set(data["projects"]),
-            {"agent-watch", "personal-ai-os", "ios-shortcuts", "k1", "magpie", "other"},
+            {"example-project", "project-a", "project-b", "project-c", "project-d", "other"},
         )
         self.assertEqual(
             data["architectures"]["now"]["layers"][-1],
-            ["codex-sol", "codex-main", "opencode", "claude"],
+            ["worker-a", "worker-b", "worker-c", "reviewer"],
         )
         self.assertEqual(
-            data["architectures"]["now"]["nodes"]["codex-main"]["model"],
-            "group/codex-main",
+            data["architectures"]["now"]["nodes"]["worker-b"]["model"],
+            "model-y",
         )
         self.assertEqual(
             data["architectures"]["future"]["layers"][2],
-            ["codex-sol", "opencode", "pi"],
+            ["worker-a", "worker-c", "worker-d"],
         )
         for project in data["projects"].values():
             self.assertIn(project["default_view"], data["architectures"])
@@ -1296,8 +1296,8 @@ class TestAgentWatch(unittest.TestCase):
                     [], width=80, view_id="now", project_id=project_id
                 )
                 self.assertIn(str(project["label"]), rendered)
-                self.assertIn("Grok Bot", rendered)
-                self.assertIn("Codex sol", rendered)
+                self.assertIn("Coordinator", rendered)
+                self.assertIn("Worker A", rendered)
                 self.assertIn("最近事件", rendered)
                 self.assertIn("┌", rendered)
                 self.assertIn("▼", rendered)
