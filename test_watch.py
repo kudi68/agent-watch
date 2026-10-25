@@ -2,17 +2,23 @@
 """Unit tests for agent-watch v7 status logic, tabs, quota, and screen output."""
 
 import asyncio
+import contextlib
 import html
+import io
+import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from textual.widgets import TabbedContent
+import watch
 
 from watch import (
     ARCHITECTURE_DATA,
@@ -27,8 +33,6 @@ from watch import (
     extract_model_from_line,
     format_completion_time,
     format_elapsed,
-    get_quota_color,
-    get_quota_color_and_tag,
     get_worker_status,
     infer_project,
     is_node_active,
@@ -48,24 +52,38 @@ from watch import (
     render_done_tasks,
     render_full_quota_view,
     render_recent_done_tasks,
-    render_quota_bar,
     split_recent_done,
+    task_bucket,
 )
+
+watch.ensure_architecture_data()
 
 
 def write_log(path: Path, start_time: float, *messages: str) -> None:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time))
     lines = [f"{stamp} session start", *messages]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(path, (start_time, start_time))
 
 
 def set_mtime(path: Path, timestamp: float) -> None:
     os.utime(path, (timestamp, timestamp))
 
 
+def snapshot_dir(fallback: Path) -> Path:
+    """Write snapshots to a temp dir unless AGENT_WATCH_UPDATE_SHOTS is set."""
+    if os.environ.get("AGENT_WATCH_UPDATE_SHOTS"):
+        target = Path(__file__).parent / "shots"
+    else:
+        target = fallback
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def git_output(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", str(repo), "-c", "user.name=agent-watch-test",
+         "-c", "user.email=agent-watch-test@example.invalid", *args],
         capture_output=True,
         text=True,
         check=True,
@@ -73,7 +91,17 @@ def git_output(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-class TestAgentWatch(unittest.TestCase):
+class IsolatedState:
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory(prefix="agent-watch-state-test-")
+        self.addCleanup(directory.cleanup)
+        setting = patch.dict(os.environ, {"AGENT_WATCH_STATE": str(Path(directory.name) / "state.json")})
+        setting.start()
+        self.addCleanup(setting.stop)
+
+
+class TestAgentWatch(IsolatedState, unittest.TestCase):
 
     def test_clean_text(self):
         raw = "\x1b[31mHello\x1b[0m\r\n\tWorld"
@@ -224,7 +252,7 @@ class TestAgentWatch(unittest.TestCase):
 
     def test_work_and_done_cards_show_harness_model_and_progress(self):
         agent = AgentInfo(
-            name="astra 用量調查",
+            name="example-project 用量調查",
             log_path=Path("/tmp/run.log"),
             last_path=Path("/tmp/REPORT.md"),
             status="running",
@@ -295,9 +323,9 @@ class TestAgentWatch(unittest.TestCase):
             },
         ]
         text = parse_quota_json(sample_quota)
-        self.assertIn("codex 5h 7%｜7d 17%", text)
-        self.assertIn("claude 7d 43%", text)
-        self.assertIn("opencode-go 7d 12%", text)
+        self.assertIn("Codex 5h 7% 7d 17%", text)
+        self.assertIn("Claude 7d 43%", text)
+        self.assertIn("OpenCode Go 7d 12%", text)
 
         # Quota empty or malformed
         self.assertEqual(parse_quota_json([]), "額度：無資料")
@@ -305,6 +333,14 @@ class TestAgentWatch(unittest.TestCase):
         self.assertEqual(parse_quota_json(None), "額度：無資料")
         no_time = [{"provider": "codex", "windows": [{"name": "5 hours", "used": 7}]}]
         self.assertNotIn("7%", parse_quota_json(no_time))
+
+        month = [{
+            "provider": "opencode-go",
+            "asOf": "2026-10-25T06:00:00Z",
+            "windows": [{"name": "month", "used": 30}],
+        }]
+        self.assertIn("OpenCode Go 月 30%", parse_quota_json(month))
+        self.assertIn("月 ", render_full_quota_view(month))
 
     def test_determine_status(self):
         now = 100000.0
@@ -356,8 +392,12 @@ class TestAgentWatch(unittest.TestCase):
             data_error="",
             now=now,
             last_status="failed",
+            init_time=now - 15,
         )
-        self.assertEqual(st, "failed")
+        # A new init after this report makes it stale for the current run.
+        # Later log writes alone do not: Claude's result event always follows
+        # the REPORT it describes (M1).
+        self.assertEqual(st, "running")
 
         st = determine_status(
             is_done_file=False,
@@ -381,8 +421,8 @@ class TestAgentWatch(unittest.TestCase):
             last_status_from_content("# 工作摘要\n狀態：DONE\n- FAILED 是較早的重試"),
             "complete",
         )
-        self.assertEqual(last_status_from_content("# 工作摘要\n目前結果是 DONE。"), "complete")
-        self.assertEqual(last_status_from_content("# 工作摘要\n工作已完成。"), "complete")
+        self.assertIsNone(last_status_from_content("# 工作摘要\n目前結果是 DONE。"))
+        self.assertIsNone(last_status_from_content("# 工作摘要\n工作已完成。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n目前結果不是 DONE。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n工作尚未完成。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n工作沒有完成。"))
@@ -433,7 +473,7 @@ class TestAgentWatch(unittest.TestCase):
             self.assertEqual(len(agents), 2)
 
             a1 = next(a for a in agents if a.name == "Agent One")
-            self.assertEqual(a1.status, "complete")
+            self.assertEqual(a1.status, "reported")
             self.assertEqual(a1.harness, "未知")
             self.assertEqual(a1.model, "未知")
             self.assertIn("任務圓滿完成", a1.latest)
@@ -597,8 +637,8 @@ class TestAgentWatch(unittest.TestCase):
             )[0][0]
 
             self.assertEqual(first.status, "complete")
-            self.assertEqual(first.elapsed, "00:02:30")
-            self.assertEqual(later.elapsed, "00:02:30")
+            self.assertEqual(first.elapsed, "~00:02:30")
+            self.assertEqual(later.elapsed, "~00:02:30")
             self.assertEqual(first.completion_time, finished)
             self.assertEqual(format_completion_time(0), "08:00")
 
@@ -622,7 +662,7 @@ class TestAgentWatch(unittest.TestCase):
 
             self.assertEqual(first.status, "complete")
             self.assertEqual(first.completion_time, finished)
-            self.assertEqual(first.elapsed, "00:04:00")
+            self.assertEqual(first.elapsed, "~00:04:00")
             self.assertEqual(later.elapsed, first.elapsed)
             self.assertRegex(render_done_tasks([later]), r"完成：\d{2}:\d{2}")
 
@@ -720,6 +760,27 @@ class TestAgentWatch(unittest.TestCase):
         self.assertNotIn("project-d 舊完成", markup)
         self.assertIn("Project D (1)", render_done_tasks(older))
 
+    def test_future_completion_within_clock_skew_stays_recent(self):
+        now = time.time()
+        agent = AgentInfo(
+            name="project-d 時鐘偏差",
+            log_path=Path("/tmp/project-d/run.log"),
+            last_path=Path("/tmp/project-d/LAST.md"),
+            status="complete",
+            model="model-x",
+            start_time=now - 300,
+            elapsed="00:05:00",
+            latest="DONE",
+            harness="Codex",
+            completion_time=now + 60,
+            project="project-d",
+        )
+        self.assertEqual(task_bucket(agent, now), "recent")
+        self.assertEqual(task_bucket(agent, now + 300), "recent")
+        self.assertEqual(
+            task_bucket(agent, now + RECENT_DONE_SECONDS + 120), "history"
+        )
+
     def test_active_work_is_grouped_by_project(self):
         agents = [
             AgentInfo(
@@ -787,7 +848,7 @@ class TestAgentWatch(unittest.TestCase):
             markup = render_done_tasks(agents)
 
             self.assertEqual(errors, [])
-            self.assertEqual(agent.status, "complete")
+            self.assertEqual(agent.status, "reported")
             self.assertEqual(agent.last_path, report)
             self.assertEqual(agent.stage, "P2 回歸驗證中")
             self.assertIn("目前階段：P2 回歸驗證中", markup)
@@ -797,8 +858,6 @@ class TestAgentWatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             git_output(root, "init", "-q")
-            git_output(root, "config", "user.email", "agent-watch-test@example.invalid")
-            git_output(root, "config", "user.name", "agent-watch-test")
             git_output(root, "commit", "-q", "--allow-empty", "-m", "base")
             base = git_output(root, "rev-parse", "HEAD")
             git_output(root, "update-ref", "refs/remotes/origin/main", base)
@@ -885,7 +944,7 @@ class TestAgentWatch(unittest.TestCase):
                 self.assertFalse(service.refresh_in_background())
 
         self.assertEqual(run.call_count, 1)
-        self.assertIn("無資料", summary)
+        self.assertIn("magpie 讀取失敗", summary)
         self.assertNotIn("88%", summary)
         self.assertNotIn("88%", render_full_quota_view(raw))
         self.assertTrue(stale)
@@ -964,8 +1023,8 @@ class TestAgentWatch(unittest.TestCase):
             self.assertTrue(ret4, "資料有變時應該更新")
             self.assertEqual(app.redraw_count, 2)
 
-    def test_three_tabs_exist_and_switchable(self):
-        """Verify three tabs exist (Work, Architecture, Quota) and can be switched via keys 1/2/3 headlessly."""
+    def test_four_tabs_exist_and_switchable(self):
+        """Verify v10 tab order and the retained architecture controls."""
         async def run_pilot_tabs():
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmppath = Path(tmpdir)
@@ -977,18 +1036,20 @@ class TestAgentWatch(unittest.TestCase):
                 app = AgentWatchApp(runs_path=runs_tsv, done_path=done_tsv)
                 app.quota_svc.refresh_in_background = lambda force=False: False
                 async with app.run_test() as pilot:
-                    # Check TabbedContent and 3 tabs exist
+                    # Four v10 tabs retain the existing architecture pane.
                     tc = app.query_one("#main-tabs", TabbedContent)
                     self.assertIsNotNone(tc)
                     self.assertIsNotNone(app.query_one("#tab-work"))
+                    self.assertIsNotNone(app.query_one("#tab-history"))
                     self.assertIsNotNone(app.query_one("#tab-arch"))
                     self.assertIsNotNone(app.query_one("#tab-quota"))
 
                     # Default active tab is 'tab-work'
                     self.assertEqual(tc.active, "tab-work")
 
-                    # Press '2' to switch to Architecture tab
                     await pilot.press("2")
+                    self.assertEqual(tc.active, "tab-history")
+                    await pilot.press("4")
                     self.assertEqual(tc.active, "tab-arch")
                     self.assertEqual(app.architecture_view_id, "now")
                     self.assertEqual(app.architecture_project_id, "example-project")
@@ -1034,8 +1095,7 @@ class TestAgentWatch(unittest.TestCase):
             )
             set_mtime(active_log, now + 1)
 
-            shots_dir = Path(__file__).parent / "shots"
-            shots_dir.mkdir(exist_ok=True)
+            shots_dir = snapshot_dir(root / "shots")
             captures = (
                 ("work-80x30.svg", (80, 30), "tab-work"),
                 ("work-100x35.svg", (100, 35), "tab-work"),
@@ -1064,13 +1124,15 @@ class TestAgentWatch(unittest.TestCase):
                 app.quota_svc.refresh_in_background = lambda force=False: False
                 async with app.run_test(size=size) as pilot:
                     if tab_id != "tab-work":
-                        await pilot.press({"tab-arch": "2", "tab-quota": "3"}[tab_id])
+                        await pilot.press({"tab-arch": "4", "tab-quota": "3"}[tab_id])
                     if filename.startswith("arch-"):
                         await pilot.press("f" if "future" in filename else "n")
                     await pilot.pause()
                     svg = app.export_screenshot(title=filename)
                     (shots_dir / filename).write_text(svg, encoding="utf-8")
                     exported[filename] = svg
+                    self.assertGreater(len(svg), 500)
+                    self.assertTrue((shots_dir / filename).is_file())
             temp_root.cleanup()
             return exported
 
@@ -1104,9 +1166,6 @@ class TestAgentWatch(unittest.TestCase):
         self.assertIn("▼", future80_text)
         self.assertIn("服務額度用量", quota_text)
         self.assertIn("2026-10-25 14:00:00", quota_text)
-        for filename, svg in exported.items():
-            self.assertGreater(len(svg), 500)
-            self.assertTrue((Path(__file__).parent / "shots" / filename).is_file())
 
     def test_v8_launcher_and_text_snapshots(self):
         root = Path(__file__).parent
@@ -1118,6 +1177,7 @@ class TestAgentWatch(unittest.TestCase):
             text=True,
             timeout=10,
             check=False,
+            env=dict(os.environ, AGENT_WATCH_PYTHON=sys.executable),
         )
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("agent-watch v8", help_result.stdout)
@@ -1188,7 +1248,7 @@ class TestAgentWatch(unittest.TestCase):
                 elapsed="00:08:00",
                 latest="主要實作完成",
                 stage="P3 實作",
-                completion_time=200.0,
+                completion_time=time.time() - 120,
                 project="example-project",
             ),
             AgentInfo(
@@ -1214,7 +1274,7 @@ class TestAgentWatch(unittest.TestCase):
                 start_time=100.0,
                 elapsed="00:03:00",
                 latest="done",
-                completion_time=300.0,
+                completion_time=time.time() - 60,
                 project="example-project",
             ),
         ]
@@ -1272,7 +1332,8 @@ class TestAgentWatch(unittest.TestCase):
         self.assertEqual(set(data["architectures"]), {"now", "future"})
         self.assertEqual(
             set(data["projects"]),
-            {"example-project", "project-a", "project-b", "project-c", "project-d", "other"},
+            {"example-project", "project-a", "project-b", "project-c", "project-d",
+             "personal-ai-os", "agent-watch", "ios-shortcuts", "K1", "other"},
         )
         self.assertEqual(
             data["architectures"]["now"]["layers"][-1],
@@ -1302,41 +1363,1287 @@ class TestAgentWatch(unittest.TestCase):
                 self.assertIn("┌", rendered)
                 self.assertIn("▼", rendered)
 
-    def test_quota_thresholds(self):
-        """Verify quota color thresholds: <= 80% Green, > 80% Yellow, > 85% Red."""
-        # Standard green (<= 80%)
-        self.assertEqual(get_quota_color(0.0), "green")
-        self.assertEqual(get_quota_color(50.0), "green")
-        self.assertEqual(get_quota_color(80.0), "green")
-        color, hex_code = get_quota_color_and_tag(80.0)
-        self.assertEqual(color, "green")
-        self.assertEqual(hex_code, "#9ece6a")
+    def test_quota_uses_one_threshold_source(self):
+        """The legacy >80/>85 helpers are gone; quota_window_status is the only rule."""
+        for name in ("get_quota_color_and_tag", "get_quota_color", "render_quota_bar"):
+            self.assertFalse(hasattr(watch, name), name + " must not come back")
+        self.assertEqual(watch.quota_window_status(84.9, None), ("#9ece6a", ""))
+        self.assertEqual(watch.quota_window_status(85.0, 10), ("#f7768e", "告急"))
+        self.assertEqual(watch.quota_window_status(50.0, 20), ("#e0af68", "燒太快"))
+        chart = watch.render_quota_chart(90.0, 50.0, 10)
+        self.assertIn("#f7768e", chart)
+        self.assertNotIn("#e0af68", chart)
 
-        # Yellow (> 80% and <= 85%)
-        self.assertEqual(get_quota_color(80.1), "yellow")
-        self.assertEqual(get_quota_color(82.0), "yellow")
-        self.assertEqual(get_quota_color(85.0), "yellow")
-        color, hex_code = get_quota_color_and_tag(85.0)
-        self.assertEqual(color, "yellow")
-        self.assertEqual(hex_code, "#e0af68")
 
-        # Red (> 85%)
-        self.assertEqual(get_quota_color(85.1), "red")
-        self.assertEqual(get_quota_color(90.0), "red")
-        self.assertEqual(get_quota_color(100.0), "red")
-        color, hex_code = get_quota_color_and_tag(90.0)
-        self.assertEqual(color, "red")
-        self.assertEqual(hex_code, "#f7768e")
+class StageOneScreenTests(IsolatedState, unittest.TestCase):
+    def test_t2_t5_t10_pinned_quota_board_and_expand_at_both_widths(self):
+        async def check_screens():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                now = time.time()
+                log = root / "active.log"
+                write_log(log, now - 120, "Current phase")
+                runs, done = root / "runs.tsv", root / "done.tsv"
+                runs.write_text(
+                    f"example-project active\t{log}\t{root / 'missing.md'}\t{os.getpid()}\tAgent A\tmodel-x\n"
+                )
+                rows = []
+                for index in range(6):
+                    report = root / ("result-%d.txt" % index)
+                    report.write_text("DONE\nNeutral fixture result\n")
+                    set_mtime(report, now - 10 - index)
+                    rows.append(f"example-project result-{index}\t{log}\t{report}")
+                done.write_text("\n".join(rows) + "\n")
+                payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
+                snapshots = snapshot_dir(root / "shots")
+                for width in (80, 120):
+                    app = AgentWatchApp(runs_path=runs, done_path=done)
+                    app.quota_svc.sessions_path = root
+                    with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                        app.quota_svc.fetch(force=True)
+                    app.quota_svc.refresh_in_background = lambda force=False: False
+                    async with app.run_test(size=(width, 40)) as pilot:
+                        await pilot.pause()
+                        text = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        first = "\n".join(text.splitlines()[:20])
+                        for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter", "example-project active"):
+                            self.assertIn(name, first)
+                        quota = app.query_one("#compact-quota-line")
+                        self.assertLessEqual(quota.size.height, 3)
+                        self.assertNotIn("…", "\n".join(text.splitlines()[3:3 + quota.size.height]))
+                        self.assertNotIn("work-scroll", [parent.id for parent in quota.ancestors])
+                        self.assertIn("另 3 筆", text)
+                        self.assertNotIn("result-3", text)
+                        redraws = app.redraw_count
+                        self.assertFalse(app.update_data(now=now + 60))
+                        await pilot.pause()
+                        timer_text = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        self.assertIn("已跑 ~3m", timer_text)
+                        self.assertEqual(app.redraw_count, redraws)
+                        await pilot.press("e")
+                        await pilot.pause()
+                        expanded = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        for index in range(6):
+                            self.assertIn("result-%d" % index, expanded)
+                        await pilot.press("e")
+                        await pilot.pause()
+                        self.assertFalse(app.ui_error)
+                        snapshot = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+                        (snapshots / ("v9-s1-%dx40.txt" % width)).write_text(snapshot)
+                        scroll = app.query_one("#work-scroll")
+                        scroll.scroll_end(animate=False)
+                        await pilot.pause()
+                        scrolled = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        self.assertIn("OpenRouter", "\n".join(scrolled.splitlines()[:10]))
+        asyncio.run(check_screens())
 
-        # Bar chart contains threshold colors
-        bar_green = render_quota_bar(50.0, 10)
-        self.assertIn("#9ece6a", bar_green)
+    def test_once_uses_board_counts_and_balance_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            log, report = root / "run.log", root / "result.txt"
+            write_log(log, now - 60, "Current phase")
+            report.write_text("# Delivery notes\nReady for review\n")
+            set_mtime(report, now - 5)
+            runs, done = root / "runs.tsv", root / "done.tsv"
+            active_name = "example-project active " + "long task title " * 5
+            active_name = active_name.strip()
+            runs.write_text(f"{active_name}\t{log}\t{root / 'missing.md'}\t{os.getpid()}\n")
+            done.write_text(f"example-project review\t{log}\t{report}\n")
+            payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
+            output = io.StringIO()
+            with patch("watch.is_pid_alive", return_value=True), patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(watch.run_once_summary(runs, done), 0)
+            text = output.getvalue()
+            for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter", active_name):
+                self.assertIn(name, "\n".join(text.splitlines()[:25]))
+            self.assertIn("需處理 0 │ 進行中 1 │ 剛完成(2h) 1 │ 歷史 0 │ 總計 2", text)
+            self.assertIn("已回報", text)
+            self.assertIn("帳戶餘額 $19.58", text)
+            self.assertNotIn("Harness", text)
 
-        bar_yellow = render_quota_bar(82.0, 10)
-        self.assertIn("#e0af68", bar_yellow)
 
-        bar_red = render_quota_bar(89.0, 10)
-        self.assertIn("#f7768e", bar_red)
+class V10ScreenAndWorkerTests(IsolatedState, unittest.TestCase):
+    def test_poll_data_stays_under_200ms_with_blocked_io_and_tabs_work(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+                runs.write_text("")
+                done.write_text("")
+                entered, release = threading.Event(), threading.Event()
+                reader_threads = []
+
+                def slow_reader(*args, **kwargs):
+                    reader_threads.append(threading.get_ident())
+                    entered.set()
+                    release.wait(timeout=3)
+                    return [], []
+
+                app = AgentWatchApp(runs_path=runs, done_path=done)
+                app.quota_svc.refresh_in_background = lambda force=False: False
+                with patch("watch.load_all_agents", side_effect=slow_reader):
+                    try:
+                        async with app.run_test(size=(80, 40)) as pilot:
+                            await pilot.pause()
+                            self.assertTrue(entered.is_set())
+                            measured = []
+                            for _ in range(5):
+                                started = time.perf_counter()
+                                app.poll_data()
+                                measured.append((time.perf_counter() - started) * 1000)
+                            for key, expected in (
+                                ("2", "tab-history"), ("3", "tab-quota"),
+                                ("4", "tab-arch"), ("1", "tab-work"),
+                            ):
+                                await pilot.press(key)
+                                self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, expected)
+                            self.assertLess(max(measured), 200)
+                            self.assertNotIn(threading.get_ident(), reader_threads)
+                            self.assertEqual(len(reader_threads), 1)
+                            print("v10 poll_data max_ms=%.3f (blocked fixture I/O)" % max(measured))
+                            release.set()
+                            await pilot.pause()
+                    finally:
+                        release.set()
+        asyncio.run(run())
+
+    def test_v10_fixture_snapshots_and_registry_mtimes(self):
+        async def run():
+            fixtures = Path(__file__).parent / "tests" / "fixtures"
+            now = watch.parse_timestamp("2026-10-25T10:12:00Z")
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for name in ("claude_stream.jsonl", "opencode_stream.jsonl"):
+                    (root / name).write_bytes((fixtures / name).read_bytes())
+                runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+                rows = (fixtures / "runs_v10.tsv").read_text()
+                rows = rows.replace("opencode_stream.jsonl", str(root / "opencode_stream.jsonl"))
+                rows = rows.replace("claude_stream.jsonl", str(root / "claude_stream.jsonl"))
+                rows = rows.replace("opencode-result.txt", str(root / "opencode-result.txt"))
+                rows = rows.replace("claude-result.txt", str(root / "claude-result.txt"))
+                runs.write_text(rows)
+                done.write_text("")
+                before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+                snapshots = snapshot_dir(root / "shots")
+                for width in (80, 120):
+                    app = AgentWatchApp(runs_path=runs, done_path=done)
+                    app.quota_svc.refresh_in_background = lambda force=False: False
+                    with patch("watch.time.time", return_value=now), patch("watch.notify_completion"):
+                        async with app.run_test(size=(width, 40)) as pilot:
+                            await pilot.pause()
+                            text = "\n".join(strip.text.rstrip() for strip in app.screen._compositor.render_strips()) + "\n"
+                            self.assertIn("已跑 12m", text)
+                            self.assertIn("Claude fixture", text)
+                            self.assertIn("OpenCode fixture", text)
+                            self.assertIn("Claude fixture 最新一句", text)
+                            self.assertIn("OpenCode fixture 最新一句", text)
+                            self.assertNotIn("'type'", text)
+                            self.assertFalse(app.ui_error)
+                            (snapshots / ("v10-s1-%dx40.txt" % width)).write_text(text)
+                            await pilot.press("4")
+                            await pilot.pause()
+                            arch = "\n".join(strip.text.rstrip() for strip in app.screen._compositor.render_strips()) + "\n"
+                            (snapshots / ("v10-s1-arch-%dx40.txt" % width)).write_text(arch)
+                self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+                print("v10 fixture agent-runs*.tsv mtime_ns and bytes UNCHANGED at 80x40 and 120x40")
+        asyncio.run(run())
+
+    def test_terminal_and_waiting_transitions_each_notify_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = AgentWatchApp(root / "unused-runs", root / "unused-done")
+            agent = AgentInfo("fixture", root / "run.log", root / "REPORT.md", "running",
+                              "fixture", time.time() - 60, "00:01:00", "fixture", key="fixture")
+            with patch("watch.load_all_agents", return_value=([agent], [])), patch("watch.notify_completion") as notify:
+                app.update_data()
+                for status in ("waiting", "partial", "failed", "blocked", "complete"):
+                    agent.status = status
+                    app.update_data()
+                    app.update_data()
+                self.assertEqual(notify.call_count, 5)
+
+    def test_architecture_ignores_ended_history(self):
+        old = AgentInfo("example-project Worker A", Path("/dev/null"), Path("/dev/null"),
+                        "complete", "fixture", 100, "00:01:00", "old task must disappear",
+                        project="example-project", completion_time=time.time() - 8000)
+        self.assertNotIn("old task must disappear", render_architecture_view([old], 120))
+
+
+class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """Fixture-only UI checks; no real TSV, quota service or process lookup."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def fixture_agents(self):
+        fixtures = Path(__file__).parent / "tests" / "fixtures"
+
+        def agent(key, status, project="example-project", **values):
+            defaults = dict(
+                name=key, log_path=fixtures / "unused.log",
+                last_path=fixtures / "unused-report", key=key, status=status,
+                harness="Codex", model="codex-sol-flash",
+                start_time=self.now - 750, elapsed="00:12:30",
+                latest="fixture 最新進度", log_lines=[key + " 第一行", key + " 第二行", key + " 最新一行"],
+                log_mtime=self.now - 1, project=project,
+            )
+            defaults.update(values)
+            return AgentInfo(**defaults)
+
+        return [
+            agent("failed-review", "failed", latest="測試失敗", completion_time=self.now - 30),
+            agent("missing-report", "no_report", "project-a", latest="已結束、無報告"),
+            agent("blocked-task", "blocked", latest="等待必要資料"),
+            agent("quiet-task", "waiting", latest="日誌暫無更新"),
+            agent("answer-hook", "question", latest="第⑤段等回答接點"),
+            agent("工作頁排版", "running", stage="P2 實作主頁", model="deepseek-v4.1-" + "very-long-model-" * 4),
+            agent("preview-follows-cursor", "running", "project-a", stage="P3 測試", log_mtime=self.now + 100),
+            *[agent("recent-%d" % index, "complete", completion_time=self.now - 100 - index)
+              for index in range(4)],
+            agent("archived-task", "complete", completion_time=self.now - 9000),
+        ]
+
+    def fixture_app(self, agents=None):
+        agents = self.fixture_agents() if agents is None else agents
+        root = Path(__file__).parent / "tests" / "fixtures"
+        directory = tempfile.TemporaryDirectory(prefix="agent-watch-ui-test-")
+        self.addCleanup(directory.cleanup)
+        app = AgentWatchApp(root / "not-read-runs.tsv", root / "not-read-done.tsv",
+                            state_path=Path(directory.name) / "state.json")
+        app.data_svc.snapshot = lambda: (list(agents), [])
+        app.data_svc.refresh_in_background = lambda: False
+        app.quota_svc.refresh_in_background = lambda force=False: False
+        app.quota_svc.cached_raw = [
+            {"provider": "codex", "windows": [{"name": "5 hours", "used": 23}]},
+            {"provider": "claude", "windows": [{"name": "5 hours", "used": 45}]},
+            {"provider": "opencode-go", "windows": [{"name": "5 hours", "used": 10}]},
+            {"provider": "openrouter", "balance": "$19.58"},
+        ]
+        return app
+
+    @staticmethod
+    def screen_text(app):
+        return "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+
+    async def test_elapsed_column_survives_80_columns_and_long_identity(self):
+        agent = self.fixture_agents()[5]
+        columns = []
+        for item in self.fixture_agents()[:7]:
+            line = watch.render_task_row(item, 76, self.now).plain.splitlines()[0]
+            columns.append(display_width(line.split("已跑", 1)[0]))
+        self.assertEqual(len(set(columns)), 1, "Elapsed must occupy the same column in every active row")
+        for elapsed, start in (("123:45:00", self.now - 445500), ("時間未知", None)):
+            agent.start_time, agent.elapsed = start, elapsed
+            for width in (72, 76, 80):
+                text = watch.render_task_row(agent, width, self.now)
+                self.assertIn("已跑 " + watch.compact_elapsed(agent), text.plain.splitlines()[0])
+                self.assertTrue(all(display_width(line) <= width for line in text.plain.splitlines()))
+                self.assertEqual(len(text.plain.splitlines()), 2)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            screen = self.screen_text(app)
+            self.assertIn("已跑 時間未知", screen)
+            self.assertIn("進行中", screen)
+            self.assertFalse(app.ui_error)
+
+    async def test_resize_at_120_changes_geometry_and_preserves_cursor(self):
+        app = self.fixture_app()
+        async with app.run_test(size=(119, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("j")
+            selected = app.selected_key
+            left, preview = app.query_one("#work-scroll"), app.query_one("#work-log-box")
+            self.assertEqual(app.layout_mode, "stacked")
+            self.assertGreaterEqual(preview.region.y, left.region.bottom)
+            await pilot.resize_terminal(120, 40)
+            await pilot.pause()
+            self.assertEqual(app.layout_mode, "split")
+            self.assertEqual(preview.region.y, left.region.y)
+            self.assertGreaterEqual(preview.region.x, left.region.right)
+            self.assertEqual(app.selected_key, selected)
+            await pilot.resize_terminal(80, 40)
+            await pilot.pause()
+            self.assertEqual(app.layout_mode, "stacked")
+            self.assertGreaterEqual(preview.region.y, left.region.bottom)
+            self.assertEqual(app.selected_key, selected)
+            self.assertFalse(app.ui_error)
+
+    async def test_four_status_colors_and_green_selected_frame(self):
+        agents = self.fixture_agents()
+        expected = ((agents[0], "#f7768e"), (agents[5], "#e0af68"),
+                    (agents[7], "#9ece6a"), (agents[-1], "#737b91"))
+        for agent, color in expected:
+            text = watch.render_task_row(agent, 76, self.now)
+            self.assertEqual(text.style, color)
+        app = self.fixture_app([agents[5], agents[6], agents[-1]])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.query_one(".project-section.selected").styles.border_top[1].hex, "#9ECE6A")
+            await pilot.press("j")
+            await pilot.pause()
+            self.assertEqual(len(app.query(".project-section.selected")), 1)
+            self.assertEqual(app.query_one(".project-section.selected").styles.border_top[1].hex, "#9ECE6A")
+            await pilot.press("2")
+            await pilot.pause()
+            # Completed history is rendered in gray, independently of its old status.
+            self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, "tab-history")
+            self.assertIn("archived-task", self.screen_text(app))
+            self.assertIn("已完成", self.screen_text(app))
+            for key, tab_id in (("3", "tab-quota"), ("4", "tab-arch"), ("1", "tab-work")):
+                await pilot.press(key)
+                await pilot.pause()
+                self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, tab_id)
+            self.assertEqual(app.selected_key, agents[6].key)
+
+    async def test_attention_collects_failed_and_missing_reports_across_projects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "run.log"
+            write_log(log, self.now - 120, "finished")
+            failed = root / "FAIL.md"
+            failed.write_text("FAIL\n測試失敗\n")
+            set_mtime(failed, self.now - 10)
+            runs, done = root / "runs.tsv", root / "done.tsv"
+            runs.write_text("")
+            done.write_text(
+                f"failed-review\t{log}\t{failed}\t\tCodex\tmodel-x\texample-project\n"
+                f"missing-report\t{log}\t{root / 'missing'}\t\tClaude\tmodel-y\tproject-a\n"
+            )
+            before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)}
+            agents, errors = load_all_agents(runs, done, LogParser(process_start_reader=None), self.now)
+            self.assertEqual(errors, [])
+            self.assertEqual({a.status for a in agents}, {"failed", "no_report"})
+            app = self.fixture_app(agents)
+            async with app.run_test(size=(80, 40)) as pilot:
+                await pilot.pause()
+                attention = app.query_one("#attention-list")
+                self.assertEqual({row.agent.key for row in attention.query(watch.TaskRow)}, {a.key for a in agents})
+                self.assertFalse(list(app.query_one("#work-board").query(watch.TaskRow)))
+                self.assertIn("失敗", self.screen_text(app))
+                self.assertIn("無報告", self.screen_text(app))
+            after = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)}
+            self.assertEqual(before, after)
+
+    async def test_attention_keeps_old_issues_until_they_are_resolved(self):
+        agents = self.fixture_agents()[:5]
+        for agent in agents:
+            agent.completion_time = self.now - RECENT_DONE_SECONDS - 300
+            agent.log_mtime = agent.completion_time
+            self.assertEqual(watch.board_bucket(agent, self.now), "attention")
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(len(app.query_one("#attention-list").query(watch.TaskRow)), 5)
+            self.assertIn("需處理 5 │ 進行中 0 │ 剛完成 0 │ 歷史 0 │ 隱藏 0 │ 總計 5", self.screen_text(app))
+            await pilot.press("2")
+            await pilot.pause()
+            self.assertIn("目前沒有歷史任務", self.screen_text(app))
+            for agent in agents:
+                self.assertNotIn(agent.name, self.screen_text(app))
+
+    async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
+        agents = self.fixture_agents()[5:7]
+        agents[0].log_lines = [
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"Claude 白話預覽"}]}}'
+        ]
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[0].key)
+            self.assertIn("Claude 白話預覽", self.screen_text(app))
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[1].key)
+            self.assertEqual(app.query_one("#bottom-log-title").render().plain, agents[1].name)
+            self.assertIn(agents[1].key + " 最新一行", self.screen_text(app))
+            agents[0].log_lines.append("另一任務最新更新不可搶走預覽")
+            agents[0].log_mtime += 1000
+            app.update_data(now=self.now)
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[1].key)
+            self.assertEqual(app.focused.agent.key, agents[1].key)
+            await pilot.press("k")
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[0].key)
+            await pilot.click(app._row_widgets[agents[1].key])
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[1].key)
+            agents[1].log_lines = ["long line " * 20, "wrapped line " * 20, "預覽最末行必須可見"]
+            app.update_data(now=self.now)
+            await pilot.pause()
+            # scroll_end() applies its offset on the following frame, so a single
+            # pause can still show the old scroll position (pre-existing flake).
+            await pilot.pause()
+            self.assertIn("預覽最末行必須可見", self.screen_text(app))
+            self.assertFalse(app.ui_error)
+
+    async def test_project_recent_limit_expand_and_selection_fallback(self):
+        agents = self.fixture_agents()[5:]
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertNotIn("recent-3", app._row_widgets)
+            self.assertIn("另 1 筆", self.screen_text(app))
+            await pilot.press("e")
+            await pilot.pause()
+            self.assertIn("recent-3", app._row_widgets)
+            app._row_widgets["recent-3"].focus()
+            await pilot.pause()
+            self.assertEqual(app.selected_key, "recent-3")
+            await pilot.press("e")
+            await pilot.pause()
+            self.assertNotEqual(app.selected_key, "recent-3")
+            self.assertIn(app.selected_key, app._row_widgets)
+            self.assertFalse(app.ui_error)
+
+    async def test_project_box_title_shows_recent_count_including_zero(self):
+        agents = self.fixture_agents()[5:]
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            titles = {section.border_title for section in app.query(".project-section")}
+            self.assertEqual(titles, {
+                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4",
+                f"{watch.project_label('project-a')} · 進行中 1 · 剛完成 0",
+            })
+            # Collapsing only changes the visible rows; the count stays at the total.
+            self.assertIn("另 1 筆", self.screen_text(app))
+            await pilot.press("e")
+            await pilot.pause()
+            titles = {section.border_title for section in app.query(".project-section")}
+            self.assertIn(
+                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4", titles
+            )
+            self.assertNotIn("另 1 筆", self.screen_text(app))
+            self.assertFalse(app.ui_error)
+
+    async def test_shortcut_table_keeps_dashboard_shortcuts_inert(self):
+        agents = self.fixture_agents()
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            project, view = app.architecture_project_id, app.architecture_view_id
+            selected = app.selected_key
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen)
+            await pilot.press("e", "p", "n", "f", "1", "2", "3", "4")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen, "Global keys must not close the table")
+            self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, "tab-work")
+            self.assertFalse(app.expand_recent)
+            self.assertEqual(app.architecture_project_id, project)
+            self.assertEqual(app.architecture_view_id, view)
+            self.assertEqual(app.selected_key, selected)
+            # The guard itself must reject the actions, not just rely on Textual
+            # truncating the binding chain at the modal screen.
+            for action in ("toggle_recent", "cycle_project", "show_architecture_now",
+                           "show_architecture_future", "switch_tab('tab-history')"):
+                self.assertFalse(await app.run_action(action), action)
+            self.assertFalse(app.expand_recent)
+            # q stays live: the table itself advertises it as the way out.
+            self.assertTrue(app.check_action("quit", ()))
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            self.assertTrue(app.expand_recent, "Shortcuts work again once the table closes")
+            self.assertFalse(app.ui_error)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen)
+            await pilot.press("q")
+            self.assertFalse(app.is_running, "q must still quit while the table is open")
+
+    async def test_help_full_screen_and_fixed_key_bar(self):
+        app = self.fixture_app()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            selected = app.selected_key
+            bar = app.query_one("#key-bar")
+            self.assertEqual(bar.region.height, 1)
+            self.assertEqual(bar.region.bottom, 40)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen)
+            self.assertEqual(app.screen.size, app.size)
+            self.assertIn("快捷鍵", self.screen_text(app))
+            app.update_data(now=self.now + 60)
+            self.assertFalse(app.ui_error, "Background refresh must remain safe with the help screen open")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(app.selected_key, selected)
+            self.assertEqual(app.focused.agent.key, selected)
+            app.query_one("#work-scroll").scroll_end(animate=False)
+            await pilot.pause()
+            self.assertEqual(bar.region.bottom, 40)
+            await pilot.press("question_mark", "question_mark")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, watch.HelpScreen)
+
+    async def test_empty_board_and_live_task_removal_keep_preview_consistent(self):
+        agents = []
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("j", "k", "down", "up", "e")
+            self.assertIsNone(app.selected_key)
+            self.assertIn("目前沒有可預覽的任務", self.screen_text(app))
+            agents.extend(self.fixture_agents()[5:7])
+            app.update_data(now=self.now)
+            await pilot.pause()
+            selected = app.selected_key
+            agents[:] = [agent for agent in agents if agent.key != selected]
+            app.update_data(now=self.now)
+            await pilot.pause()
+            self.assertEqual(app.selected_key, agents[0].key)
+            self.assertEqual(app.query_one("#bottom-log-title").render().plain, agents[0].name)
+            self.assertFalse(app.ui_error)
+
+    async def test_background_result_after_shutdown_ignores_cancelled_callback(self):
+        app = self.fixture_app([])
+        with patch.object(app, "call_from_thread", side_effect=watch.CancelledError()):
+            app._data_ready()
+
+    async def test_fixture_snapshots_80_and_120_with_four_quota_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shots = snapshot_dir(Path(tmp))
+            for width in (80, 120):
+                app = self.fixture_app()
+                with patch("watch.load_all_agents", side_effect=AssertionError("UI must use fixture snapshot")), \
+                     patch("watch.subprocess.run", side_effect=AssertionError("No live quota or process reads")):
+                    async with app.run_test(size=(width, 40)) as pilot:
+                        await pilot.pause()
+                        text = self.screen_text(app)
+                        lines = text.splitlines()
+                        self.assertEqual(len(lines), 40)
+                        self.assertTrue(all(display_width(line) <= width for line in lines))
+                        quota = app.query_one("#compact-quota-line")
+                        self.assertLessEqual(quota.size.height, 2)
+                        quota_lines = "\n".join(lines[1:1 + quota.size.height])
+                        names = ("Codex", "Claude", "OpenCode Go", "OpenRouter")
+                        for name in names:
+                            self.assertIn(name, quota_lines)
+                        self.assertEqual(sorted(names, key=quota_lines.index), list(names))
+                        self.assertIn("已跑 12m", text)
+                        self.assertFalse(app.ui_error)
+                        (shots / ("v10-s2-%dx40.txt" % width)).write_text(
+                            "\n".join(line.rstrip() for line in lines) + "\n", encoding="utf-8",
+                        )
+
+
+class V10StateTests(unittest.TestCase):
+    fixture_agents = V10MainPageTests.fixture_agents
+
+    def setUp(self):
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        directory = tempfile.TemporaryDirectory(prefix="v10-state-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.path = self.root / "state.json"
+        self.state = watch.WatchState(self.path)
+        self.agents = self.fixture_agents()
+        self.finished = self.agents[7]
+
+    def apply(self, operation, agent=None, **values):
+        return self.state.apply(operation, agent or self.finished, self.agents, self.now, **values)
+
+    def test_running_and_attention_cannot_hide_or_finish(self):
+        for agent in self.agents[:7]:
+            for operation in ("hide", "done"):
+                self.assertFalse(self.apply(operation, agent)[0])
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.state.data["tasks"], {})
+
+    def test_hidden_rerun_returns_home_and_keeps_tags_and_pin(self):
+        self.apply("tags", tags=["追蹤"])
+        self.apply("pin")
+        self.assertTrue(self.apply("hide")[0])
+        self.assertEqual(self.state.bucket(self.finished, self.now), "hidden")
+        state = watch.WatchState(self.path)
+        self.finished.status = "running"
+        self.finished.start_time = self.now
+        state.reconcile(self.agents, self.now)
+        self.assertEqual(state.bucket(self.finished, self.now), "running")
+        self.assertFalse(state.task(self.finished.key)["hidden"])
+        self.assertEqual(state.task(self.finished.key)["tags"], ["追蹤"])
+        self.assertTrue(state.task(self.finished.key)["pinned"])
+
+    def test_sixth_pin_rejected_and_unpin_frees_slot(self):
+        for agent in self.agents[:5]:
+            self.assertTrue(self.apply("pin", agent)[0])
+        before = self.path.read_bytes()
+        ok, message = self.apply("pin", self.agents[5])
+        self.assertFalse(ok)
+        self.assertIn("5", message)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.apply("pin", self.agents[0])
+        self.assertTrue(self.apply("pin", self.agents[5])[0])
+        self.assertEqual(sum(bool(t.get("pinned")) for t in self.state.data["tasks"].values()), 5)
+
+    def test_missing_corrupt_and_invalid_schema_are_empty_with_warning(self):
+        self.assertIn("不存在", self.state.warning)
+        for content in ('{broken', '[]', '{"version":2,"tasks":{},"projects":{}}',
+                        '{"version":1,"tasks":{"x":{"tags":3}},"projects":{}}',
+                        '{"version":1,"tasks":{"x":{"hidden":"no"}},"projects":{}}'):
+            self.path.write_text(content)
+            state = watch.WatchState(self.path)
+            self.assertEqual(state.data, dict(version=1, tasks={}, projects={}))
+            self.assertIn("空狀態", state.warning)
+        self.path.write_bytes(b"\xff")
+        self.assertIn("空狀態", watch.WatchState(self.path).warning)
+
+    def test_atomic_replace_sees_complete_temp_and_old_target(self):
+        self.apply("tags", tags=["原始"])
+        before = self.path.read_bytes()
+        replace = os.replace
+        calls = []
+
+        def inspect(source, destination):
+            source = Path(source)
+            self.assertEqual(source.parent, self.path.parent)
+            self.assertNotEqual(source, self.path)
+            self.assertEqual(self.path.read_bytes(), before)
+            data = json.loads(source.read_text())
+            self.assertEqual(data["tasks"][self.finished.key]["tags"], ["新標籤"])
+            calls.append(source)
+            replace(source, destination)
+
+        with patch("watch.os.replace", side_effect=inspect):
+            self.assertTrue(self.apply("tags", tags=["新標籤"])[0])
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0].exists())
+        self.assertEqual(watch.WatchState(self.path).task(self.finished.key)["tags"], ["新標籤"])
+
+    def test_failed_atomic_write_preserves_disk_and_memory(self):
+        self.apply("tags", tags=["原始"])
+        before = self.path.read_bytes()
+        with patch("watch.os.replace", side_effect=OSError("fixture permission denied")):
+            ok, message = self.apply("hide")
+        self.assertFalse(ok)
+        self.assertIn("寫入失敗", message)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse(self.state.task(self.finished.key).get("hidden"))
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_collapse_rejects_active_and_new_task_reopens_after_restart(self):
+        self.assertFalse(self.apply("collapse")[0])
+        project_tasks = [self.finished, self.agents[8]]
+        self.assertTrue(self.state.apply("collapse", self.finished, project_tasks, self.now)[0])
+        self.assertTrue(all(self.state.bucket(a, self.now) == "history" for a in project_tasks))
+        restarted = watch.WatchState(self.path)
+        new = self.agents[5]
+        new.key = "new-run"
+        restarted.reconcile(project_tasks + [new], self.now)
+        self.assertFalse(restarted.data["projects"][new.project]["collapsed"])
+        self.assertEqual(restarted.bucket(self.finished, self.now), "recent")
+
+    def test_manual_done_restore_and_old_history_returns_home(self):
+        self.assertTrue(self.apply("done")[0])
+        self.assertEqual(self.state.bucket(self.finished, self.now), "history")
+        old = self.agents[-1]
+        self.apply("hide", old)
+        self.assertTrue(self.apply("restore", old)[0])
+        self.assertEqual(self.state.bucket(old, self.now), "recent")
+        self.assertFalse(self.state.task(old.key)["hidden"])
+        self.assertTrue(watch.WatchState(self.path).task(old.key)["restored"])
+
+    def test_read_and_tags_persist_and_new_completion_is_unread(self):
+        self.apply("tags", tags=["要追", "待驗", "要追", " "])
+        self.apply("read")
+        state = watch.WatchState(self.path)
+        entry = state.task(self.finished.key)
+        self.assertEqual(entry["tags"], ["要追", "待驗"])
+        self.assertTrue(entry["read"])
+        self.assertIn("updated_at", entry)
+        self.finished.status = "running"
+        state.reconcile(self.agents, self.now)
+        self.finished.status = "complete"
+        state.reconcile(self.agents, self.now)
+        self.assertFalse(state.task(self.finished.key)["read"])
+        self.assertEqual(state.task(self.finished.key)["tags"], ["要追", "待驗"])
+
+    def test_history_search_filters_and_newest_first(self):
+        agents = self.agents[7:]
+        for agent in agents:
+            self.state.apply("done", agent, agents, self.now)
+        agents[1].project = "project-a"
+        self.state.apply("tags", agents[1], agents, self.now, ["追蹤"])
+        self.state.apply("read", agents[1], agents, self.now)
+        self.state.apply("hide", agents[2], agents, self.now)
+        find = lambda **values: history_tasks_for_test(agents, self.state, self.now, **values)
+        self.assertEqual(find(), [a.key for a in agents])
+        self.assertEqual(find(query="RECENT-1"), [agents[1].key])
+        self.assertEqual(find(query="追蹤"), [agents[1].key])
+        self.assertEqual(find(project="project-a"), [agents[1].key])
+        self.assertEqual(find(tag="追蹤"), [agents[1].key])
+        self.assertEqual(find(read="read"), [agents[1].key])
+        self.assertNotIn(agents[1].key, find(read="unread"))
+        self.assertEqual(find(hidden="hidden"), [agents[2].key])
+        self.assertNotIn(agents[2].key, find(hidden="visible"))
+        self.assertEqual(find(query="追蹤", project="project-a", tag="追蹤", read="read", hidden="visible"),
+                         [agents[1].key])
+        self.assertEqual(find(query="no-such-result"), [])
+
+
+def history_tasks_for_test(agents, state, now, **values):
+    return [a.key for a in watch.history_tasks(agents, state, now, **values)]
+
+
+class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    fixture_agents = V10MainPageTests.fixture_agents
+    fixture_app = V10MainPageTests.fixture_app
+    screen_text = staticmethod(V10MainPageTests.screen_text)
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def history_fixture(self):
+        agents = self.fixture_agents()[7:]
+        agents[1].project = "project-a"
+        agents[-1].project = "project-a"
+        for agent in agents:
+            agent.completion_time -= 9000
+        app = self.fixture_app(agents)
+        app.state.update_task(agents[1].key, tags=["追蹤"], read=True)
+        app.state.update_task(agents[2].key, hidden=True)
+        return app, agents
+
+    async def test_history_grouping_collapse_and_newest_first(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2", "g")
+            self.assertTrue(app.history_grouped)
+            self.assertEqual(app.history_rows[0], ("project", "example-project"))
+            self.assertEqual(app.history_rows[1:4], [("task", a.key) for a in (agents[0], agents[2], agents[3])])
+            # Switching to grouped mode keeps the cursor on the previously selected task,
+            # so select the project header before exercising collapse/expand.
+            table = app.query_one("#history-table", watch.DataTable)
+            table.move_cursor(row=app.history_rows.index(("project", "example-project")))
+            await pilot.pause()
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            await pilot.press("space")
+            self.assertIn("example-project", app.history_collapsed)
+            self.assertNotIn(("task", agents[0].key), app.history_rows)
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            await pilot.press("enter")
+            self.assertNotIn("example-project", app.history_collapsed)
+            self.assertIn(("task", agents[0].key), app.history_rows)
+            self.assertFalse(app.ui_error)
+
+    async def test_grouped_space_on_task_row_collapses_project_and_moves_cursor(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2", "g")
+            table = app.query_one("#history-table", watch.DataTable)
+            # 切到分組模式會保留原本的任務游標，這次刻意不先移到專案列。
+            self.assertEqual(app.history_rows[table.cursor_row], ("task", agents[0].key))
+            await pilot.press("space")
+            self.assertIn("example-project", app.history_collapsed)
+            self.assertNotIn(("task", agents[0].key), app.history_rows)
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            self.assertFalse(app.ui_error)
+
+    async def test_grouped_search_input_filters_and_escape_clear(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2", "g", "slash")
+            await pilot.press(*"recent-1")
+            self.assertEqual(app.history_query, "recent-1")
+            self.assertEqual(app.history_rows, [("project", "project-a"), ("task", agents[1].key)])
+            await pilot.press("enter")
+            for field, value in (("project", "project-a"), ("tag", "追蹤"), ("read", "read"), ("hidden", "visible")):
+                app.query_one("#filter-" + field, watch.Select).value = value
+                await pilot.pause()
+                self.assertIn(("task", agents[1].key), app.history_rows)
+            app.query_one("#filter-hidden", watch.Select).value = "hidden"
+            await pilot.pause()
+            self.assertEqual(app.history_rows, [])
+            await pilot.press("escape")
+            self.assertEqual(app.history_query, "")
+            self.assertFalse(app.query_one("#history-search").display)
+            self.assertFalse(app.ui_error)
+
+    async def test_search_treats_shortcuts_as_literal_text(self):
+        app, _ = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2", "slash")
+            await pilot.press(*"q1gituhd")
+            self.assertTrue(app.is_running)
+            self.assertEqual(app.history_query, "q1gituhd")
+            self.assertFalse(app.history_grouped)
+            self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, "tab-history")
+            await pilot.press("escape")
+            self.assertEqual(app.history_query, "")
+
+    async def test_restore_hidden_old_task_returns_to_work_with_selection(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            table = app.query_one("#history-table", watch.DataTable)
+            table.move_cursor(row=app.history_rows.index(("task", agents[2].key)))
+            await pilot.press("r")
+            await pilot.pause()
+            self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, "tab-work")
+            self.assertEqual(app.selected_key, agents[2].key)
+            self.assertIn(agents[2].key, app._row_widgets)
+            self.assertFalse(app.state.task(agents[2].key)["hidden"])
+            self.assertFalse(app.ui_error)
+
+    async def test_work_actions_persist_and_tag_modal_keeps_keys_literal(self):
+        agents = self.fixture_agents()[7:9]
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(app.state.task(agents[0].key)["read"], "visible preview marks completion read")
+            await pilot.press("u")
+            self.assertFalse(app.state.task(agents[0].key)["read"], "manual unread survives refresh")
+            await pilot.press("i")
+            await pilot.pause()
+            self.assertTrue(app.state.task(agents[0].key)["pinned"])
+            self.assertIn(agents[0].key, [row.agent.key for row in app.query_one("#pinned-box").query(watch.TaskRow)])
+            await pilot.press("t")
+            self.assertIsInstance(app.screen, watch.TagScreen)
+            await pilot.press(*"q1,g")
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(app.state.task(agents[0].key)["tags"], ["q1", "g"])
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertEqual(app.state.bucket(agents[0], self.now), "history")
+            persisted = watch.WatchState(app.state.path)
+            self.assertTrue(persisted.task(agents[0].key)["done_manual"])
+            self.assertFalse(app.ui_error)
+
+    async def test_history_highlighting_does_not_mark_read(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2")
+            self.assertFalse(app.state.task(agents[0].key).get("read", False))
+            await pilot.press("u")
+            self.assertTrue(app.state.task(agents[0].key)["read"])
+            await pilot.press("u")
+            self.assertFalse(app.state.task(agents[0].key)["read"])
+
+    async def test_bad_state_warning_once_and_app_keeps_working(self):
+        app, _ = self.history_fixture()
+        app.state.path.write_text("{broken")
+        app.state = watch.WatchState(app.state.path)
+        app.state_message = app.state.warning
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(self.screen_text(app).count("state 檔損壞"), 1)
+            await pilot.press("2", "g")
+            app.update_data()
+            await pilot.pause()
+            self.assertEqual(self.screen_text(app).count("state 檔損壞"), 1)
+            self.assertFalse(app.ui_error)
+
+    async def test_s3_fixture_snapshots_and_registry_mtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+            runs.write_text("")
+            done.write_text("")
+            before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+            shots = Path(__file__).parent / "shots" if os.environ.get(
+                "AGENT_WATCH_UPDATE_S3_SHOTS") else root / "shots"
+            shots.mkdir(parents=True, exist_ok=True)
+            for width in (80, 120):
+                app, agents = self.history_fixture()
+                agents.extend(self.fixture_agents()[5:7])
+                app.runs_path, app.done_path = runs, done
+                with patch("watch.load_all_agents", side_effect=AssertionError("No live registry")), \
+                     patch("watch.subprocess.run", side_effect=AssertionError("No live service")):
+                    async with app.run_test(size=(width, 40)) as pilot:
+                        await pilot.pause()
+                        for mode in ("work", "table", "grouped"):
+                            if mode == "table":
+                                await pilot.press("2")
+                            elif mode == "grouped":
+                                await pilot.press("g")
+                            await pilot.pause()
+                            text = self.screen_text(app)
+                            self.assertEqual(len(text.splitlines()), 40)
+                            self.assertTrue(all(display_width(line) <= width for line in text.splitlines()))
+                            self.assertFalse(app.ui_error)
+                            if mode != "work":
+                                self.assertIn("結果摘要", text)
+                                self.assertIn("archived-task", text)
+                            (shots / ("v10-s3-%s-%dx40.txt" % (mode, width))).write_text(
+                                "\n".join(line.rstrip() for line in text.splitlines()) + "\n",
+                                encoding="utf-8",
+                            )
+            self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+            print("v10-s3 fixture state isolated; TSV bytes and mtime_ns UNCHANGED")
+
+
+class TestQuestionFiles(unittest.TestCase):
+    """SPEC §3.3: QUESTION.md / ANSWER.md parsing and atomic answering."""
+
+    QUESTION = (
+        "# QUESTION\n"
+        "id: q1\n"
+        "asked_at: 2026-10-25T10:00:00Z\n"
+        "question: 要先修 A 還是 B？\n"
+        "options:\n"
+        "- A: 先修 A\n"
+        "- B: 先修 B（推薦）\n"
+        "- C: 兩個都先不修\n"
+    )
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-question-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def test_valid_question_parses_id_options_and_wait(self):
+        parsed = watch.parse_question(self.QUESTION)
+        self.assertEqual(parsed["error"], "")
+        self.assertEqual(parsed["id"], "q1")
+        self.assertEqual([code for code, _ in parsed["options"]], ["A", "B", "C"])
+        self.assertIn("推薦", parsed["options"][1][1])
+        self.assertEqual(
+            watch.format_question_wait(watch.question_wait_seconds(
+                {"asked_at_ts": parsed["asked_at"]}, parsed["asked_at"] + 185)),
+            "已等 3m",
+        )
+        self.assertEqual(watch.format_question_wait(31 * 60), "已等 31m")
+        self.assertEqual(watch.format_question_wait(2 * 3600 + 5 * 60), "已等 2h05m")
+
+    def test_missing_id_question_or_options_is_an_error(self):
+        for body, expected in (
+            ("id: q1\nquestion: x\noptions:\n- A: a\n", "缺少 # QUESTION"),
+            ("# QUESTION\nquestion: x\noptions:\n- A: a\n", "缺少 id"),
+            ("# QUESTION\nid: q1\noptions:\n- A: a\n", "缺少 question"),
+            ("# QUESTION\nid: q1\nquestion: x\n", "缺少 options"),
+            ("# QUESTION\nid: q1\nquestion: x\noptions:\n- A\n", "缺少 options"),
+            ("# QUESTION\nid: q1\nquestion: x\noptions:\n- A: a\n- A: b\n", "重複"),
+        ):
+            with self.subTest(body=body):
+                self.assertIn(expected, watch.parse_question(body)["error"])
+        self.assertTrue(watch.question_is_active(watch.parse_question("# QUESTION\nid: q1\n")))
+
+    def test_answer_requires_matching_id_and_choice(self):
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        question = watch.read_task_question(self.root)
+        self.assertTrue(watch.question_is_active(question))
+        (self.root / "ANSWER.md").write_text("# ANSWER\nid: q9\nchoice: B\n")
+        self.assertFalse(watch.read_task_question(self.root)["answered"], "stale id is not an answer")
+        self.assertTrue(watch.question_is_active(watch.read_task_question(self.root)))
+
+        ok, _ = watch.write_answer_file(self.root, question, "D")
+        self.assertFalse(ok)
+        self.assertFalse((self.root / "ANSWER.md").read_text().endswith("choice: D\n"))
+
+        ok, _ = watch.write_answer_file(self.root, question, "B", "先 B 再 A", now=1792922400)
+        self.assertTrue(ok)
+        content = (self.root / "ANSWER.md").read_text()
+        self.assertEqual(
+            content.splitlines()[:4],
+            ["# ANSWER", "id: q1", "answered_at: 2026-10-25T18:00:00+08:00", "choice: B"],
+        )
+        self.assertIn("note: 先 B 再 A", content)
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+        self.assertTrue(watch.read_task_question(self.root)["answered"])
+
+    def test_stale_question_after_completion_is_not_active(self):
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        question = watch.read_task_question(self.root)
+        self.assertTrue(watch.question_is_active(question, completion_time=question["asked_at"] - 60))
+        self.assertFalse(watch.question_is_active(question, completion_time=question["asked_at"] + 60))
+        question["answered"] = True
+        self.assertFalse(watch.question_is_active(question))
+
+    def test_tsv_question_status_and_answer_clears_attention(self):
+        now = parse_timestamp("2026-10-25T10:10:00Z")
+        log = self.root / "run.log"
+        write_log(log, now - 600, "等回答中")
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        set_mtime(self.root / "QUESTION.md", now - 120)
+        runs, done = self.root / "runs.tsv", self.root / "done.tsv"
+        runs.write_text("ask-task\t%s\t%s\t\tClaude\tmodel-q\taw\n" % (log, self.root / "REPORT.md"))
+        done.write_text("")
+        agents, errors = load_all_agents(runs, done, LogParser(process_start_reader=None), now)
+        self.assertEqual(errors, [])
+        self.assertEqual(agents[0].status, "question")
+        self.assertEqual(agents[0].question["id"], "q1")
+        self.assertTrue(watch.write_answer_file(self.root, agents[0].question, "A", now=now)[0])
+        agents, _ = load_all_agents(runs, done, LogParser(process_start_reader=None), now)
+        self.assertNotEqual(agents[0].status, "question")
+        self.assertTrue(agents[0].question["answered"])
+
+
+class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """SPEC §2.4 / §3.3: read-only terminal, question popup, ANSWER.md, 30m alert."""
+
+    fixture_app = V10MainPageTests.fixture_app
+    screen_text = staticmethod(V10MainPageTests.screen_text)
+
+    QUESTION = TestQuestionFiles.QUESTION
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def deep_dir(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-deep-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        log = root / "run.log"
+        log.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"白話第一句"}]}}\n'
+            '{"type":"system","subtype":"init","model":"fixture-model","timestamp":"2026-10-25T09:59:00Z"}\n'
+            "工具完成\n"
+        )
+        return root, log
+
+    def write_question(self, root, asked_at, body=None):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(asked_at))
+        text = body if body is not None else self.QUESTION.replace(
+            "2026-10-25T10:00:00Z", stamp,
+        )
+        path = root / "QUESTION.md"
+        path.write_text(text)
+        set_mtime(path, asked_at)
+
+    def question_agent(self, root, log, status="question", question=None, **values):
+        if question is None:
+            question = watch.read_task_question(root)
+        defaults = dict(
+            name="question-task", log_path=log, last_path=root / "REPORT.md",
+            status=status, harness="Claude", model="claude-fixture",
+            start_time=self.now - 900, elapsed="00:15:00", latest="等回答",
+            log_lines=["等回答中"], log_mtime=self.now - 1, project="example-project",
+            key="question-task::%s::%s" % (log, root / "REPORT.md"), question=question,
+        )
+        defaults.update(values)
+        return AgentInfo(**defaults)
+
+    async def test_enter_terminal_escape_keeps_pid_and_log_untouched(self):
+        root, log = self.deep_dir()
+        agent = self.question_agent(root, log, status="running", question=None, pid=os.getpid())
+        before = (log.stat().st_mtime_ns, log.read_bytes())
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.TerminalScreen)
+            text = self.screen_text(app)
+            self.assertIn("白話第一句", text)
+            self.assertIn("初始化 Claude (fixture-model)", text)
+            self.assertNotIn('{"type"', text)
+            self.assertTrue(app.state.task(agent.key)["read"], "deep view marks the task read")
+            app.update_data(now=self.now + 5)
+            self.assertIsInstance(app.screen, watch.TerminalScreen)
+            self.assertFalse(app.ui_error)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, watch.TerminalScreen)
+            self.assertEqual(app.selected_key, agent.key)
+            self.assertEqual(app.focused.agent.key, agent.key)
+            self.assertEqual(app.current_agents[0].pid, os.getpid())
+            os.kill(os.getpid(), 0)  # the dashboard never signals the run
+        self.assertEqual(before, (log.stat().st_mtime_ns, log.read_bytes()))
+
+    async def test_terminal_search_scroll_and_live_tail(self):
+        root, log = self.deep_dir()
+        agent = self.question_agent(root, log, status="running", question=None)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            search = app.screen.query_one("#terminal-search", watch.Input)
+            search.value = "工具"
+            await pilot.pause()
+            screen = app.screen
+            self.assertEqual(screen.query_text, "工具")
+            rendered = screen.query_one("#terminal-content", watch.Static).render()
+            self.assertIn("工具完成", rendered.plain)
+            self.assertIn("224,175,104", " ".join(str(span.style) for span in rendered.spans))
+            await pilot.press("enter")
+            await pilot.pause()
+            log.write_text(log.read_text() + "即時追加一行\n")
+            screen.refresh_content()
+            await pilot.pause()
+            self.assertIn(
+                "即時追加一行",
+                screen.query_one("#terminal-content", watch.Static).render().plain,
+            )
+            self.assertFalse(app.ui_error)
+
+    async def test_question_popup_writes_answer_with_matching_id(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 120)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertIn("等回答", self.screen_text(app))
+            self.assertIn("已等 2m", self.screen_text(app))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.QuestionScreen)
+            self.assertIn("要先修 A 還是 B？", self.screen_text(app))
+            options = app.screen.query_one("#question-options", watch.OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            answer = (root / "ANSWER.md").read_text()
+            self.assertIn("id: q1", answer)
+            self.assertIn("choice: B", answer)
+            self.assertIn("answered_at: ", answer)
+            self.assertIn("note: ", answer)
+            self.assertEqual(list(root.glob("*.tmp")), [])
+            self.assertTrue(watch.read_task_question(root)["answered"])
+            self.assertFalse(app.ui_error)
+
+    async def test_question_note_input_and_escape_cancel(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 60)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            self.assertFalse((root / "ANSWER.md").exists(), "Esc cancels without writing")
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one("#question-options", watch.OptionList).highlighted = 2
+            note = app.screen.query_one("#question-note", watch.Input)
+            note.focus()
+            note.value = "先 C"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            answer = (root / "ANSWER.md").read_text()
+            self.assertIn("choice: C", answer)
+            self.assertIn("note: 先 C", answer)
+
+    async def test_malformed_question_shows_raw_and_cannot_answer(self):
+        root, log = self.deep_dir()
+        self.write_question(
+            root, self.now - 60,
+            body="# QUESTION\nid: q9\nquestion: 壞掉的問題\n- 沒有 options 段落\n",
+        )
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            screen = self.screen_text(app)
+            self.assertIn("問題格式錯誤", screen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.QuestionScreen)
+            self.assertFalse(app.screen.query("#question-options"), "no options for bad format")
+            self.assertFalse(app.screen.query("#question-note"))
+            self.assertIn("只顯示原文", self.screen_text(app))
+            self.assertIn("壞掉的問題", self.screen_text(app))
+            await pilot.press("escape")
+            await pilot.pause()
+        self.assertFalse((root / "ANSWER.md").exists())
+
+    async def test_thirty_minute_question_turns_red_and_notifies_once(self):
+        old_root, old_log = self.deep_dir()
+        self.write_question(old_root, self.now - 31 * 60)
+        old = self.question_agent(old_root, old_log)
+        text = watch.render_task_row(old, 76, self.now)
+        self.assertIn("已等 31m", text.plain)
+        self.assertIn("#f7768e", " ".join(str(span.style) for span in text.spans))
+        self.assertTrue(all(display_width(line) <= 76 for line in text.plain.splitlines()))
+
+        young_root, young_log = self.deep_dir()
+        self.write_question(young_root, self.now - 29 * 60)
+        young = self.question_agent(young_root, young_log)
+        young_text = watch.render_task_row(young, 76, self.now)
+        self.assertIn("已等 29m", young_text.plain)
+        self.assertIn("#e0af68", " ".join(str(span.style) for span in young_text.spans))
+
+        app = self.fixture_app([old])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            app.is_first_load = False
+            # The first paint records already-overdue questions without alerting;
+            # this test checks the crossing itself.
+            app.notified_questions.clear()
+            with patch("watch.notify_question_overdue") as notify:
+                app.update_data(now=self.now - 2 * 60)  # 29 minutes
+                notify.assert_not_called()
+                app.update_data(now=self.now)  # 31 minutes
+                self.assertEqual(notify.call_count, 1)
+                app.update_data(now=self.now + 30)
+                self.assertEqual(notify.call_count, 1, "one alert per question id")
+            self.assertIn("已等 31m", self.screen_text(app))
+
+    async def test_s5_fixture_snapshots_and_registry_mtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+            runs.write_text("")
+            done.write_text("")
+            before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+            shots = Path(__file__).parent / "shots" if os.environ.get(
+                "AGENT_WATCH_UPDATE_S5_SHOTS") else root / "shots"
+            shots.mkdir(parents=True, exist_ok=True)
+            for width in (80, 120):
+                cases = []
+                work_root, work_log = self.deep_dir()
+                self.write_question(work_root, self.now - 31 * 60)
+                cases.append(("work-question", self.question_agent(work_root, work_log)))
+                term_root, term_log = self.deep_dir()
+                cases.append(("terminal", self.question_agent(
+                    term_root, term_log, status="running", question=None,
+                )))
+                q_root, q_log = self.deep_dir()
+                self.write_question(q_root, self.now - 300)
+                cases.append(("question", self.question_agent(q_root, q_log)))
+                for name, agent in cases:
+                    app = self.fixture_app([agent])
+                    app.runs_path, app.done_path = runs, done
+                    with patch("watch.load_all_agents", side_effect=AssertionError("No live registry")), \
+                         patch("watch.subprocess.run", side_effect=AssertionError("No live service")):
+                        async with app.run_test(size=(width, 40)) as pilot:
+                            await pilot.pause()
+                            if name != "work-question":
+                                await pilot.press("enter")
+                                await pilot.pause()
+                            text = self.screen_text(app)
+                            self.assertEqual(len(text.splitlines()), 40)
+                            self.assertTrue(all(display_width(line) <= width for line in text.splitlines()))
+                            self.assertFalse(app.ui_error)
+                            if name == "terminal":
+                                self.assertIn("白話第一句", text)
+                            elif name == "question":
+                                self.assertIn("要先修 A 還是 B？", text)
+                            else:
+                                self.assertIn("已等 31m", text)
+                            (shots / ("v10-s5-%s-%dx40.txt" % (name, width))).write_text(
+                                "\n".join(line.rstrip() for line in text.splitlines()) + "\n",
+                                encoding="utf-8",
+                            )
+            self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+            print("v10-s5 fixtures isolated; TSV bytes and mtime_ns UNCHANGED")
 
 
 if __name__ == "__main__":

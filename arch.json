@@ -3,14 +3,17 @@
   "projects": {
     "example-project": {
       "label": "example-project",
+      "aliases": ["example"],
       "match_keywords": ["example-project", "example project"],
       "path_keywords": ["example-project"],
       "default_view": "now"
     },
     "project-a": {
       "label": "project-a",
-      "match_keywords": ["project-a", "project a", "pa", "alpha", "pr #4"],
-      "path_keywords": ["project-a", "alpha-", "pr-4"],
+      "aliases": ["pa"],
+      "match_keywords": ["project-a", "project a", "pa", "alpha"],
+      "match_patterns": ["(?<![a-z0-9])pr\\s*#\\d+(?![a-z0-9])", "(?<![a-z0-9])pr-\\d+(?![a-z0-9])"],
+      "path_keywords": ["project-a", "alpha-"],
       "default_view": "now"
     },
     "project-b": {
@@ -29,6 +32,34 @@
       "label": "Project D",
       "match_keywords": ["project-d", "project d", "quota"],
       "path_keywords": ["project-d", "quota"],
+      "default_view": "now"
+    },
+    "personal-ai-os": {
+      "label": "personal-ai-os",
+      "aliases": ["pai"],
+      "match_keywords": ["personal-ai-os", "pai"],
+      "path_keywords": ["personal-ai-os"],
+      "default_view": "now"
+    },
+    "agent-watch": {
+      "label": "agent-watch",
+      "aliases": ["aw"],
+      "match_keywords": ["agent-watch", "aw"],
+      "path_keywords": ["agent-watch"],
+      "default_view": "now"
+    },
+    "ios-shortcuts": {
+      "label": "iOS 捷徑",
+      "aliases": ["ios"],
+      "match_keywords": ["ios-shortcuts", "ios"],
+      "path_keywords": ["ios-shortcuts"],
+      "default_view": "now"
+    },
+    "K1": {
+      "label": "K1",
+      "aliases": ["k1"],
+      "match_keywords": ["K1"],
+      "path_keywords": ["K1"],
       "default_view": "now"
     },
     "other": {

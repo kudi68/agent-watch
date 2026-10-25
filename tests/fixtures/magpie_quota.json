@@ -7,9 +7,9 @@
     "windows": [
       {
         "name": "5 hours",
-        "used": 19,
-        "remaining": 81,
-        "resetsAt": "2026-10-25T16:59:00+08:00"
+        "used": 50,
+        "remaining": 50,
+        "resetsAt": "2026-10-25T18:15:00+08:00"
       },
       {
         "name": "7 days",
@@ -28,8 +28,8 @@
     "windows": [
       {
         "name": "5 hours",
-        "used": 11,
-        "remaining": 89,
+        "used": 85,
+        "remaining": 15,
         "resetsAt": "2026-10-25T19:11:51+08:00"
       },
       {
@@ -65,6 +65,16 @@
         "resetsAt": "2026-11-16T07:28:11+08:00"
       }
     ],
-    "readAt": "2026-10-25T15:00:54+08:00"
+    "readAt": "2026-10-25T15:00:54+08:00",
+    "lastServedAt": "2026-10-25T15:00:54+08:00"
+  },
+  {
+    "provider": "openrouter",
+    "name": "OpenRouter",
+    "kind": "balance",
+    "user": "quota-user@example.invalid",
+    "windows": [],
+    "balance": "$19.58",
+    "readAt": "2026-10-25T15:00:56+08:00"
   }
 ]

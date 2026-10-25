@@ -2,6 +2,8 @@
 """agent-watch v8: Textual dashboard for reliable run status and quota monitoring."""
 
 import argparse
+import calendar
+import copy
 import json
 import math
 import os
@@ -10,22 +12,30 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from rich.markup import escape
+from rich.text import Text
 
 # Textual imports (conditional for --once flag speed)
 try:
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.widgets import Collapsible, Footer, Label, Static, TabbedContent, TabPane
+    from textual.message import Message
+    from textual.screen import ModalScreen
+    from textual.widgets import (
+        DataTable, Input, Label, OptionList, Select, Static, TabbedContent, TabPane,
+    )
+    from textual.widgets.option_list import Option
 except ImportError:
     App = object  # type: ignore
 
@@ -55,6 +65,8 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     """Load and validate the editable architecture graph from JSON."""
     source = Path(path) if path is not None else ARCHITECTURE_PATH
     data = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("arch.json must be an object")
     projects = data.get("projects")
     architectures = data.get("architectures")
     if not isinstance(projects, dict) or not projects:
@@ -65,6 +77,13 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     for project_id, project in projects.items():
         if not isinstance(project, dict) or not project.get("label"):
             raise ValueError(f"project {project_id!r} has no label")
+        for key in ("aliases", "match_keywords", "path_keywords", "match_patterns"):
+            values = project.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise ValueError(f"project {project_id!r} has invalid {key}")
+            if key == "match_patterns":
+                for pattern in values:
+                    re.compile(pattern)
         default_view = project.get("default_view", "now")
         if default_view not in architectures:
             raise ValueError(f"project {project_id!r} uses unknown architecture {default_view!r}")
@@ -77,6 +96,10 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
         edges = view.get("edges")
         if not isinstance(nodes, dict) or not isinstance(layers, list) or not layers:
             raise ValueError(f"architecture {view_id!r} has invalid nodes or layers")
+        if not all(isinstance(node, dict) for node in nodes.values()):
+            raise ValueError(f"architecture {view_id!r} has invalid node definitions")
+        if edges is not None and not isinstance(edges, list):
+            raise ValueError(f"architecture {view_id!r} has invalid edges")
         layer_by_node = {}
         for layer_index, layer in enumerate(layers):
             if not isinstance(layer, list) or not layer:
@@ -97,18 +120,67 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     return data
 
 
-ARCHITECTURE_DATA = load_architecture_data()
+FALLBACK_ARCHITECTURE = {
+    "projects": {"other": {"label": "其他", "default_view": "now"}},
+    "architectures": {
+        "now": {
+            "label": "現在", "caption": "架構資料無法讀取", "layers": [["operator"]],
+            "nodes": {"operator": {"label": "Operator", "kind": "actor"}}, "edges": [],
+        }
+    },
+}
+ARCHITECTURE_DATA: Dict[str, Any] = {}
+ARCHITECTURE_ERRORS: List[str] = []
+
+
+def ensure_architecture_data() -> None:
+    """Load at runtime, keeping a usable graph and one warning on bad input."""
+    if ARCHITECTURE_DATA:
+        return
+    try:
+        data = load_architecture_data()
+    except (OSError, ValueError, TypeError, KeyError, re.error) as exc:
+        data = copy.deepcopy(FALLBACK_ARCHITECTURE)
+        ARCHITECTURE_ERRORS[:] = [f"arch.json 無法讀取，使用預設架構：{exc}"]
+    ARCHITECTURE_DATA.update(data)
 PROJECT_OTHER = "other"
 RECENT_DONE_SECONDS = 2 * 60 * 60
+# Tolerate small clock skew so a just-finished task is not aged into history.
+FUTURE_SKEW_TOLERANCE_SECONDS = 5 * 60
 MAGPIE_TIMEOUT_SECONDS = 10
 QUOTA_REFRESH_SECONDS = 60
+QUOTA_BURN_AHEAD_PERCENT = 15
+QUOTA_CRITICAL_PERCENT = 85
+# SPEC §3.3: a question left unanswered for 30 minutes turns red and notifies.
+QUESTION_OVERDUE_SECONDS = 30 * 60
+QUESTION_FILENAME = "QUESTION.md"
+ANSWER_FILENAME = "ANSWER.md"
+TERMINAL_TAIL_LINES = 400
+TERMINAL_TAIL_BYTES = 512 * 1024
+QUOTA_PROVIDER_NAMES = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "opencode-go": "OpenCode Go",
+    "openrouter": "OpenRouter",
+}
 
 
 def keyword_matches(keyword: str, text: str) -> bool:
     token = keyword.casefold()
-    if re.fullmatch(r"[a-z0-9]{1,3}", token):
-        return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text) is not None
-    return token in text
+    return bool(token) and re.search(
+        rf"(?<![a-z0-9]){re.escape(token)}" + (r"(?![a-z0-9])" if token[-1:].isalnum() else ""),
+        text.casefold(),
+    ) is not None
+
+
+def resolve_project(value: str) -> Tuple[str, str]:
+    ensure_architecture_data()
+    for project_id, config in ARCHITECTURE_DATA["projects"].items():
+        if value.casefold() in [project_id.casefold()] + [
+            alias.casefold() for alias in config.get("aliases", [])
+        ]:
+            return project_id, ""
+    return PROJECT_OTHER, f"未知專案：{value}"
 
 
 def infer_project(
@@ -117,6 +189,7 @@ def infer_project(
     last_path: Optional[Path] = None,
 ) -> str:
     """Map a task to the configured project table; unknown tasks use other."""
+    ensure_architecture_data()
     name_text = name.casefold()
     path_text = " ".join(
         str(path) for path in (log_path, last_path) if path is not None
@@ -131,6 +204,8 @@ def infer_project(
             for keyword in name_keywords
         ):
             return project_id
+        if any(re.search(pattern, name_text + " " + path_text, re.IGNORECASE) for pattern in config.get("match_patterns", [])):
+            return project_id
         if any(
             isinstance(keyword, str) and keyword_matches(keyword, path_text)
             for keyword in path_keywords
@@ -140,6 +215,7 @@ def infer_project(
 
 
 def project_label(project_id: str) -> str:
+    ensure_architecture_data()
     config = ARCHITECTURE_DATA.get("projects", {}).get(project_id)
     if isinstance(config, dict) and config.get("label"):
         return str(config["label"])
@@ -147,6 +223,7 @@ def project_label(project_id: str) -> str:
 
 
 def project_sort_key(project_id: str) -> Tuple[int, str]:
+    ensure_architecture_data()
     configured = list(ARCHITECTURE_DATA.get("projects", {}).keys())
     if project_id in configured:
         return configured.index(project_id), project_label(project_id)
@@ -309,6 +386,8 @@ def _identity_from_metadata_record(data: Dict[str, Any]) -> Tuple[str, str]:
             harness = _harness_value(item.get("harness"))
         if model == UNKNOWN_IDENTITY and item.get("model") is not None:
             model = _model_value(item.get("model"))
+    if event == "system" and data.get("subtype") == "init":
+        harness = "Claude Code"
     return harness, model
 
 
@@ -481,6 +560,39 @@ def format_elapsed(start_time: Optional[float], now: float) -> str:
 
 def summarize_jsonl_step(data: dict) -> str:
     """Produce a concise human-readable summary for an agy jsonl event."""
+    kind = data.get("type")
+    if kind == "system":
+        model = data.get("model", "")
+        return f"初始化 Claude ({model})" if model else "Claude 系統事件"
+    if kind in ("assistant", "user"):
+        message = data.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if isinstance(content, str):
+            return clean_text(content)
+        summaries = []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                summaries.append(clean_text(block["text"]))
+            elif block.get("type") == "tool_use":
+                params = json.dumps(block.get("input", {}), ensure_ascii=False, separators=(",", ":"))
+                summaries.append(f"工具：{block.get('name', '未知')} {params[:100]}")
+        return " · ".join(summaries) or ("接收使用者指令" if kind == "user" else "")
+    if kind == "result":
+        result = clean_text(str(data.get("result") or ""))
+        failed = data.get("is_error") is True or str(data.get("subtype", "")).startswith("error")
+        return f"{'失敗' if failed else '完成'}：{result or data.get('subtype', '')}"
+    part = data.get("part")
+    if isinstance(part, dict):
+        if isinstance(part.get("text"), str):
+            return clean_text(part["text"])
+        if part.get("tool"):
+            return f"工具：{part['tool']}"
+    if kind in ("item.completed", "item.updated"):
+        item = data.get("item", {})
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            return clean_text(item["text"])
     event = data.get("event", "")
     if event == "init":
         model = data.get("init", {}).get("model", "")
@@ -505,7 +617,249 @@ def summarize_jsonl_step(data: dict) -> str:
         elif stype == "user_input":
             return "接收使用者指令"
         return f"步驟更新 ({stype} {state})"
-    return clean_text(str(data))[:60]
+    return clean_text(str(data.get("text") or data.get("message") or data.get("type") or event or "日誌事件"))[:120]
+
+
+def record_timestamp(data: Dict[str, Any]) -> Optional[float]:
+    value = data.get("timestamp")
+    if isinstance(value, (float, int)):
+        return float(value) / 1000 if value > 10**11 else float(value)
+    if value:
+        return parse_timestamp(str(value))
+    return None
+
+
+def question_key_value(line: str) -> Optional[Tuple[str, str]]:
+    """Parse a `key: value` line from QUESTION.md / ANSWER.md."""
+    match = re.match(r"^([A-Za-z_]+)\s*[:：]\s*(.*)$", line.strip())
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def parse_question(text: str) -> Dict[str, Any]:
+    """Parse SPEC §3.3 QUESTION.md; `error` keeps unreadable files answerless."""
+    question: Dict[str, Any] = dict(
+        id="", asked_at=None, asked_at_text="", question="", options=[],
+        raw=text, error="",
+    )
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].strip().upper().startswith("# QUESTION"):
+        question["error"] = "缺少 # QUESTION 標題"
+        return question
+
+    values: Dict[str, str] = {}
+    options: List[Tuple[str, str]] = []
+    option_error = ""
+    in_options = False
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if in_options:
+            match = re.match(r"^[-*]\s*([^:：\s]+)\s*[:：]\s*(.+?)\s*$", stripped)
+            if match:
+                options.append((match.group(1), match.group(2)))
+                continue
+            if question_key_value(stripped) is None:
+                option_error = option_error or "選項格式錯誤：" + stripped
+                continue
+            in_options = False
+        pair = question_key_value(stripped)
+        if pair is None:
+            continue
+        key, value = pair
+        if key == "options":
+            in_options = True
+            if value:
+                option_error = option_error or "options 必須另起一行列出"
+        else:
+            values[key] = value
+
+    question["id"] = values.get("id", "")
+    question["asked_at_text"] = values.get("asked_at", "")
+    question["question"] = values.get("question", "")
+    question["options"] = options
+    codes = [code for code, _ in options]
+    if not question["id"]:
+        question["error"] = "缺少 id"
+    elif not question["question"]:
+        question["error"] = "缺少 question"
+    elif not options:
+        question["error"] = "缺少 options 或沒有可用選項"
+    elif len(set(codes)) != len(codes):
+        question["error"] = "選項代號重複"
+    elif option_error:
+        question["error"] = option_error
+    if question["asked_at_text"]:
+        question["asked_at"] = parse_timestamp(question["asked_at_text"])
+    return question
+
+
+def parse_answer(text: str) -> Dict[str, Any]:
+    """Parse ANSWER.md; a mismatched id is treated as no answer."""
+    answer: Dict[str, Any] = dict(id="", choice="", note="", answered_at="", error="")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].strip().upper().startswith("# ANSWER"):
+        answer["error"] = "缺少 # ANSWER 標題"
+        return answer
+    for line in lines[1:]:
+        if line.strip().startswith("#"):
+            continue
+        pair = question_key_value(line)
+        if pair is None:
+            continue
+        key, value = pair
+        if key in ("id", "choice", "note", "answered_at"):
+            answer[key] = value
+    if not answer["id"]:
+        answer["error"] = "缺少 id"
+    elif not answer["choice"]:
+        answer["error"] = "缺少 choice"
+    return answer
+
+
+def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
+    """Read QUESTION.md beside the run log; None when the task has no question."""
+    path = Path(directory) / QUESTION_FILENAME
+    try:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+    question = parse_question(text)
+    question["path"] = str(path)
+    question["mtime"] = info.st_mtime
+    asked = question.get("asked_at")
+    question["asked_at_ts"] = asked if asked is not None else info.st_mtime
+    question["asked_at_estimated"] = asked is None
+    answer_text = ""
+    try:
+        answer_path = path.with_name(ANSWER_FILENAME)
+        if stat.S_ISREG(answer_path.stat().st_mode):
+            answer_text = answer_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        answer_text = ""
+    answer = parse_answer(answer_text) if answer_text.strip() else None
+    question["answer"] = answer
+    question["answered"] = bool(
+        question["id"] and answer is not None and not answer["error"]
+        and answer["id"] == question["id"]
+    )
+    return question
+
+
+def question_is_active(question: Optional[Dict[str, Any]],
+                       completion_time: Optional[float] = None) -> bool:
+    """An unanswered question is attention until a matching ANSWER.md exists."""
+    if not question or question.get("answered"):
+        return False
+    asked = question.get("asked_at_ts") or question.get("mtime") or 0
+    if completion_time is not None and asked <= completion_time:
+        # A leftover question older than the finished run belongs to an older run.
+        return False
+    return True
+
+
+def question_wait_seconds(question: Optional[Dict[str, Any]], now: float) -> int:
+    if not question:
+        return 0
+    asked = question.get("asked_at_ts") or question.get("mtime") or now
+    return max(0, int(now - asked))
+
+
+def format_question_wait(seconds: int) -> str:
+    minutes = max(0, int(seconds)) // 60
+    if minutes < 60:
+        return "已等 %dm" % minutes
+    hours, minutes = divmod(minutes, 60)
+    return "已等 %dh%02dm" % (hours, minutes)
+
+
+def write_answer_file(directory: Path, question: Dict[str, Any], choice: str,
+                      note: str = "", now: Optional[float] = None) -> Tuple[bool, str]:
+    """Write ANSWER.md atomically with the question's id (SPEC §3.3)."""
+    if question.get("error"):
+        return False, "問題格式錯誤，不能回答"
+    codes = [code for code, _ in question.get("options", [])]
+    if not choice or choice not in codes:
+        return False, "選項不存在"
+    if not question.get("id"):
+        return False, "問題缺少 id，不能回答"
+    stamp = datetime.fromtimestamp(now if now is not None else time.time()).astimezone()
+    clean_note = " ".join(str(note or "").splitlines()).strip()
+    content = (
+        "# ANSWER\n"
+        "id: %s\n"
+        "answered_at: %s\n"
+        "choice: %s\n"
+        "note: %s\n"
+    ) % (question["id"], stamp.isoformat(timespec="seconds"), choice, clean_note)
+    target = Path(directory) / ANSWER_FILENAME
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(Path(directory)),
+            prefix="." + ANSWER_FILENAME + "-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        return False, "ANSWER.md 寫入失敗：" + str(exc)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    return True, str(target)
+
+
+def read_log_tail(path: Path, limit: int = TERMINAL_TAIL_LINES) -> List[str]:
+    """Read only the log tail, like `tail -n`, without scanning the whole file."""
+    if str(path) == "/dev/null":
+        return []
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            block = min(size, TERMINAL_TAIL_BYTES)
+            stream.seek(size - block)
+            data = stream.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    return text.splitlines()[-limit:]
+
+
+def humanize_log_line(line: str) -> str:
+    """Turn one tail line into plain language; JSON events never show raw keys."""
+    cleaned = clean_text(line)
+    if not cleaned or is_noise(cleaned):
+        return ""
+    stripped = cleaned.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            return " ".join(summarize_jsonl_step(data).splitlines()).strip()
+    return " ".join(cleaned.splitlines()).strip()
+
+
+def humanize_log_lines(lines: List[str]) -> List[str]:
+    result = []
+    for line in lines:
+        summary = humanize_log_line(line)
+        if summary:
+            result.append(summary)
+    return result
 
 
 @dataclass
@@ -529,6 +883,14 @@ class AgentInfo:
     stage: str = ""
     harness: str = UNKNOWN_IDENTITY
     project: str = PROJECT_OTHER
+    start_source: str = ""
+    elapsed_estimated: bool = False
+    question: Optional[Dict[str, Any]] = None
+
+
+# Sentinel so an injected reader and the built-in `ps` reader stay distinct:
+# passing None still disables the PID source explicitly.
+DEFAULT_PROCESS_START_READER = object()
 
 
 class LogParser:
@@ -536,9 +898,46 @@ class LogParser:
 
     MAX_INITIAL_READ = 2 * 1024 * 1024
     START_SCAN_BYTES = 64 * 1024
+    PID_START_CACHE_LIMIT = 512
 
-    def __init__(self):
+    def __init__(
+        self,
+        process_start_reader: Any = DEFAULT_PROCESS_START_READER,
+    ):
         self.cache: Dict[str, dict] = {}
+        # SPEC §4.1 layer 2: a live PID's `ps -o lstart=` start time sits
+        # between the TSV's started_at and the log/birthtime estimate.
+        if process_start_reader is DEFAULT_PROCESS_START_READER:
+            process_start_reader = read_process_start
+        self.process_start_reader: Optional[Callable[[int], Optional[float]]] = process_start_reader
+        self.pid_start_cache: Dict[int, Optional[float]] = {}
+        self.result_events: Dict[str, Tuple[Optional[float], str]] = {}
+        # The latest init event bounds the CURRENT run. Claude writes its
+        # REPORT.md before the final log records, so this (not the log mtime)
+        # decides whether a report belongs to this invocation.
+        self.init_events: Dict[str, Optional[float]] = {}
+
+    def pid_start_time(self, pid: Optional[int]) -> Optional[float]:
+        """Return a live PID's start time; a successful lookup is cached per PID."""
+        if pid is None or self.process_start_reader is None:
+            return None
+        if pid in self.pid_start_cache:
+            return self.pid_start_cache[pid]
+        try:
+            value = self.process_start_reader(pid)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            value = None
+        # A start after `now` cannot describe an already-running process;
+        # treat it as unusable rather than showing a negative elapsed time.
+        if value is not None and (not isinstance(value, (int, float)) or value > time.time() + 60):
+            value = None
+        if value is not None:
+            # A process's start time never changes, so cache the hit; a miss is
+            # retried on the next poll in case `ps` was only briefly unavailable.
+            if len(self.pid_start_cache) >= self.PID_START_CACHE_LIMIT:
+                self.pid_start_cache.clear()
+            self.pid_start_cache[pid] = value
+        return value
 
     @staticmethod
     def _summarize(raw_line: bytes, mtime: float) -> Tuple[Optional[float], Optional[str], Optional[str]]:
@@ -546,7 +945,7 @@ class LogParser:
         if not line:
             return None, None, None
 
-        timestamp = parse_timestamp(line)
+        timestamp = parse_timestamp(line) if re.match(r"^20\d{2}[-/]", line) else None
         model = None
         if is_noise(line):
             return timestamp, model, None
@@ -555,27 +954,32 @@ class LogParser:
             try:
                 data = json.loads(line)
                 summary = summarize_jsonl_step(data) if isinstance(data, dict) else line
+                if isinstance(data, dict):
+                    timestamp = record_timestamp(data)
             except (json.JSONDecodeError, ValueError):
                 summary = line
         else:
             summary = line
 
-        match_clock = CLOCK_RE.search(line)
-        clock = match_clock.group(1) if match_clock else time.strftime("%H:%M:%S", time.localtime(mtime))
-        return timestamp, model, f"{clock}  {summary}"
+        if not summary:
+            return timestamp, model, None
+        clock = time.strftime("%H:%M:%S", time.localtime(timestamp)) if timestamp is not None else ""
+        return timestamp, model, f"{clock}  {summary}" if clock else summary
 
     def parse(self, path: Path) -> Tuple[Optional[float], str, List[str], float, str]:
         if str(path) == "/dev/null":
             return None, UNKNOWN_IDENTITY, [], 0.0, ""
 
+        cache_key = str(path.resolve())
         try:
             st = path.stat()
             if not stat.S_ISREG(st.st_mode):
+                self.init_events.pop(cache_key, None)
                 return None, UNKNOWN_IDENTITY, [], 0.0, "不是一般檔案"
         except OSError as e:
+            self.init_events.pop(cache_key, None)
             return None, UNKNOWN_IDENTITY, [], 0.0, e.strerror or "無法讀取"
 
-        cache_key = str(path.resolve())
         identity = (st.st_dev, st.st_ino)
         mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
         cached = self.cache.get(cache_key)
@@ -603,6 +1007,9 @@ class LogParser:
         model = cached["model"] if append_only else UNKNOWN_IDENTITY
         recent = list(cached["recent"]) if append_only else []
         pending = cached["pending"] if append_only else b""
+        if not append_only:
+            self.result_events.pop(cache_key, None)
+            self.init_events.pop(cache_key, None)
 
         try:
             with path.open("rb") as stream:
@@ -623,8 +1030,8 @@ class LogParser:
                                 record = json.loads(text_line)
                             except ValueError:
                                 continue
-                            if isinstance(record, dict) and record.get("timestamp"):
-                                start_time = parse_timestamp(str(record["timestamp"]))
+                            if isinstance(record, dict) and record_timestamp(record) is not None:
+                                start_time = record_timestamp(record)
                                 break
                         if start_time is None:
                             start_time = getattr(st, "st_birthtime", None)
@@ -648,6 +1055,25 @@ class LogParser:
                 ts, _, summary = self._summarize(raw_line.rstrip(b"\r"), st.st_mtime)
                 if start_time is None and ts is not None:
                     start_time = ts
+                try:
+                    record = json.loads(raw_line)
+                except ValueError:
+                    record = None
+                if isinstance(record, dict) and record.get("type") == "result":
+                    failed = record.get("is_error") is True or str(record.get("subtype", "")).startswith("error")
+                    self.result_events[cache_key] = (record_timestamp(record) or st.st_mtime, "failed" if failed else "complete")
+                elif summary:
+                    self.result_events.pop(cache_key, None)
+                is_init_event = (
+                    isinstance(record, dict) and record.get("type") == "system" and record.get("subtype") == "init"
+                ) or re.search(rb"\bsession start\b", raw_line, re.IGNORECASE) is not None
+                if is_init_event:
+                    # A new init starts a new run. Without its timestamp the
+                    # boundary is unknown, so do not keep an older init time.
+                    self.init_events[cache_key] = ts
+                    if ts is not None:
+                        start_time = ts
+                        self.result_events.pop(cache_key, None)
                 if summary:
                     recent.append(summary)
 
@@ -700,10 +1126,13 @@ def resolve_result_path(path: Path) -> Path:
     return max(existing, key=lambda candidate: candidate.stat().st_mtime)
 
 
-def read_progress_stage(directory: Path) -> str:
+def read_progress_stage(directory: Path, run_start: Optional[float] = None) -> str:
     """Return the last non-empty line in a sibling PROGRESS.md, if present."""
     try:
-        content = (directory / "PROGRESS.md").read_text(encoding="utf-8", errors="replace")
+        path = directory / "PROGRESS.md"
+        if run_start is None or path.stat().st_mtime <= run_start:
+            return ""
+        content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     return next((line.strip() for line in reversed(content.splitlines()) if line.strip()), "")
@@ -772,9 +1201,10 @@ def find_new_branch_commit(path: Path, run_start: Optional[float]) -> Tuple[bool
             if not commit_time:
                 return False, None
             try:
-                return True, float(commit_time)
+                timestamp = float(commit_time)
+                return (True, timestamp) if run_start is not None and timestamp > run_start else (False, None)
             except ValueError:
-                return True, None
+                return False, None
 
         if has_base or run_start is None:
             return False, None
@@ -806,12 +1236,12 @@ def last_status_from_content(content: str) -> Optional[str]:
 
     def status_value(word: str) -> str:
         upper = word.upper()
-        return "complete" if upper in ("DONE", "COMPLETE") else upper.lower()
+        return "complete" if upper in ("DONE", "COMPLETE") else "failed" if upper == "FAIL" else upper.lower()
 
     if normalized_lines:
         first_status = re.match(
             r"^(?:(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*)?"
-            r"(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+            r"(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             normalized_lines[0],
             re.IGNORECASE,
         )
@@ -819,9 +1249,9 @@ def last_status_from_content(content: str) -> Optional[str]:
             return status_value(first_status.group(1))
 
     for line in normalized_lines:
-        status_field = re.search(
-            r"(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*"
-            r"(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+        status_field = re.match(
+            r"^(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*"
+            r"(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             line,
             re.IGNORECASE,
         )
@@ -830,46 +1260,108 @@ def last_status_from_content(content: str) -> Optional[str]:
 
     for line in normalized_lines:
         status_line = re.match(
-            r"^(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+            r"^(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             line,
             re.IGNORECASE,
         )
         if status_line:
             return status_value(status_line.group(1))
 
-    for line in normalized_lines:
-        done_marker = re.search(r"\b(DONE|COMPLETE)\b", line)
-        if done_marker:
-            prefix = line[: done_marker.start()]
-            english_negation = re.search(
-                r"\b(?:not|never|no|isn't|wasn't)\b[^.!?]*$",
-                prefix,
-                re.IGNORECASE,
-            )
-            chinese_negation = re.search(r"(?:不是|並非|未|沒有)\s*$", prefix)
-            if not english_negation and not chinese_negation:
-                return "complete"
-
-    for line in lines[:20]:
-        if re.search(r"(?<!未)(?<!沒)(?<!有)(?<!法)(?<!能)(?:已完成|完成)", line):
-            return "complete"
     return None
 
 
 def is_pid_alive(pid: int) -> Optional[bool]:
     """None means inspection failed, not that the process has ended."""
+    if pid <= 0:
+        return None
     try:
         result = subprocess.run(
-            ["pgrep", "-l", "."], capture_output=True, text=True, timeout=2, check=False,
+            ["pgrep", "-l", "."], capture_output=True, text=True, timeout=3, check=False,
         )
         if result.returncode not in (0, 1):
             return None
-        return any(
-            line.split()[0] == str(pid)
-            for line in result.stdout.splitlines() if line.split()
-        )
-    except (OSError, subprocess.SubprocessError):
+        return any(line.split(maxsplit=1)[0] == str(pid) for line in result.stdout.splitlines() if line.strip())
+    except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def parse_process_lstart(text: str) -> Optional[float]:
+    """Parse `ps -o lstart=` output ("Sun Oct 25 10:00:00 2026") as epoch seconds."""
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return None
+    try:
+        parsed = time.strptime(normalized, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    try:
+        return time.mktime(parsed)
+    except (OverflowError, ValueError):
+        return None
+
+
+def read_process_start(pid: int, now: Optional[float] = None) -> Optional[float]:
+    """SPEC §4.1 layer 2: read a live PID's start time from `ps -o lstart=`.
+
+    Returns None whenever the process is gone, `ps` fails, or the output cannot
+    be parsed, so the caller can fall back to the log/birthtime estimate.
+    """
+    if pid <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            # `lstart` is locale dependent; pin C so %a/%b stay parseable.
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    started = parse_process_lstart(result.stdout or "")
+    if started is None:
+        return None
+    if now is not None and started > now + 60:
+        return None
+    return started
+
+
+def report_is_fresh(
+    last_valid: bool,
+    last_mtime: float,
+    run_start: float,
+    init_time: Optional[float] = None,
+) -> bool:
+    """Return whether a result document was written by the current run.
+
+    Claude stream-json keeps writing after REPORT.md is saved (the final
+    assistant text and the ``result`` event), so the log's mtime cannot be the
+    upper boundary. The run start and the latest init event are the real
+    boundaries; a report older than either belongs to an earlier invocation.
+    """
+    if not last_valid or last_mtime <= run_start:
+        return False
+    return init_time is None or last_mtime >= init_time
+
+
+def explicit_report_status(
+    is_done_file: bool,
+    last_valid: bool,
+    last_mtime: float,
+    last_status: Optional[str],
+    run_start: float,
+    init_time: Optional[float] = None,
+) -> Optional[str]:
+    """Return the REPORT's explicit status when it belongs to this run."""
+    if not last_valid or last_status is None:
+        return None
+    if is_done_file or report_is_fresh(last_valid, last_mtime, run_start, init_time):
+        return last_status
+    return None
 
 
 def determine_status(
@@ -885,9 +1377,11 @@ def determine_status(
     last_status: Optional[str] = None,
     has_new_commit: bool = False,
     process_alive: Optional[bool] = None,
+    inspect_process: bool = True,
+    init_time: Optional[float] = None,
 ) -> str:
     if pid is not None:
-        if process_alive is None:
+        if process_alive is None and inspect_process:
             process_alive = is_pid_alive(pid)
         if process_alive:
             return "running"
@@ -896,7 +1390,7 @@ def determine_status(
     if is_done_file:
         return (last_status or "reported") if last_valid else "no_report"
     run_start = start_time if start_time is not None else log_mtime
-    last_is_fresh = last_valid and last_mtime > run_start
+    last_is_fresh = report_is_fresh(last_valid, last_mtime, run_start, init_time)
     if last_is_fresh:
         return last_status or "reported"
     if has_new_commit:
@@ -926,6 +1420,8 @@ def build_agent(
     registration_time: Optional[float] = None,
     harness: Optional[str] = None,
     model: Optional[str] = None,
+    project: Optional[str] = None,
+    started_at: Optional[float] = None,
 ) -> AgentInfo:
     log_path = Path(log_str).expanduser()
     if not log_path.is_absolute():
@@ -939,7 +1435,6 @@ def build_agent(
     start_time, _, log_lines, log_mtime, log_err = log_parser.parse(log_path)
     result_path = resolve_result_path(last_path)
     last_content, last_mtime, last_valid, last_err = read_last_file(result_path)
-    stage = read_progress_stage(result_path.parent)
 
     data_err = row_error or log_err or last_err
     if not is_null_log and not log_path.exists():
@@ -954,11 +1449,29 @@ def build_agent(
         pid_alive,
     )
 
-    run_start_candidates = [value for value in (start_time, registration_time) if value is not None]
-    run_start = max(run_start_candidates) if run_start_candidates else log_mtime
-    elapsed_start = start_time if start_time is not None else registration_time
-    last_is_fresh = last_valid and last_mtime > run_start
+    elapsed_start = started_at
+    start_source = "tsv" if started_at is not None else ""
+    if elapsed_start is None and pid_alive is True:
+        elapsed_start = log_parser.pid_start_time(pid)
+        if elapsed_start is not None:
+            start_source = "pid"
+    if elapsed_start is None:
+        elapsed_start = start_time
+        start_source = "log" if elapsed_start is not None else ""
+        # A result followed by new log activity proves reuse, but the old
+        # prefix cannot prove when this invocation began.
+        if last_valid and log_mtime > last_mtime and (elapsed_start or 0) <= last_mtime:
+            elapsed_start = None
+            start_source = ""
+    run_start = elapsed_start if elapsed_start is not None else log_mtime
+    log_key = str(log_path.resolve())
+    init_time = log_parser.init_events.get(log_key)
+    last_is_fresh = report_is_fresh(last_valid, last_mtime, run_start, init_time)
+    report_status = explicit_report_status(
+        is_done_file, last_valid, last_mtime, last_status, run_start, init_time
+    )
     run_started = run_start if run_start > 0 else None
+    stage = read_progress_stage(log_path.parent, run_started)
     has_new_commit = False
     commit_time = None
     if pid_alive is not True and not is_done_file and not last_is_fresh:
@@ -977,7 +1490,17 @@ def build_agent(
         last_status=last_status,
         has_new_commit=has_new_commit,
         process_alive=pid_alive,
+        inspect_process=False,
+        init_time=init_time,
     )
+    event_status = log_parser.result_events.get(log_key)
+    if (
+        pid_alive is not True and not (pid is not None and pid_alive is None)
+        and report_status is None and event_status is not None
+        and event_status[0] is not None and run_started is not None
+        and event_status[0] >= run_started
+    ):
+        status = event_status[1]
 
     is_terminal = status in {"complete", "failed", "blocked", "partial", "reported"}
     completion_time = None
@@ -988,22 +1511,43 @@ def build_agent(
             completion_time = last_mtime
         elif status == "complete" and has_new_commit:
             completion_time = commit_time or (last_mtime if last_valid else 0) or log_mtime or now
+        elif event_status and event_status[0] is not None:
+            completion_time = event_status[0]
     if completion_time is not None and elapsed_start is not None and elapsed_start > completion_time:
         elapsed_start = None
+    question = None if is_null_log else read_task_question(log_path.parent)
+    if question is not None and question_is_active(question, completion_time):
+        # SPEC §3.3: an unanswered question is a needs-attention task even while
+        # its PID is alive, so it must leave the running bucket.
+        status = "question"
     elapsed = format_elapsed(elapsed_start, completion_time if completion_time is not None else now)
+    estimated = start_source == "log" and elapsed_start is not None
+    if estimated:
+        elapsed = "~" + elapsed
     key = f"{name}::{log_path}::{result_path}"
 
-    if is_terminal and last_content:
+    if is_terminal and last_content and (last_is_fresh or is_done_file):
         clean_last_lines = [
             clean_text(l) for l in last_content.splitlines() if clean_text(l) and not is_noise(clean_text(l))
         ]
-        conclusion_lines = [line for line in clean_last_lines if not line.startswith("#")]
-        latest = (conclusion_lines or clean_last_lines or ["任務已回報"])[0]
+        conclusion_lines = [
+            line for line in clean_last_lines
+            if not line.startswith("#") and not re.fullmatch(
+                r"(?:(?:STATUS|狀態|判定)\s*[:：]\s*)?"
+                r"(?:DONE|COMPLETE|COMPLETED|PARTIAL|FAIL|FAILED|BLOCKED|REPORTED|完成|部分完成|失敗|受阻)",
+                line.replace("**", "").strip(), re.IGNORECASE,
+            )
+        ]
+        latest = (conclusion_lines or ["完成" if status == "complete" else "任務已回報"])[0]
     elif log_lines:
         latest = log_lines[-1].partition("  ")[2] or log_lines[-1]
     else:
         latest = data_err or "尚無訊息"
 
+    resolved_project, project_error = resolve_project(project) if project else (
+        infer_project(name, log_path, result_path), ""
+    )
+    data_err = "；".join(value for value in (data_err, project_error) if value)
     return AgentInfo(
         name=name,
         log_path=log_path,
@@ -1023,7 +1567,10 @@ def build_agent(
         pid=pid,
         completion_time=completion_time,
         stage=stage,
-        project=infer_project(name, log_path, result_path),
+        project=resolved_project,
+        start_source=start_source,
+        elapsed_estimated=estimated,
+        question=question,
     )
 
 
@@ -1049,8 +1596,8 @@ def load_tsv_agents(
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) not in (3, 4, 5, 6):
-            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 6 欄）")
+        if not 3 <= len(parts) <= 8:
+            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 8 欄）")
             continue
         name, log_p, last_p = parts[0].strip(), parts[1].strip(), parts[2].strip()
         if not name or not log_p or not last_p:
@@ -1070,6 +1617,17 @@ def load_tsv_agents(
                 pid = None
         harness = parts[4].strip() or None if len(parts) >= 5 else None
         model = parts[5].strip() or None if len(parts) >= 6 else None
+        project = parts[6].strip() or None if len(parts) >= 7 else None
+        started_at = None
+        if len(parts) >= 8 and parts[7].strip():
+            raw_start = parts[7].strip()
+            try:
+                parsed = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("timezone required")
+                started_at = parsed.timestamp()
+            except (ValueError, OverflowError, OSError):
+                errors.append(f"{tsv_path.name} 第 {line_num} 行 started_at 格式錯誤（需 ISO 8601 含時區）")
 
         agents.append(
             build_agent(
@@ -1084,6 +1642,8 @@ def load_tsv_agents(
                 registration_time=registration_time,
                 harness=harness,
                 model=model,
+                project=project,
+                started_at=started_at,
             )
         )
 
@@ -1096,6 +1656,7 @@ def load_all_agents(
     log_parser: Optional[LogParser] = None,
     now: Optional[float] = None,
 ) -> Tuple[List[AgentInfo], List[str]]:
+    ensure_architecture_data()
     if log_parser is None:
         log_parser = LogParser()
     if now is None:
@@ -1114,7 +1675,7 @@ def load_all_agents(
         ),
         reverse=True,
     )
-    return all_agents, err1 + err2
+    return all_agents, list(ARCHITECTURE_ERRORS) + err1 + err2
 
 
 def is_active_agent(agent: AgentInfo) -> bool:
@@ -1143,7 +1704,10 @@ def split_recent_done(
     for agent in done_agents:
         timestamp = done_timestamp(agent)
         age = current - timestamp if timestamp is not None else None
-        if age is not None and 0 <= age <= RECENT_DONE_SECONDS:
+        if (
+            age is not None
+            and -FUTURE_SKEW_TOLERANCE_SECONDS <= age <= RECENT_DONE_SECONDS
+        ):
             recent.append(agent)
         else:
             older.append(agent)
@@ -1153,39 +1717,143 @@ def split_recent_done(
     return recent, older
 
 
+def task_bucket(agent: AgentInfo, now: Optional[float] = None) -> str:
+    """Partition every task once, allowing ended issues to age into history."""
+    current = time.time() if now is None else now
+    if agent.status == "running":
+        return "running"
+    ended = agent.completion_time
+    if ended is None and is_done_agent(agent):
+        ended = done_timestamp(agent)
+    if ended is not None and current - ended > RECENT_DONE_SECONDS:
+        return "history"
+    if agent.status in {"waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
+        return "attention"
+    if agent.status in {"complete", "reported", "partial"}:
+        if (
+            ended is not None
+            and -FUTURE_SKEW_TOLERANCE_SECONDS <= current - ended <= RECENT_DONE_SECONDS
+        ):
+            return "recent"
+        return "history"
+    return "attention"
+
+
+def count_buckets(
+    agents: List[AgentInfo], now: Optional[float] = None,
+    bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
+) -> Dict[str, int]:
+    current = time.time() if now is None else now
+    counts = dict(attention=0, running=0, recent=0, history=0, total=len(agents))
+    for agent in agents:
+        counts[bucket_fn(agent, current)] += 1
+    return counts
+
+
+def format_bucket_counts(
+    agents: List[AgentInfo], now: float,
+    bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
+) -> str:
+    counts = count_buckets(agents, now, bucket_fn)
+    return (
+        f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
+        f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ 總計 {counts['total']}"
+    )
+
+
+def work_board_groups(agents: List[AgentInfo], now: float) -> Dict[str, List[AgentInfo]]:
+    all_groups = group_agents_by_project(agents)
+    groups = group_agents_by_project([a for a in agents if task_bucket(a, now) != "history"])
+    latest_finish = {
+        project: max(
+            (done_timestamp(a) or 0 for a in tasks if is_done_agent(a)),
+            default=0,
+        )
+        for project, tasks in all_groups.items()
+    }
+    order = {"attention": 0, "running": 1, "recent": 2}
+    for tasks in groups.values():
+        tasks.sort(key=lambda a: (
+            order[task_bucket(a, now)],
+            -(a.start_time or 0) if task_bucket(a, now) == "running" else -(done_timestamp(a) or 0),
+            a.key,
+        ))
+    return dict(sorted(groups.items(), key=lambda item: (
+        min(order[task_bucket(a, now)] for a in item[1]),
+        -latest_finish[item[0]],
+        project_sort_key(item[0]),
+    )))
+
+
 # ==============================================================================
 # Quota Logic & Magpie Fetching
 # ==============================================================================
 
-def get_quota_color_and_tag(pct: float) -> Tuple[str, str]:
-    """
-    Returns (color_name, hex_code) based on quota usage:
-    - Over 85%: Red (#f7768e)
-    - Over 80%: Yellow (#e0af68)
-    - <= 80%: Green (#9ece6a)
-    """
-    if pct > 85:
-        return "red", "#f7768e"
-    elif pct > 80:
-        return "yellow", "#e0af68"
+def quota_time_progress(window: Dict[str, Any], now: Optional[float] = None) -> Optional[float]:
+    """Infer elapsed percentage only when the window duration and reset are known."""
+    reset = quota_epoch(window.get("resetsAt") or window.get("resets_at"))
+    if reset is None:
+        return None
+    minutes = window.get("window_minutes")
+    name = str(window.get("name") or "").strip().casefold()
+    if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes) and minutes > 0:
+        seconds = minutes * 60
+    elif name in ("5 hours", "5 hour", "5h", "5 小時"):
+        seconds = 5 * 3600
+    elif name in ("7 days", "7 day", "7d", "weekly", "7 天"):
+        seconds = 7 * 86400
+    elif name in ("30 days", "30 day", "30d"):
+        seconds = 30 * 86400
+    elif name in ("month", "monthly", "月"):
+        end = datetime.fromtimestamp(reset, ZoneInfo("Asia/Taipei"))
+        year, month = (end.year - 1, 12) if end.month == 1 else (end.year, end.month - 1)
+        start = end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1]))
+        seconds = reset - start.timestamp()
     else:
-        return "green", "#9ece6a"
+        return None
+    current = time.time() if now is None else now
+    return max(0.0, min(100.0, 100 * (current - reset + seconds) / seconds))
 
 
-def get_quota_color(pct: float) -> str:
-    """Return color name ('red', 'yellow', 'green') for percentage."""
-    return get_quota_color_and_tag(pct)[0]
+def quota_window_status(used: float, progress: Optional[float]) -> Tuple[str, str]:
+    """Critical usage takes precedence over burning ahead of the clock."""
+    if used >= QUOTA_CRITICAL_PERCENT:
+        return "#f7768e", "告急"
+    if progress is not None and used - progress >= QUOTA_BURN_AHEAD_PERCENT:
+        return "#e0af68", "燒太快"
+    return "#9ece6a", ""
 
 
-def render_quota_bar(pct: float, width: int = 10) -> str:
-    """Render horizontal bar chart for quota percentage with threshold colors."""
-    clamped = max(0.0, min(100.0, pct))
-    filled_len = int(round(clamped / 100.0 * width))
-    empty_len = width - filled_len
-    _, hex_color = get_quota_color_and_tag(clamped)
-    filled_part = f"[{hex_color}]{'█' * filled_len}[/]" if filled_len > 0 else ""
-    empty_part = f"[#414868]{'░' * empty_len}[/]" if empty_len > 0 else ""
-    return f"\\[{filled_part}{empty_part}\\]"
+def render_quota_chart(used: float, progress: Optional[float], width: int = 12) -> str:
+    width = max(1, width)
+    filled = int(round(used / 100 * width))
+    marker = None if progress is None else int(round(progress / 100 * (width - 1)))
+    color, _ = quota_window_status(used, progress)
+    cells = []
+    for index in range(width):
+        if index == marker:
+            cells.append("[bold #c0caf5]│[/]")
+        elif index < filled:
+            cells.append(f"[{color}]▓[/]")
+        else:
+            cells.append("[#737b91]░[/]")
+    return "".join(cells)
+
+
+def ordered_quota_items(data: list) -> list:
+    """Use canonical provider order without discarding additional accounts."""
+    items = [
+        item for item in data
+        if isinstance(item, dict) and str(item.get("provider") or "").strip()
+    ] if isinstance(data, list) else []
+    if not items:
+        return []
+    ordered = []
+    for provider in QUOTA_PROVIDER_NAMES:
+        matches = [item for item in items if str(item.get("provider", "")).casefold() == provider]
+        ordered.extend(matches or [{"provider": provider, "windows": []}])
+    ordered.extend(item for item in items if str(item.get("provider", "")).casefold() not in QUOTA_PROVIDER_NAMES)
+    return ordered
 
 
 def quota_epoch(value: Any) -> Optional[float]:
@@ -1215,14 +1883,14 @@ def format_quota_source_time(value: Any) -> str:
     )
 
 
-def format_reset_time(value: Any) -> str:
+def format_reset_time(value: Any, now: Optional[float] = None) -> str:
     """Format an ISO or epoch reset time in Taipei time; never infer a missing value."""
     epoch = quota_epoch(value)
     if epoch is None:
         return "未提供"
     reset = datetime.fromtimestamp(epoch, ZoneInfo("Asia/Taipei"))
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if reset.date() == now.date():
+    current = datetime.fromtimestamp(time.time() if now is None else now, ZoneInfo("Asia/Taipei"))
+    if reset.date() == current.date():
         return reset.strftime("%H:%M")
     return reset.strftime("%m/%d %H:%M")
 
@@ -1245,7 +1913,7 @@ def quota_window_label(window: Dict[str, Any]) -> str:
     if "7 day" in name or "7d" in name or minutes == 10080:
         return "7 天"
     if "month" in name or "30 day" in name or minutes == 43200:
-        return "month"
+        return "月"
     label = str(window.get("name") or "").strip()
     return label or "額度窗口"
 
@@ -1374,13 +2042,16 @@ def normalize_magpie_item(value: Any) -> Optional[Dict[str, Any]]:
                     "name": str(window.get("name") or "額度窗口"),
                     "used": used,
                     "resetsAt": window.get("resetsAt") or window.get("resets_at"),
+                    "window_minutes": window.get("window_minutes"),
                 }
             )
     return {
         "provider": provider,
         "name": value.get("name") or provider,
+        "kind": value.get("kind"),
+        "balance": value.get("balance"),
         "plan": value.get("plan"),
-        "asOf": value.get("readAt") or value.get("asOf") or value.get("as_of"),
+        "asOf": value.get("readAt"),
         "windows": windows,
     }
 
@@ -1468,27 +2139,33 @@ class QuotaService:
             return [], f"magpie quota 讀取失敗：{e}"
 
     def _read_quota(self) -> Tuple[str, list, str]:
-        """magpie is the live source; a failed read shows no numbers at all."""
+        """Use magpie values or this read's local Codex session fallback."""
         magpie_items, magpie_error = self._read_magpie_quota()
-        if magpie_error:
-            return parse_quota_json([]), [], magpie_error
-
         items = list(magpie_items)
-        errors: List[str] = []
-        # magpie is a live read; a row without readAt still has valid numbers and
-        # gets this fetch's timestamp as its provenance, never an older cached one.
+        errors: List[str] = [magpie_error] if magpie_error else []
         fetched_at = time.time()
         for item in items:
-            if valid_quota_windows(item) and quota_epoch(item.get("asOf")) is None:
-                item["asOf"] = fetched_at
+            item["fetchedAt"] = fetched_at
         providers = {str(item.get("provider") or "").lower() for item in items}
-        if "codex" not in providers:
-            # Older magpie builds may omit codex; the session rate_limits are real data too.
+        codex_has_data = any(
+            str(item.get("provider", "")).lower() == "codex" and quota_item_has_data(item)
+            for item in items
+        )
+        if not codex_has_data:
             codex_item, codex_error = read_codex_quota_item(self.sessions_path)
             if codex_error:
                 errors.append(codex_error)
-            if valid_quota_windows(codex_item):
+            if quota_item_has_data(codex_item):
+                items = [item for item in items if str(item.get("provider", "")).lower() != "codex"]
                 items.insert(0, codex_item)
+                providers.add("codex")
+        for provider in QUOTA_PROVIDER_NAMES:
+            if provider not in providers:
+                items.append({
+                    "provider": provider, "windows": [],
+                    "reason": "magpie 讀取失敗" if magpie_error else "無資料",
+                    "fetchedAt": fetched_at,
+                })
         return parse_quota_json(items), items, "；".join(errors)
 
     def fetch(self, force: bool = False) -> Tuple[str, list]:
@@ -1520,41 +2197,88 @@ def valid_quota_windows(item: Dict[str, Any]) -> List[Tuple[str, float, Dict[str
     return result
 
 
+def quota_item_has_data(item: Dict[str, Any]) -> bool:
+    """A balance or valid windows with known read provenance are usable."""
+    balance = item.get("balance")
+    has_time = any(quota_epoch(item.get(key)) is not None for key in ("readAt", "asOf", "fetchedAt"))
+    return bool(
+        (isinstance(balance, str) and balance.strip())
+        or (has_time and valid_quota_windows(item))
+    )
+
+
+def quota_data_time(item: Dict[str, Any]) -> str:
+    source = item.get("readAt") or item.get("asOf")
+    if quota_epoch(source) is not None:
+        return format_quota_source_time(source)
+    fetched = quota_epoch(item.get("fetchedAt"))
+    if fetched is not None:
+        clock = datetime.fromtimestamp(fetched, ZoneInfo("Asia/Taipei")).strftime("%H:%M:%S")
+        return f"未提供（本次讀取 {clock}）"
+    return "時間未確認"
+
+
 def parse_quota_json(data: list) -> str:
-    """Format a compact line only when both a value and source time are valid."""
+    """Keep the home summary short; source and reset times live in details."""
     if not isinstance(data, list):
         return "額度：無資料"
     parts = []
     seen = set()
-    for item in data:
+    for item in ordered_quota_items(data):
         if not isinstance(item, dict):
             continue
         provider = str(item.get("provider") or "").strip()
         if not provider or provider.lower() in seen:
             continue
         seen.add(provider.lower())
-        source_time = format_quota_source_time(item.get("asOf"))
+        name = QUOTA_PROVIDER_NAMES.get(provider.lower(), provider)
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            parts.append(f"{provider}：無資料")
+        if not quota_item_has_data(item):
+            parts.append(f"{name}：{item.get('reason') or '無資料'}")
             continue
-        abbreviations = {"5 小時": "5h", "7 天": "7d", "month": "month"}
+        abbreviations = {"5 小時": "5h", "7 天": "7d"}
         values = []
-        for label, used, window in windows:
+        for label, used, _ in windows:
             window_name = abbreviations.get(label, label)
-            reset = ""
-            if quota_epoch(window.get("resetsAt") or window.get("resets_at")) is not None:
-                reset = f"（重置 {format_reset_time(window.get('resetsAt') or window.get('resets_at'))}）"
-            values.append(f"{window_name} {int(round(used))}%{reset}")
-        parts.append(f"{provider} {'｜'.join(values)}（資料時間 {source_time}）")
-    return "  ".join(parts) if parts else "額度：無資料"
+            values.append(f"{window_name} {int(round(used))}%")
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            values.append(item["balance"])
+        parts.append(f"{name} {' '.join(values)}")
+    if not parts:
+        return "額度：無資料"
+    updated = max(
+        (quota_epoch(item.get("fetchedAt")) or quota_epoch(item.get("asOf")) or 0
+         for item in data if isinstance(item, dict)), default=0,
+    )
+    clock = datetime.fromtimestamp(updated, ZoneInfo("Asia/Taipei")).strftime("%H:%M:%S") if updated else "未確認"
+    return " │ ".join(parts) + f" │ 更新 {clock}"
 
 
-def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = False) -> str:
+def render_compact_quota(summary: str, width: int = 80) -> str:
+    """Wrap at provider separators, preserving every service without ellipsis."""
+    lines: List[str] = []
+    current = "額度 "
+    for part in summary.split(" │ "):
+        candidate = current + (" │ " if current != "額度 " else "") + part
+        if display_width(candidate) <= width:
+            current = candidate
+        else:
+            if current.strip() != "額度":
+                lines.append(current)
+            wrapped = wrap_display(part, max(1, width))
+            lines.extend(wrapped[:-1])
+            current = wrapped[-1]
+    lines.append(current)
+    return "\n".join(lines)
+
+
+def render_full_quota_view(
+    quota_data: list, width: int = 80, stale: bool = False, now: Optional[float] = None,
+) -> str:
     """Render each quota window on its own short line for narrow terminals."""
     lines = [
         "[bold #7aa2f7]● 服務額度用量[/bold #7aa2f7]",
-        "[#565f89]每 60 秒背景更新；使用率超過 80% 黃色、超過 85% 紅色[/#565f89]",
+        "[#a9b1bd]│ 時間進度；用量領先 ≥15 點黃、用量 ≥85% 紅；每 60 秒更新[/]",
     ]
     if stale:
         lines.append("[bold #ff9e3b]部分來源讀取失敗；只顯示本次取得且有時間的有效數字[/bold #ff9e3b]")
@@ -1563,28 +2287,38 @@ def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = Fals
         return "\n".join(lines)
 
     rendered = False
-    for item in quota_data:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or item.get("provider") or "未知服務")
+    for item in ordered_quota_items(quota_data):
+        provider = str(item.get("provider", "")).casefold()
+        name = QUOTA_PROVIDER_NAMES.get(provider, str(item.get("name") or provider))
         plan = item.get("plan")
         title = name if not plan else f"{name} ({plan})"
         lines.append(f"[bold #c0caf5]{escape(title)}[/bold #c0caf5]")
-        source_time = format_quota_source_time(item.get("asOf"))
-        lines.append(f"  [#565f89]資料時間：{escape(source_time)}[/#565f89]")
+        source_time = quota_data_time(item)
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            lines.append("  [#ff9e3b]無資料[/#ff9e3b]")
+        if not quota_item_has_data(item):
+            lines.append(f"  [#a9b1bd]資料時間：{escape(source_time)}[/]")
+            lines.append(f"  [#ff9e3b]{escape(str(item.get('reason') or '無資料'))}[/#ff9e3b]")
             rendered = True
             continue
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            lines.append(f"  帳戶餘額 {escape(item['balance'])}")
+            lines.append(f"  [#a9b1bd]資料時間：{escape(source_time)}[/]")
+            rendered = True
         for label, used, window in windows:
-            reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"))
-            pct = int(round(used))
-            bar = render_quota_bar(used, 8)
-            lines.append(
-                f"  {label} {bar} {pct:>3}%  重置 {escape(reset)}"
-                f"  ·  資料時間 {escape(source_time)}"
-            )
+            reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"), now)
+            progress = quota_time_progress(window, now)
+            color, tag = quota_window_status(used, progress)
+            if progress is None:
+                tag = (tag + " " if tag else "") + "時間進度未知"
+            short_label = {"5 小時": "5h", "7 天": "7d"}.get(label, label)
+            bar = render_quota_chart(used, progress, max(6, min(20, width - 62)))
+            row = f"  {escape(short_label)} {bar} [{color}]{used:g}% {tag}[/]  重置 {escape(reset)}"
+            stamp = f"資料時間：{escape(source_time)}"
+            if display_width(Text.from_markup(row + "  " + stamp).plain) <= max(1, width - 4):
+                lines.append(row + "  [#a9b1bd]" + stamp + "[/]")
+            else:
+                lines.append(row)
+                lines.append("    [#a9b1bd]" + stamp + "[/]")
             rendered = True
 
     if not rendered:
@@ -1596,20 +2330,22 @@ def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = Fals
 def render_plain_quota_details(quota_data: list) -> List[str]:
     """Render sanitized plain-text quota details for --once."""
     lines = []
-    for item in quota_data if isinstance(quota_data, list) else []:
+    for item in ordered_quota_items(quota_data):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("provider") or "未知服務")
-        source_time = format_quota_source_time(item.get("asOf"))
+        source_time = quota_data_time(item)
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            lines.append(f"  * {name}: 無資料（資料時間 {source_time}）")
+        if not quota_item_has_data(item):
+            lines.append(f"  * {name}: {item.get('reason') or '無資料'}（資料時間：{source_time}）")
             continue
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            lines.append(f"  * {name}: 帳戶餘額 {item['balance']}（資料時間：{source_time}）")
         for label, used, window in windows:
             reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"))
             lines.append(
                 f"  * {name} {label}: {int(round(used))}%"
-                f"（重置 {reset}，資料時間 {source_time}）"
+                f"（重置 {reset}，資料時間：{source_time}）"
             )
     return lines or ["  * 無資料"]
 
@@ -1849,6 +2585,7 @@ def get_worker_status(
     active_agents: List[AgentInfo],
 ) -> Tuple[bool, int, str]:
     """Compatibility helper for checking a node in the current architecture."""
+    ensure_architecture_data()
     view = ARCHITECTURE_DATA["architectures"]["now"]
     node = view["nodes"].get(worker_id)
     if not isinstance(node, dict):
@@ -1875,6 +2612,7 @@ def render_architecture_view(
     project_id: Optional[str] = None,
 ) -> str:
     """Render one project's configurable coordinator/worker graph."""
+    ensure_architecture_data()
     projects = ARCHITECTURE_DATA["projects"]
     project_ids = list(projects)
     selected = project_id or project_ids[0]
@@ -1887,6 +2625,7 @@ def render_architecture_view(
     project_agents = [
         agent for agent in agents
         if (agent.project or PROJECT_OTHER) == selected
+        and (agent.status == "running" or task_bucket(agent) != "history")
     ]
     assignments = _assign_agents_to_nodes(project_agents, view)
     available_width = max(20, width - 4)
@@ -2031,6 +2770,384 @@ def format_completion_time(timestamp: Optional[float]) -> str:
     return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Taipei")).strftime("%H:%M")
 
 
+def compact_elapsed(agent: AgentInfo) -> str:
+    elapsed = agent.elapsed.lstrip("~")
+    if agent.start_time is None or not re.fullmatch(r"\d+:\d{2}:\d{2}", elapsed):
+        return agent.elapsed
+    hours, minutes, seconds = (int(part) for part in elapsed.split(":"))
+    total = hours * 60 + minutes
+    return ("~" if agent.elapsed.startswith("~") else "") + (f"{total}m" if total else f"{seconds}s")
+
+
+def render_board_active(agents: List[AgentInfo], width: int) -> str:
+    lines = []
+    for agent in agents:
+        badge = STATUS_BADGE_MARKUP.get(agent.status, "")
+        available = max(16, width - 4)
+        badge_width = display_width(Text.from_markup(badge).plain) + 1 if badge else 0
+        timer = f" · 已跑 {compact_elapsed(agent)}"
+        identity_width = max(8, available - badge_width - 12)
+        identity = truncate_display(f"{agent.harness} · {agent.model}", max(1, identity_width - display_width(timer))) + timer
+        name_width = max(1, available - badge_width - display_width(identity) - 4)
+        name = truncate_display(agent.name, name_width)
+        title = f"▶ {name}  {identity}"
+        lines.append(f"[#7dcfff]{escape(title)}[/] {badge}")
+        detail = agent.stage or agent.latest
+        if detail and detail != UNKNOWN_IDENTITY:
+            lines.append(f"  [#a9b1d6]{escape(truncate_display(detail, max(12, width - 6)))}[/]")
+        if agent.error:
+            lines.append(f"  [#ff9e3b]{escape(truncate_display(agent.error, max(12, width - 6)))}[/]")
+    return "\n".join(lines)
+
+
+def render_board_recent(agents: List[AgentInfo], width: int, expanded: bool = False) -> str:
+    lines = []
+    for agent in agents if expanded else agents[:3]:
+        marker = "⚠" if agent.status == "partial" else "✓"
+        label = " 已回報" if agent.status == "reported" else ""
+        text = f"{marker} {format_completion_time(agent.completion_time)} {agent.name}{label} │ {agent.latest}"
+        lines.append(f"[#e0af68]{escape(truncate_display(text, max(16, width - 4)))}[/]")
+    if not expanded and len(agents) > 3:
+        lines.append(f"[#565f89]  … 另 {len(agents) - 3} 筆  \\[e] 展開[/]")
+    return "\n".join(lines)
+
+
+def render_history_summary(agents: List[AgentInfo], now: float) -> str:
+    history = [a for a in agents if task_bucket(a, now) == "history"]
+    groups = group_agents_by_project(history)
+    counts = "／".join(f"{project_label(project)} {len(tasks)}" for project, tasks in groups.items())
+    return f"歷史 {len(history)} 筆" + (f"（{counts}）" if counts else "")
+
+
+BOARD_COLORS = {
+    "running": "#e0af68",
+    "recent": "#9ece6a",
+    "history": "#737b91",
+    "attention": "#f7768e",
+}
+BOARD_STATUS_LABELS = {
+    "running": "進行中", "waiting": "等候中", "blocked": "卡住",
+    "failed": "失敗", "no_report": "無報告", "unconfirmed": "待確認",
+    "error": "資料錯誤", "complete": "剛完成", "reported": "已回報",
+    "partial": "部分完成", "question": "等回答",
+}
+WIDE_BOARD_COLUMNS = 120
+
+
+def board_bucket(agent: AgentInfo, now: float) -> str:
+    # Issues remain actionable even after the recent-completion window ends.
+    # Stage 5 may supply question tasks without adding file I/O to the UI.
+    if agent.status in {"question", "waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
+        return "attention"
+    return task_bucket(agent, now)
+
+
+class WatchState:
+    """Dashboard-owned state. Registry files are never modified."""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path) if path is not None else _env_path(
+            "AGENT_WATCH_STATE", Path.home() / "Projects/night/agent-watch-state.json",
+        )
+        self.data: Dict[str, Any] = dict(version=1, tasks={}, projects={})
+        self.warning = ""
+        self.revision = 0
+        self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._validate(data)
+            self.data = data
+        except FileNotFoundError:
+            self.warning = "state 檔不存在，使用空狀態"
+        except (OSError, ValueError, TypeError, UnicodeError):
+            self.warning = "state 檔損壞或無法讀取，使用空狀態"
+
+    @staticmethod
+    def _validate(data: Any) -> None:
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+            raise ValueError("unsupported state")
+        for section in ("tasks", "projects"):
+            if not isinstance(data.get(section), dict):
+                raise ValueError("invalid section")
+            for entry in data[section].values():
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid entry")
+                for name in ("hidden", "done_manual", "read", "pinned", "restored", "collapsed"):
+                    if name in entry and type(entry[name]) is not bool:
+                        raise ValueError("invalid flag")
+                if "tags" in entry and (
+                    not isinstance(entry["tags"], list)
+                    or not all(isinstance(tag, str) for tag in entry["tags"])
+                ):
+                    raise ValueError("invalid tags")
+        if sum(bool(entry.get("pinned")) for entry in data["tasks"].values()) > 5:
+            raise ValueError("too many pins")
+
+    def task(self, key: str) -> Dict[str, Any]:
+        return self.data["tasks"].get(key, {})
+
+    def save(self, data: Dict[str, Any]) -> bool:
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=str(self.path.parent),
+                prefix="." + self.path.name + "-", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = stream.name
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except (OSError, ValueError) as exc:
+            self.warning = "state 寫入失敗：" + str(exc)
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+        self.data = data
+        self.revision += 1
+        self.warning = ""
+        return True
+
+    @staticmethod
+    def stamp() -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def update_task(self, key: str, **values: Any) -> bool:
+        data = copy.deepcopy(self.data)
+        entry = data["tasks"].setdefault(key, {})
+        entry.update(values, updated_at=self.stamp())
+        return self.save(data)
+
+    def reconcile(self, agents: List[AgentInfo], now: float) -> None:
+        """A rerun keeps user tags/pins but drops the previous run's disposition."""
+        data = copy.deepcopy(self.data)
+        changed = False
+        observed = dict(self._observed)
+        for agent in agents:
+            previous = self._observed.get(agent.key)
+            observed[agent.key] = (agent.status, agent.start_time)
+            entry = data["tasks"].get(agent.key)
+            if entry is not None:
+                rerun = (
+                    agent.status == "running"
+                    and any(entry.get(flag) for flag in ("hidden", "done_manual", "restored", "read"))
+                ) or (
+                    previous is not None and (
+                        (previous[0] == "running" and agent.status != "running")
+                        or previous[1] != agent.start_time
+                    )
+                ) or (
+                    entry.get("run_start") is not None and agent.start_time is not None
+                    and entry["run_start"] != agent.start_time
+                )
+                if rerun:
+                    entry.update(hidden=False, done_manual=False, restored=False, read=False,
+                                 run_start=agent.start_time, updated_at=self.stamp())
+                    changed = True
+            project = data["projects"].get(agent.project, {})
+            if project.get("collapsed") and board_bucket(agent, now) in ("running", "attention"):
+                project.update(collapsed=False, collapsed_at=self.stamp())
+                changed = True
+        if not changed or self.save(data):
+            self._observed = observed
+
+    def bucket(self, agent: AgentInfo, now: float) -> str:
+        bucket = board_bucket(agent, now)
+        if bucket in ("attention", "running"):
+            return bucket
+        entry = self.task(agent.key)
+        if entry.get("hidden"):
+            return "hidden"
+        if entry.get("done_manual") or self.data["projects"].get(agent.project, {}).get("collapsed"):
+            return "history"
+        return "recent" if entry.get("restored") else bucket
+
+    def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
+              tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+        entry = self.task(agent.key)
+        if operation in ("hide", "done") and board_bucket(agent, now) in ("running", "attention"):
+            return False, "進行中或需處理的任務不能隱藏／歸到已完成"
+        if operation == "collapse":
+            if any(a.project == agent.project and board_bucket(a, now) in ("running", "attention") for a in agents):
+                return False, "專案仍有進行中或需處理的任務，不能收起"
+            data = copy.deepcopy(self.data)
+            data["projects"][agent.project] = dict(collapsed=True, collapsed_at=self.stamp())
+            ok = self.save(data)
+        else:
+            if operation == "pin" and not entry.get("pinned"):
+                if sum(bool(t.get("pinned")) for t in self.data["tasks"].values()) >= 5:
+                    return False, "最多只能釘選 5 個任務，請先取消一個"
+            changes: Dict[str, Any] = {
+                "hide": dict(hidden=True, restored=False),
+                "done": dict(done_manual=True, restored=False),
+                "restore": dict(hidden=False, done_manual=False, restored=True),
+                "read": dict(read=not entry.get("read", False)),
+                "pin": dict(pinned=not entry.get("pinned", False)),
+                "tags": dict(tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip()))),
+            }.get(operation, {})
+            if not changes:
+                return False, "未知操作"
+            if operation == "restore":
+                data = copy.deepcopy(self.data)
+                data["tasks"].setdefault(agent.key, {}).update(
+                    changes, updated_at=self.stamp(), run_start=agent.start_time,
+                )
+                data["projects"].setdefault(agent.project, {})["collapsed"] = False
+                ok = self.save(data)
+            else:
+                ok = self.update_task(agent.key, run_start=agent.start_time, **changes)
+        return ok, "已儲存" if ok else self.warning
+
+
+def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
+                  query: str = "", project: str = "", tag: str = "",
+                  read: str = "", hidden: str = "") -> List[AgentInfo]:
+    result = []
+    for agent in agents:
+        if state.bucket(agent, now) not in ("history", "hidden"):
+            continue
+        entry = state.task(agent.key)
+        if project and agent.project != project:
+            continue
+        if tag and tag not in entry.get("tags", []):
+            continue
+        if read and bool(entry.get("read")) != (read == "read"):
+            continue
+        if hidden and bool(entry.get("hidden")) != (hidden == "hidden"):
+            continue
+        searchable = " ".join((agent.name, agent.latest, agent.project, project_label(agent.project),
+                               " ".join(entry.get("tags", []))))
+        if query.casefold() not in searchable.casefold():
+            continue
+        result.append(agent)
+    return sorted(result, key=lambda a: (-(done_timestamp(a) or 0), a.key))
+
+
+def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False) -> Text:
+    """Reserve separate elapsed/status columns before fitting task identity."""
+    width = max(1, width)
+    bucket = board_bucket(agent, now)
+    color = BOARD_COLORS[bucket]
+    marker = "› " if selected else "  "
+    status = BOARD_STATUS_LABELS.get(agent.status, "待確認")
+    if bucket == "history":
+        status = "已完成"
+    if bucket in ("recent", "history"):
+        line = "{}{} {} │ {} │ {}".format(
+            marker, format_completion_time(agent.completion_time),
+            agent.name, status, agent.latest,
+        )
+        return Text(truncate_display(line, width), style=color)
+
+    elapsed = "已跑 " + compact_elapsed(agent)
+    elapsed_width = max(14, display_width(elapsed))
+    status_width = 8
+    # Three separators plus the cursor. Shrink model, then title, then agent.
+    budget = width - 2 - 9 - elapsed_width - status_width
+    name_width = min(display_width(agent.name), max(1, budget - 10), 26)
+    identity_width = max(0, budget - name_width)
+    identity = agent.harness + " · " + agent.model
+    if display_width(identity) > identity_width:
+        model_width = identity_width - display_width(agent.harness + " · ")
+        if model_width >= 1:
+            identity = agent.harness + " · " + truncate_display(agent.model, model_width)
+        else:
+            identity = truncate_display(agent.harness, identity_width)
+    name = truncate_display(agent.name, name_width)
+    name += " " * max(0, name_width - display_width(name))
+    identity += " " * max(0, identity_width - display_width(identity))
+    result = Text(marker + name + " │ " + identity + " │ ", style=color)
+    result.append(elapsed + " " * (elapsed_width - display_width(elapsed)), style="bold " + color)
+    result.append(" │ " + status + " " * max(0, status_width - display_width(status)))
+    detail = agent.stage or agent.latest or "尚無進度"
+    wait_text = ""
+    if agent.question:
+        if agent.question.get("error"):
+            detail = "問題格式錯誤：" + agent.question["error"]
+        else:
+            detail = agent.question.get("question") or detail
+        if agent.status == "question" and not agent.question.get("answered"):
+            wait_text = "  " + format_question_wait(
+                question_wait_seconds(agent.question, now)
+            )
+    detail_width = max(1, width - display_width(wait_text))
+    result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
+    if wait_text:
+        overdue = question_wait_seconds(agent.question, now) >= QUESTION_OVERDUE_SECONDS
+        result.append(wait_text, style="bold #f7768e" if overdue else "bold #e0af68")
+    return result
+
+
+def render_home_quota(
+    raw: list, width: int, stale: bool = False, now: Optional[float] = None,
+) -> str:
+    """Show the most urgent window per provider, using the full chart's algorithm."""
+    parts = []
+    items = ordered_quota_items(raw)
+    for provider in QUOTA_PROVIDER_NAMES:
+        name = QUOTA_PROVIDER_NAMES[provider]
+        candidates = []
+        balances = []
+        for item in items:
+            if str(item.get("provider", "")).casefold() != provider:
+                continue
+            if isinstance(item.get("balance"), str) and item["balance"].strip():
+                balances.append(item["balance"])
+            if quota_item_has_data(item):
+                for label, used, window in valid_quota_windows(item):
+                    progress = quota_time_progress(window, now)
+                    color, tag = quota_window_status(used, progress)
+                    severity = 2 if tag == "告急" else 1 if tag else 0
+                    candidates.append((severity, label, used, progress, color, tag))
+        if candidates:
+            _, label, used, progress, color, tag = max(candidates, key=lambda entry: entry[0])
+            label = {"5 小時": "5h", "7 天": "7d"}.get(label, label)
+            bar = render_quota_chart(used, progress, 6)
+            value = f"{escape(label)} {bar} [{color}]{used:g}%{' ' + tag if tag else ''}[/]"
+        elif balances:
+            value = escape(balances[0])
+        else:
+            value = "[#737b91]無資料[/]"
+        parts.append(f"{name} {value}")
+    if stale:
+        parts[0] = "[#f7768e]過期 [/]" + parts[0]
+    separator = "   "
+    lines = []
+    current = ""
+    for part in parts:
+        candidate = current + (separator if current else "") + part
+        if current and display_width(Text.from_markup(candidate).plain) > width:
+            lines.append(current)
+            current = part
+        else:
+            current = candidate
+    return "\n".join(lines + [current])
+
+
+def render_work_board(
+    agents: List[AgentInfo], width: int = 80, now: Optional[float] = None,
+    expand_recent: bool = False,
+) -> str:
+    current = time.time() if now is None else now
+    lines = []
+    for project, tasks in work_board_groups(agents, current).items():
+        lines.append(f"[bold #bb9af7]▌ {escape(project_label(project))}[/]")
+        active = [a for a in tasks if task_bucket(a, current) != "recent"]
+        recent = [a for a in tasks if task_bucket(a, current) == "recent"]
+        if active:
+            lines.append(render_board_active(active, width))
+        if recent:
+            lines.append(render_board_recent(recent, width, expand_recent))
+    lines.append(escape(render_history_summary(agents, current)))
+    return "\n".join(lines)
+
+
 def render_active_flow(active_agents: List[AgentInfo], width: int = 80) -> str:
     """Render active flow as bordered text cards without recreating widgets."""
     if not active_agents:
@@ -2161,9 +3278,11 @@ def render_done_tasks(done_agents: List[AgentInfo], width: int = 80) -> str:
 
 
 def notify_completion(agent: AgentInfo):
-    """Trigger macOS notification and sound when an agent completes."""
+    """Notify on a terminal result or a stalled run."""
     name_escaped = agent.name.replace('"', '\\"')
-    script = f'display notification "{name_escaped} 已完成" with title "Agent Watch"'
+    labels = {"complete": "已完成", "partial": "部分完成", "failed": "失敗", "blocked": "受阻", "waiting": "等待中"}
+    label = labels.get(agent.status, agent.status)
+    script = f'display notification "{name_escaped} {label}" with title "Agent Watch"'
     try:
         subprocess.Popen(
             ["osascript", "-e", script],
@@ -2175,7 +3294,33 @@ def notify_completion(agent: AgentInfo):
         pass
     try:
         subprocess.Popen(
-            ["afplay", "/System/Library/Sounds/Glass.aiff"],
+            ["afplay", f"/System/Library/Sounds/{'Glass' if agent.status == 'complete' else 'Basso' if agent.status == 'failed' else 'Ping'}.aiff"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        pass
+
+
+def notify_question_overdue(agent: AgentInfo):
+    """Notify once when a QUESTION.md has waited past the 30-minute limit."""
+    question = agent.question or {}
+    label = question.get("id") or "問題"
+    message = "%s 的 %s 已等超過 30 分鐘" % (agent.name, label)
+    script = 'display notification "%s" with title "Agent Watch · 等回答"' % message.replace('"', '\\"')
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(
+            ["afplay", "/System/Library/Sounds/Basso.aiff"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
@@ -2198,95 +3343,22 @@ def run_once_summary(
     if quota_stale:
         quota_text += "（資料過期）"
 
-    status_tags = {
-        "running": "進行中 (藍)",
-        "complete": "完成 (綠)",
-        "waiting": "等待 (橘)",
-        "failed": "失敗 (紅)",
-        "blocked": "受阻 (橘)",
-        "partial": "部分完成 (黃)",
-        "no_report": "已結束、無結果報告 (橘)",
-        "unconfirmed": "結果未確認",
-        "error": "異常 (灰)",
-    }
-
-    counts = {}
-    for a in agents:
-        counts[a.status] = counts.get(a.status, 0) + 1
-
-    print("================================================================================")
+    print("=" * 80)
     print(f" AGENT WATCH v8 (單次摘要)  |  時間: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}")
-    print(f" 額度: {quota_text}")
-    print(
-        f" 統計: 總計 {len(agents)} | 進行中 {counts.get('running', 0)} | "
-        f"完成 {counts.get('complete', 0)} | 卡住 {counts.get('waiting', 0)} | "
-        f"失敗 {counts.get('failed', 0)} | 異常 {counts.get('error', 0)}"
-    )
-    print("================================================================================")
+    print(render_compact_quota(quota_text, 80))
+    print(format_bucket_counts(agents, now))
+    print("【工作看板】")
+    # Plain output has no viewport: retain full task names for search and review.
+    board_width = max([80] + [
+        display_width(a.name) + display_width(a.harness) + display_width(a.model) + 40
+        for a in agents if task_bucket(a, now) != "history"
+    ])
+    print(Text.from_markup(render_work_board(agents, board_width, now)).plain)
 
     if errors:
         print("資料提示:")
         for err in errors:
             print(f"  * {err}")
-        print("--------------------------------------------------------------------------------")
-
-    active_agents = [a for a in agents if is_active_agent(a)]
-    completed_agents = [a for a in agents if is_done_agent(a)]
-    recent_agents, older_agents = split_recent_done(completed_agents, now)
-
-    print("【剛完成 · 最近 2 小時 · 最新在上】")
-    if not recent_agents:
-        print("  (目前沒有剛完成的 agent)")
-    else:
-        recent_groups = group_agents_by_project(recent_agents)
-        ordered_recent = sorted(
-            recent_groups.items(),
-            key=lambda item: max((done_timestamp(agent) or 0.0) for agent in item[1]),
-            reverse=True,
-        )
-        for project_id, project_agents in ordered_recent:
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                tag = status_tags.get(a.status, a.status)
-                print(f"  [●] {a.name} | 狀態: {tag} | 完成: {format_completion_time(a.completion_time)}")
-                print(f"      成果: {a.latest}")
-
-    print("\n【分頁 1：進行中任務流程】")
-    if not active_agents:
-        print("  (目前沒有進行中的 agent)")
-    else:
-        index = 0
-        active_groups = group_agents_by_project(active_agents)
-        for project_id, project_agents in active_groups.items():
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                index += 1
-                tag = status_tags.get(a.status, a.status)
-                print(f"  [{index:02d}] {a.name}")
-                print(
-                    f"       狀態: {tag} | Harness: {a.harness} | 模型: {a.model} | 已跑: {a.elapsed}"
-                )
-                print(f"       目前階段: {a.stage or UNKNOWN_IDENTITY}")
-                print(f"       最新: {a.latest}")
-
-    print("\n【分頁 1：其他已完成任務】")
-    if not older_agents:
-        print("  (目前沒有其他已完成的 agent)")
-    else:
-        index = 0
-        older_groups = group_agents_by_project(older_agents)
-        for project_id, project_agents in older_groups.items():
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                index += 1
-                tag = status_tags.get(a.status, a.status)
-                print(
-                    f"  [✓{index:02d}] {a.name} | 狀態: {tag} | "
-                    f"Harness: {a.harness} | 模型: {a.model} | 已跑: {a.elapsed} | "
-                    f"完成: {format_completion_time(a.completion_time)}"
-                )
-                print(f"        目前階段: {a.stage or UNKNOWN_IDENTITY}")
-                print(f"        成果: {a.latest}")
 
     print("\n【分頁 2：架構狀態】")
     view = ARCHITECTURE_DATA["architectures"]["now"]
@@ -2330,120 +3402,246 @@ def run_once_summary(
 
 APP_CSS = """
 Screen {
-    background: #0f1117;
-    color: #c0caf5;
+    background: #101216;
+    color: #c4c9d4;
 }
-
 #top-bar {
-    height: 3;
-    background: #1a1b26;
-    border-bottom: heavy #3b4261;
+    height: 1;
+    background: #1b1e24;
+}
+#top-title {
+    width: 9;
+    color: #a9b1bd;
+}
+.nav-tab {
+    width: 11;
+    height: 1;
+    color: #a9b1bd;
+}
+.nav-tab.current {
+    color: #9ece6a;
+    text-style: bold;
+}
+#clock {
+    width: 1fr;
+    text-align: right;
+    padding-right: 1;
+}
+#main-tabs {
+    height: 1fr;
+}
+#main-tabs ContentTabs {
+    display: none;
+}
+TabPane {
+    padding: 0;
+}
+#compact-quota-line {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+    background: #181b20;
+}
+#work-page {
+    layout: vertical;
+    height: 1fr;
     padding: 0 1;
 }
-
-#top-title {
-    color: #7aa2f7;
-    text-style: bold;
-    width: 20;
+#work-page.wide {
+    layout: horizontal;
 }
-
-#top-stats {
-    color: #a9b1d6;
-    width: 1fr;
-}
-
-TabbedContent {
-    height: 1fr;
-}
-
-TabPane {
-    padding: 1;
-}
-
-#work-page {
-    height: 1fr;
-}
-
 #work-scroll {
+    width: 1fr;
     height: 1fr;
     min-height: 3;
+    scrollbar-size: 1 1;
 }
-
-.flow-title {
-    color: #bb9af7;
-    text-style: bold;
-    height: 1;
+#work-page.wide #work-scroll {
+    width: 2fr;
+    margin-right: 1;
 }
-
 #data-errors {
     height: auto;
-    color: #ff9e3b;
+    color: #f7768e;
 }
-
-#recent-done-display {
+#attention-box, .project-section, #pinned-box {
     height: auto;
-    margin-bottom: 1;
-}
-
-#compact-quota-line {
-    background: #16161e;
-    color: #7dcfff;
-    border: dashed #3b4261;
+    border: solid #444b59;
     padding: 0 1;
+    border-title-color: #a9b1bd;
+}
+#attention-box {
+    border: solid #f7768e;
+    border-title-color: #f7768e;
+}
+#attention-list, #work-board {
+    height: auto;
+}
+#pinned-box {
+    color: #737b91;
+}
+.empty-row, .more-recent, #top-stats, #history-summary {
+    height: 1;
+    color: #737b91;
+}
+.task-row {
+    height: auto;
+    min-height: 1;
+}
+.task-row:focus, .task-row.selected {
+    background: #222831;
+}
+.project-section.selected, #attention-box.selected {
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+}
+#work-log-box {
+    height: 7;
+    min-height: 7;
+    border: solid #444b59;
+    border-title-color: #a9b1bd;
+    padding: 0 1;
+}
+#work-page.wide #work-log-box {
+    width: 1fr;
+    height: 1fr;
+}
+#bottom-log-title {
+    height: 1;
+    color: #c4c9d4;
+    text-style: bold;
+}
+#preview-scroll {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
+#bottom-log-content {
+    height: auto;
+    color: #a9b1bd;
+}
+#key-bar {
+    height: 1;
+    background: #1b1e24;
+    color: #a9b1bd;
+    padding-left: 1;
+}
+#arch-display, #quota-display, #history-display {
+    height: auto;
+}
+#state-message {
+    height: auto;
+    max-height: 2;
+    color: #e0af68;
+    padding: 0 1;
+}
+#history-page {
+    padding: 0 1;
+}
+#history-filters {
     height: 3;
 }
-
-#active-timers {
-    height: auto;
-    margin-top: 1;
-    margin-bottom: 1;
+#history-filters Select {
+    width: 1fr;
 }
-
-#active-flow-display {
-    height: auto;
-    margin-bottom: 1;
+#history-search {
+    height: 3;
+    display: none;
 }
-
-#done-collapsible {
-    background: #1a1b26;
-    border: solid #3b4261;
-    margin-top: 1;
-    margin-bottom: 1;
+#history-table {
+    height: 1fr;
+    color: #a9b1bd;
 }
-
-#done-tasks-display {
-    height: auto;
+TagScreen {
+    align: center middle;
+}
+#tag-panel {
+    width: 70;
+    max-width: 100%;
+    height: 7;
+    border: solid #9ece6a;
+    background: #101216;
     padding: 0 1;
 }
-
-#work-log-box {
-    height: 9;
-    min-height: 9;
-    max-height: 9;
-    background: #16161e;
-    border-top: double #7aa2f7;
+HelpScreen {
+    background: #101216;
+}
+#help-scroll {
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+    padding: 1 2;
+}
+#help-content {
+    height: auto;
+}
+TerminalScreen {
+    background: #101216;
+}
+#terminal-panel {
+    height: 1fr;
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+    background: #101216;
     padding: 0 1;
 }
-
-#bottom-log-title {
-    color: #7dcfff;
-    text-style: bold;
+#terminal-title {
     height: 1;
-    content-align: left middle;
+    color: #9ece6a;
+    text-style: bold;
 }
-
-#bottom-log-content {
-    color: #a9b1d6;
-    height: 6;
-    overflow: hidden;
+#terminal-scroll {
+    height: 1fr;
+    scrollbar-size: 1 1;
 }
-
-#arch-display {
+#terminal-content {
     height: auto;
+    color: #c4c9d4;
 }
-
-#quota-display {
+#terminal-search {
+    height: 3;
+    display: none;
+}
+#terminal-hint {
+    height: 1;
+    color: #737b91;
+}
+QuestionScreen {
+    align: center middle;
+    background: #101216;
+}
+#question-panel {
+    width: 90%;
     height: auto;
+    max-height: 90%;
+    border: solid #f7768e;
+    border-title-color: #f7768e;
+    background: #101216;
+    padding: 0 1;
+}
+#question-agent {
+    height: 1;
+    color: #f7768e;
+    text-style: bold;
+}
+#question-text, #question-error, #question-raw {
+    height: auto;
+    margin-bottom: 1;
+}
+#question-error {
+    color: #f7768e;
+}
+#question-raw {
+    color: #a9b1bd;
+}
+#question-options {
+    height: auto;
+    max-height: 8;
+}
+#question-note {
+    height: 3;
+}
+#question-hint {
+    height: 1;
+    color: #737b91;
 }
 """
 
@@ -2463,6 +3661,365 @@ def render_data_errors(errors: List[str], agents: List[AgentInfo], width: int) -
     return "\n".join(lines)
 
 
+class RunDataService:
+    """One background reader owns the parser; UI reads complete snapshots."""
+
+    def __init__(self, runs_path: Path, done_path: Path, parser: LogParser):
+        self.runs_path = runs_path
+        self.done_path = done_path
+        self.parser = parser
+        self._lock = threading.Lock()
+        self._fetching = False
+        self._snapshot: Tuple[List[AgentInfo], List[str]] = ([], [])
+        self.on_ready: Optional[Callable[[], None]] = None
+
+    def snapshot(self) -> Tuple[List[AgentInfo], List[str]]:
+        with self._lock:
+            agents, errors = self._snapshot
+            return [copy.copy(agent) for agent in agents], list(errors)
+
+    def refresh_in_background(self) -> bool:
+        with self._lock:
+            if self._fetching:
+                return False
+            self._fetching = True
+
+        def read() -> None:
+            try:
+                result = load_all_agents(self.runs_path, self.done_path, self.parser)
+            except Exception as exc:
+                result = ([], [f"讀取工作資料失敗：{exc}"])
+            with self._lock:
+                self._snapshot = result
+                self._fetching = False
+            if self.on_ready is not None:
+                self.on_ready()
+
+        threading.Thread(target=read, daemon=True, name="agent-watch-data").start()
+        return True
+
+
+class NavTab(Static):
+    def __init__(self, label: str, tab_id: str):
+        super().__init__(label, classes="nav-tab", markup=False)
+        self.tab_id = tab_id
+
+    def on_click(self) -> None:
+        self.app.action_switch_tab(self.tab_id)
+
+
+class HistoryTable(DataTable):
+    # ScrollView otherwise consumes Space before it reaches the App binding.
+    BINDINGS = [("space", "app.toggle_history_group", "收合專案組")]
+
+
+class TaskRow(Static, can_focus=True):
+    class Selected(Message):
+        def __init__(self, key: str):
+            super().__init__()
+            self.key = key
+
+    def __init__(self, agent: AgentInfo, now: float):
+        super().__init__(classes="task-row")
+        self.agent = agent
+        self.now = now
+        self.selected = False
+
+    def render(self) -> Text:
+        agent = copy.copy(self.agent)
+        entry = self.app.state.task(agent.key)
+        if board_bucket(agent, self.now) not in ("running", "attention") and not entry.get("read"):
+            agent.name = "● " + agent.name
+        if entry.get("tags"):
+            agent.name += " [" + ", ".join(entry["tags"]) + "]"
+        return render_task_row(agent, self.content_size.width, self.now, self.selected)
+
+    def on_focus(self) -> None:
+        self.post_message(self.Selected(self.agent.key))
+
+    def on_click(self) -> None:
+        self.focus()
+        self.post_message(self.Selected(self.agent.key))
+
+
+# Dashboard-wide actions that must stay inert while the full-screen help table is
+# up. Textual 8.2.8 already drops App bindings behind a modal screen, but the App
+# is the last resort in the binding chain (and priority bindings skip that
+# truncation), so the intent is stated explicitly and tested.
+HELP_BLOCKED_ACTIONS = frozenset({
+    "switch_tab",               # 1-4
+    "toggle_recent",            # e
+    "cycle_project",            # p
+    "show_architecture_now",    # n
+    "show_architecture_future",  # f
+    "hide_task", "finish_task", "collapse_project", "toggle_pin", "toggle_read",
+    "edit_tags", "restore_task", "toggle_history_mode", "toggle_history_group",
+    "search_history", "next_task", "previous_task", "open_task",
+})
+
+
+class TagScreen(ModalScreen):
+    BINDINGS = [("escape", "dismiss(None)", "取消")]
+
+    def __init__(self, tags: List[str]):
+        super().__init__()
+        self.tags = tags
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tag-panel") as panel:
+            panel.border_title = "自訂標籤"
+            yield Label("用逗號分隔；留空清除。Enter 儲存，Esc 取消。")
+            yield Input(value=", ".join(self.tags), id="tag-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss([tag.strip() for tag in re.split("[,，]", event.value) if tag.strip()])
+
+
+class HelpScreen(ModalScreen):
+    BINDINGS = [
+        ("escape", "dismiss", "返回"),
+        ("question_mark", "dismiss", "返回"),
+        # The table itself advertises `q` as the way out, so keep it live here.
+        ("q", "app.quit", "離開"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="help-scroll") as panel:
+            panel.border_title = "快捷鍵 · Esc / ? 返回"
+            yield Static(
+                "[bold #9ece6a]AGENT WATCH v10 · 快捷鍵[/]\n\n"
+                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構\n\n"
+                "[bold]工作頁[/]\n"
+                "  j / ↓        下一筆任務\n"
+                "  k / ↑        上一筆任務\n"
+                "  Tab / Shift+Tab  移動焦點\n"
+                "  滑鼠點選      選中任務並預覽\n"
+                "  Enter        深入畫面：全螢幕唯讀終端機（Esc 返回）\n"
+                "               有 QUESTION.md 時開選項彈窗\n"
+                "  e            展開／收起各專案的剛完成清單\n\n"
+                "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
+                "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
+                "  i            釘選／取消釘選（最多 5 個）\n"
+                "  t            編輯自訂標籤（逗號分隔）\n"
+                "  u            切換已讀／未讀\n\n"
+                "[bold]歷史頁[/]\n"
+                "  /            搜尋；Enter 回清單；Esc 清除搜尋\n"
+                "  Tab          移至專案／標籤／已讀／隱藏篩選\n"
+                "  g            切換表格／依專案分組\n"
+                "  Space / Enter  收合／展開選中的專案組\n"
+                "  j / k / ↑ / ↓  選取列\n"
+                "  r            撈回主頁（取消隱藏與手動完成）\n"
+                "  i / t / u    釘選／標籤／已讀切換\n\n"
+                "[bold]架構頁[/]\n"
+                "  p            切換專案\n"
+                "  n / f        現在／未來架構\n\n"
+                "[bold]全域[/]\n"
+                "  ?            開啟／關閉此表\n"
+                "  Esc          關閉此表\n"
+                "  q            離開看板",
+                id="help-content",
+            )
+
+
+class TerminalScreen(ModalScreen):
+    """Full-screen read-only tail of a run log; Esc returns without touching the run."""
+
+    BINDINGS = [
+        ("escape", "back", "返回"),
+        ("slash", "focus_search", "搜尋"),
+        ("j", "scroll_down", "下一行"),
+        ("k", "scroll_up", "上一行"),
+        ("home", "scroll_home", "頂端"),
+        ("end", "scroll_end", "末端"),
+    ]
+
+    def __init__(self, agent: AgentInfo):
+        super().__init__()
+        self.agent = agent
+        self.query_text = ""
+        self._last_markup = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="terminal-panel") as panel:
+            panel.border_title = "深入畫面 · Esc 返回"
+            yield Static(self.title_text(), id="terminal-title", markup=False)
+            with VerticalScroll(id="terminal-scroll"):
+                yield Static("讀取 run.log…", id="terminal-content", markup=False)
+            yield Input(placeholder="搜尋日誌；Enter 套用，Esc 清除", id="terminal-search")
+            yield Static(
+                "j/k ↑↓ 捲動 · PgUp/PgDn 翻頁 · / 搜尋 · Esc 返回（唯讀，不會影響任務）",
+                id="terminal-hint",
+            )
+
+    def title_text(self) -> str:
+        name = "無 log" if str(self.agent.log_path) == "/dev/null" else Path(self.agent.log_path).name
+        return "%s · %s %s · %s（唯讀）" % (
+            self.agent.name, self.agent.harness, self.agent.model, name,
+        )
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+        self.query_one("#terminal-scroll", VerticalScroll).focus()
+        self.set_interval(1.0, self.refresh_content)
+
+    def refresh_content(self) -> None:
+        scroll = self.query_one("#terminal-scroll", VerticalScroll)
+        at_bottom = scroll.scroll_offset.y >= max(0, scroll.max_scroll_y - 1)
+        lines = humanize_log_lines(read_log_tail(Path(self.agent.log_path)))
+        content = self.query_one("#terminal-content", Static)
+        if lines:
+            text = render_terminal_text(lines, self.query_text)
+        else:
+            text = Text("（沒有可讀的日誌內容）", style="#737b91")
+        markup = text.plain + "|" + self.query_text
+        if markup == self._last_markup:
+            return
+        self._last_markup = markup
+        content.update(text)
+        if at_bottom:
+            self.call_after_refresh(scroll.scroll_end, animate=False)
+
+    def action_focus_search(self) -> None:
+        search = self.query_one("#terminal-search", Input)
+        search.display = True
+        search.focus()
+
+    def action_back(self) -> None:
+        search = self.query_one("#terminal-search", Input)
+        if search.display or self.query_text:
+            search.value = ""
+            search.display = False
+            self.query_text = ""
+            self._last_markup = None
+            self.refresh_content()
+            self.query_one("#terminal-scroll", VerticalScroll).focus()
+            return
+        self.dismiss()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "terminal-search":
+            self.query_text = event.value.strip()
+            self._last_markup = None
+            self.refresh_content()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "terminal-search":
+            event.input.display = False
+            self.query_text = event.value.strip()
+            self._last_markup = None
+            self.refresh_content()
+            self.query_one("#terminal-scroll", VerticalScroll).focus()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_up(animate=False)
+
+    def action_scroll_home(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
+
+
+class QuestionScreen(ModalScreen):
+    """SPEC §3.3 options popup; malformed questions only show their raw text."""
+
+    BINDINGS = [("escape", "dismiss(None)", "取消")]
+
+    def __init__(self, agent: AgentInfo, question: Dict[str, Any]):
+        super().__init__()
+        self.agent = agent
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        question = self.question
+        with Vertical(id="question-panel") as panel:
+            panel.border_title = "等回答 · %s" % self.agent.name
+            wait = format_question_wait(question_wait_seconds(question, time.time()))
+            yield Static(
+                "%s · %s%s" % (
+                    self.agent.name, wait,
+                    " · 已等超過 30 分鐘" if question_wait_seconds(
+                        question, time.time()) >= QUESTION_OVERDUE_SECONDS else "",
+                ),
+                id="question-agent", markup=False,
+            )
+            if question.get("error"):
+                yield Static(
+                    "問題格式錯誤：%s（只顯示原文，不能選）" % question["error"],
+                    id="question-error", markup=False,
+                )
+                yield Static(question.get("raw", ""), id="question-raw", markup=False)
+            else:
+                yield Static(question.get("question", ""), id="question-text", markup=False)
+                yield OptionList(
+                    *[Option("%s  %s" % (code, label), id=code)
+                      for code, label in question.get("options", [])],
+                    id="question-options",
+                )
+                yield Input(
+                    placeholder="可留一行備註（Tab 到這裡，Enter 送出）",
+                    id="question-note",
+                )
+            yield Static(
+                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · Esc 取消",
+                id="question-hint",
+            )
+
+    def on_mount(self) -> None:
+        options = self.query("#question-options")
+        if options:
+            options.first().focus()
+    def _dismiss_with(self, choice: str, note: str = "") -> None:
+        self.dismiss(dict(choice=choice, note=note))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._dismiss_with(str(event.option.id or ""))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "question-note":
+            return
+        event.stop()
+        options = self.query("#question-options")
+        codes = [code for code, _ in self.question.get("options", [])]
+        if not options or not codes:
+            return
+        index = options.first().highlighted
+        choice = codes[index if index is not None else 0]
+        self._dismiss_with(choice, event.value)
+
+
+def render_terminal_text(lines: List[str], query: str = "") -> Text:
+    """Render humanized tail lines; a search query is highlighted per line."""
+    text = Text()
+    query_folded = query.casefold()
+    for index, line in enumerate(lines):
+        if index:
+            text.append("\n")
+        if not query_folded:
+            text.append(line, style="#c4c9d4")
+            continue
+        folded = line.casefold()
+        start = 0
+        position = folded.find(query_folded, start)
+        if position < 0:
+            text.append(line, style="#c4c9d4")
+            continue
+        while position >= 0:
+            text.append(line[start:position], style="#c4c9d4")
+            text.append(line[position:position + len(query)], style="bold #e0af68")
+            start = position + len(query)
+            position = folded.find(query_folded, start)
+        text.append(line[start:], style="#c4c9d4")
+    return text
+
+
 class AgentWatchApp(App):
     """Textual terminal dashboard for monitoring agents with tabs and flicker-free updates."""
 
@@ -2470,24 +4027,48 @@ class AgentWatchApp(App):
     BINDINGS = [
         ("q", "quit", "離開 (Quit)"),
         ("1", "switch_tab('tab-work')", "工作 (1)"),
-        ("2", "switch_tab('tab-arch')", "架構 (2)"),
+        ("2", "switch_tab('tab-history')", "歷史 (2)"),
         ("3", "switch_tab('tab-quota')", "額度 (3)"),
+        ("4", "switch_tab('tab-arch')", "架構 (4)"),
+        ("j", "next_task", "下一筆"),
+        ("down", "next_task", "下一筆"),
+        ("k", "previous_task", "上一筆"),
+        ("up", "previous_task", "上一筆"),
+        ("enter", "open_task", "深入畫面"),
+        ("question_mark", "show_help", "快捷鍵"),
+        ("e", "toggle_recent", "展開剛完成 (E)"),
         ("p", "cycle_project", "切換專案 (P)"),
         ("n", "show_architecture_now", "現在 (N)"),
         ("f", "show_architecture_future", "未來 (F)"),
+        ("h", "hide_task", "隱藏"),
+        ("d", "finish_task", "歸到已完成"),
+        ("c", "collapse_project", "收起專案"),
+        ("i", "toggle_pin", "釘選"),
+        ("t", "edit_tags", "標籤"),
+        ("u", "toggle_read", "已讀"),
+        ("r", "restore_task", "撈回主頁"),
+        ("g", "toggle_history_mode", "表格／分組"),
+        ("space", "toggle_history_group", "收合專案組"),
+        ("slash", "search_history", "搜尋"),
+        ("escape", "clear_history_search", "清除搜尋"),
     ]
 
     def __init__(
         self,
         runs_path: Path = DEFAULT_RUNS_TSV,
         done_path: Path = DEFAULT_DONE_TSV,
+        state_path: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
         self.done_path = done_path
+        self.state = WatchState(state_path)
+        self.state_message = self.state.warning
         self.log_parser = LogParser()
+        self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.notified_keys: Set[str] = set()
+        self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
         self.is_first_load = True
         self.last_snapshot: Any = None
@@ -2498,47 +4079,570 @@ class AgentWatchApp(App):
         self.ui_error = ""
         self.current_agents: List[AgentInfo] = []
         self.architecture_view_id = "now"
+        ensure_architecture_data()
         self.architecture_project_id = next(iter(ARCHITECTURE_DATA["projects"]))
         self.current_active_agents: List[AgentInfo] = []
+        self.expand_recent = False
+        self.selected_key: Optional[str] = None
+        self._row_widgets: Dict[str, TaskRow] = {}
+        self._board_structure: Any = None
+        self.layout_mode = "stacked"
+        self.history_grouped = False
+        self.history_collapsed: Set[str] = set()
+        self.history_query = ""
+        self.history_filters = dict(project="", tag="", read="", hidden="")
+        self.history_rows: List[Tuple[str, str]] = []
+        self._history_snapshot: Any = None
+        self._history_options: Any = None
+        self._now = time.time()
+        self._preview_read_key: Optional[str] = None
+        self._last_preview_key: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
-            yield Label("⚡ AGENT WATCH v8", id="top-title")
-            yield Label("載入中...", id="top-stats")
+            yield Label(" AW v10", id="top-title")
+            for number, label, tab_id in (
+                (1, "工作", "tab-work"), (2, "歷史", "tab-history"),
+                (3, "額度", "tab-quota"), (4, "架構", "tab-arch"),
+            ):
+                yield NavTab(f"[{number}] {label}", tab_id)
+            yield Label("", id="clock")
+        yield Static("額度：載入中...", id="compact-quota-line")
+        yield Static(self.state_message, id="state-message", markup=False)
 
         with TabbedContent(initial="tab-work", id="main-tabs"):
-            with TabPane("工作 (1)", id="tab-work"):
+            with TabPane("[1] 工作", id="tab-work"):
                 with Vertical(id="work-page"):
                     with VerticalScroll(id="work-scroll"):
-                        yield Label("● 工作狀態", classes="flow-title")
                         yield Static(id="data-errors")
-                        yield Static(id="recent-done-display")
-                        yield Static("⚡ 額度：載入中...", id="compact-quota-line")
-                        yield Static(id="active-timers")
-                        yield Static(id="active-flow-display")
-                        with Collapsible(title="其他已完成／歸檔工作 (0)", id="done-collapsible", collapsed=True):
-                            yield Static(id="done-tasks-display")
-                    with Vertical(id="work-log-box"):
-                        yield Label("最新 LOG：無", id="bottom-log-title")
-                        yield Static("尚無即時日誌", id="bottom-log-content")
+                        with Vertical(id="attention-box") as attention:
+                            attention.border_title = "需處理"
+                            yield Vertical(id="attention-list")
+                        with Vertical(id="pinned-box") as pinned:
+                            pinned.border_title = "釘選 · 0/5"
+                            yield Static("尚無釘選", classes="empty-row")
+                        yield Vertical(id="work-board")
+                        yield Label("", id="top-stats")
+                        yield Static(id="history-summary")
+                    with Vertical(id="work-log-box") as preview:
+                        preview.border_title = "預覽 · 跟隨游標"
+                        yield Label("尚未選中任務", id="bottom-log-title", markup=False)
+                        with VerticalScroll(id="preview-scroll"):
+                            yield Static("尚無即時日誌", id="bottom-log-content", markup=False)
 
-            with TabPane("架構 (2)", id="tab-arch"):
+            with TabPane("[2] 歷史", id="tab-history"):
+                with Vertical(id="history-page"):
+                    yield Input(placeholder="/ 搜尋名稱、專案、標籤、結果摘要", id="history-search")
+                    with Horizontal(id="history-filters"):
+                        yield Select([("專案：全部", "")], value="", allow_blank=False, id="filter-project")
+                        yield Select([("標籤：全部", "")], value="", allow_blank=False, id="filter-tag")
+                        yield Select([("已讀：全部", ""), ("已讀", "read"), ("未讀", "unread")],
+                                     value="", allow_blank=False, id="filter-read")
+                        yield Select([("隱藏：全部", ""), ("已隱藏", "hidden"), ("未隱藏", "visible")],
+                                     value="", allow_blank=False, id="filter-hidden")
+                    yield Static(id="history-display", markup=False)
+                    yield HistoryTable(id="history-table", cursor_type="row", zebra_stripes=True)
+            with TabPane("[3] 額度", id="tab-quota"):
+                with VerticalScroll(id="quota-scroll"):
+                    yield Static(id="quota-display")
+            with TabPane("[4] 架構", id="tab-arch"):
                 with VerticalScroll(id="arch-scroll"):
                     yield Static(id="arch-display")
 
-            with TabPane("額度 (3)", id="tab-quota"):
-                with VerticalScroll(id="quota-scroll"):
-                    yield Static(id="quota-display")
+        yield Static("1–4 分頁 │ j/k ↑↓ 選取 │ Enter 深入 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
 
-        yield Footer()
+    def action_toggle_recent(self) -> None:
+        self.expand_recent = not self.expand_recent
+        self.last_snapshot = None
+        self.update_data()
+
+    def on_resize(self, event) -> None:
+        if self._ui_ready:
+            self.update_layout(event.size.width)
+            self.call_after_refresh(self.refresh_after_resize)
+
+    def refresh_after_resize(self) -> None:
+        self.last_snapshot = None
+        self.update_data()
+
+    def update_layout(self, width: Optional[int] = None) -> None:
+        columns = self.size.width if width is None else width
+        self.layout_mode = "split" if columns >= WIDE_BOARD_COLUMNS else "stacked"
+        self.query_one("#work-page").set_class(self.layout_mode == "split", "wide")
+
+    def update_board(self, agents: List[AgentInfo], now: float, width: int) -> None:
+        attention = [a for a in agents if self.state.bucket(a, now) == "attention"]
+        pinned = [a for a in agents if self.state.task(a.key).get("pinned")
+                  and self.state.bucket(a, now) not in ("attention", "hidden")
+                  and not self.state.task(a.key).get("done_manual")
+                  and not self.state.data["projects"].get(a.project, {}).get("collapsed")]
+        pinned_keys = {a.key for a in pinned}
+        groups = group_agents_by_project(
+            [a for a in agents if self.state.bucket(a, now) in ("running", "recent")
+             and a.key not in pinned_keys],
+        )
+        for tasks in groups.values():
+            tasks.sort(key=lambda a: (
+                0 if self.state.bucket(a, now) == "running" else 1,
+                -(a.start_time or 0) if a.status == "running" else -(done_timestamp(a) or 0),
+                a.key,
+            ))
+        groups = dict(sorted(groups.items(), key=lambda item: (
+            min(0 if a.status == "running" else 1 for a in item[1]),
+            -max((done_timestamp(a) or 0 for a in item[1] if is_done_agent(a)), default=0),
+            project_sort_key(item[0]),
+        )))
+        visible_groups = []
+        for project, tasks in groups.items():
+            running = [a for a in tasks if self.state.bucket(a, now) == "running"]
+            recent = [a for a in tasks if self.state.bucket(a, now) == "recent"]
+            visible = running + (recent if self.expand_recent else recent[:3])
+            visible_groups.append(
+                (project, visible, len(recent) - min(3, len(recent)), len(recent))
+            )
+        structure = (
+            tuple(a.key for a in attention),
+            tuple(a.key for a in pinned),
+            tuple(
+                (project, tuple(a.key for a in tasks), extra, recent_count)
+                for project, tasks, extra, recent_count in visible_groups
+            ),
+            self.expand_recent,
+        )
+        if structure == self._board_structure:
+            self.update_board_timers(agents, now, width)
+            self.update_selection()
+            return
+        self._board_structure = structure
+        restore_focus = isinstance(self.focused, TaskRow) or self.selected_key is None
+        board = self.query_one("#work-board", Vertical)
+        board.remove_children()
+        attention_list = self.query_one("#attention-list", Vertical)
+        attention_list.remove_children()
+        pinned_box = self.query_one("#pinned-box", Vertical)
+        pinned_box.remove_children()
+        pinned_box.border_title = "釘選 · %d/5" % sum(
+            bool(entry.get("pinned")) for entry in self.state.data["tasks"].values()
+        )
+        self._row_widgets = {}
+
+        def row(agent: AgentInfo) -> TaskRow:
+            widget = TaskRow(agent, now)
+            self._row_widgets[agent.key] = widget
+            return widget
+
+        attention_list.mount(*(
+            [row(a) for a in attention] if attention
+            else [Static("目前沒有需處理任務", classes="empty-row")]
+        ))
+        self.query_one("#attention-box").border_title = (
+            f"需處理 · {len(attention)} · 等回答／卡住／失敗／無報告"
+        )
+        pinned_box.mount(*([row(a) for a in pinned] if pinned else [
+            Static("尚無可顯示的釘選", classes="empty-row"),
+        ]))
+        sections = []
+        for project, tasks, extra, recent_count in visible_groups:
+            children = [row(a) for a in tasks]
+            if extra and not self.expand_recent:
+                children.append(Static(
+                    f"  … 另 {extra} 筆  [e] 展開", markup=False, classes="more-recent",
+                ))
+            section = Vertical(*children, classes="project-section")
+            running_count = sum(board_bucket(a, now) == "running" for a in tasks)
+            section.border_title = (
+                f"{project_label(project)} · 進行中 {running_count} · 剛完成 {recent_count}"
+            )
+            sections.append(section)
+        if sections:
+            board.mount(*sections)
+        else:
+            board.mount(Static("目前沒有進行中或剛完成的任務", classes="empty-row"))
+        if self.selected_key not in self._row_widgets:
+            self.selected_key = next(iter(self._row_widgets), None)
+        self.call_after_refresh(self.restore_selection, restore_focus)
+        history_count = sum(self.state.bucket(agent, now) in ("history", "hidden") for agent in agents)
+        self.query_one("#history-summary", Static).update(f"歷史 {history_count} 筆")
+
+    def update_board_timers(self, agents: List[AgentInfo], now: float, width: int) -> None:
+        for agent in agents:
+            widget = self._row_widgets.get(agent.key)
+            if widget is not None:
+                widget.agent = agent
+                widget.now = now
+                widget.refresh(layout=True)
+
+    def restore_selection(self, restore_focus: bool) -> None:
+        self.update_selection()
+        if restore_focus and self.query_one("#main-tabs", TabbedContent).active == "tab-work":
+            row = self._row_widgets.get(self.selected_key)
+            if row is not None:
+                row.focus(scroll_visible=False)
+
+    def on_task_row_selected(self, event: TaskRow.Selected) -> None:
+        if event.key in self._row_widgets:
+            self.selected_key = event.key
+            self.update_selection()
+
+    def update_selection(self) -> None:
+        for widget in self.query(".project-section, #attention-box, #pinned-box"):
+            widget.remove_class("selected")
+        for key, row in self._row_widgets.items():
+            row.selected = key == self.selected_key
+            row.set_class(row.selected, "selected")
+            row.refresh()
+            if row.selected and row.parent is not None:
+                panel = row.parent
+                if panel.id == "attention-list":
+                    panel = panel.parent
+                panel.add_class("selected")
+        self.update_preview()
+
+    def update_preview(self) -> None:
+        followed = next((a for a in self.current_agents if a.key == self.selected_key), None)
+        title = self.query_one("#bottom-log-title", Label)
+        content = self.query_one("#bottom-log-content", Static)
+        if followed is None:
+            title.update("尚未選中任務")
+            content.update("目前沒有可預覽的任務")
+            return
+        if followed.key != self._last_preview_key:
+            self._preview_read_key = None
+            self._last_preview_key = followed.key
+        title.update(followed.name)
+        lines = []
+        for line in followed.log_lines:
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                event = None
+            summary = summarize_jsonl_step(event) if isinstance(event, dict) else clean_text(line)
+            if summary:
+                lines.extend(summary.splitlines())
+        limit = 24 if self.layout_mode == "split" else 3
+        content.update("\n".join(lines[-limit:]) if lines else followed.latest or "尚無即時日誌")
+        if (
+            self.query_one("#main-tabs", TabbedContent).active == "tab-work"
+            and board_bucket(followed, self._now) not in ("running", "attention")
+            and self._preview_read_key != followed.key
+            and not self.state.task(followed.key).get("read")
+        ):
+            # Reading is tied to a visible preview, not to history highlighting.
+            if self.state.update_task(followed.key, read=True, run_start=followed.start_time):
+                self._preview_read_key = followed.key
+                if followed.key in self._row_widgets:
+                    self._row_widgets[followed.key].refresh()
+            self.show_state_message(self.state.warning)
+        self.call_after_refresh(self.scroll_preview_to_end)
+
+    def show_state_message(self, message: str) -> None:
+        self.state_message = message
+        if self._ui_ready:
+            self.query_one("#state-message", Static).update(message)
+
+    def selected_task(self) -> Optional[AgentInfo]:
+        tab = self.query_one("#main-tabs", TabbedContent).active
+        key = self.selected_key
+        if tab == "tab-history":
+            table = self.query_one("#history-table", DataTable)
+            if table.cursor_row >= len(self.history_rows):
+                return None
+            kind, key = self.history_rows[table.cursor_row]
+            if kind != "task":
+                return None
+        elif tab != "tab-work":
+            return None
+        return next((a for a in self.current_agents if a.key == key), None)
+
+    def operate(self, operation: str, tags: Optional[List[str]] = None,
+                task: Optional[AgentInfo] = None) -> None:
+        agent = task or self.selected_task()
+        if agent is None:
+            self.show_state_message("請先選擇一筆任務")
+            return
+        ok, message = self.state.apply(operation, agent, self.current_agents, self._now, tags)
+        self.show_state_message(message)
+        if ok:
+            if operation == "read":
+                self._preview_read_key = agent.key
+            self.last_snapshot = None
+            self.update_data()
+            if operation == "restore":
+                self.selected_key = agent.key
+                self.action_switch_tab("tab-work")
+
+    def action_hide_task(self) -> None:
+        self.operate("hide")
+
+    def action_finish_task(self) -> None:
+        self.operate("done")
+
+    def action_collapse_project(self) -> None:
+        self.operate("collapse")
+
+    def action_toggle_pin(self) -> None:
+        self.operate("pin")
+
+    def action_toggle_read(self) -> None:
+        self.operate("read")
+
+    def action_restore_task(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            self.operate("restore")
+
+    def action_edit_tags(self) -> None:
+        agent = self.selected_task()
+        if agent is None:
+            return
+
+        def saved(tags: Optional[List[str]]) -> None:
+            if tags is not None:
+                self.operate("tags", tags, agent)
+
+        self.push_screen(TagScreen(self.state.task(agent.key).get("tags", [])), saved)
+
+    def update_history(self) -> None:
+        table = self.query_one("#history-table", DataTable)
+        options = (
+            tuple(sorted({a.project for a in self.current_agents}, key=project_sort_key)),
+            tuple(sorted({tag for a in self.current_agents for tag in self.state.task(a.key).get("tags", [])})),
+        )
+        if options != self._history_options:
+            self._history_options = options
+            for field, values, label in (("project", options[0], "專案"), ("tag", options[1], "標籤")):
+                selector = self.query_one("#filter-" + field, Select)
+                selected = self.history_filters[field]
+                selector.set_options([(label + "：全部", "")] + [
+                    (project_label(value) if field == "project" else value, value) for value in values
+                ])
+                self.history_filters[field] = selected if selected in values else ""
+                selector.value = self.history_filters[field]
+        tasks = history_tasks(self.current_agents, self.state, self._now,
+                              self.history_query, **self.history_filters)
+        snapshot = (
+            self.history_grouped, tuple(sorted(self.history_collapsed)), self.size.width,
+            self.history_query, tuple(self.history_filters.items()),
+            tuple((a.key, a.completion_time, a.latest, a.status, a.project,
+                   json.dumps(self.state.task(a.key), sort_keys=True)) for a in tasks),
+        )
+        if snapshot == self._history_snapshot:
+            return
+        self._history_snapshot = snapshot
+        old_index = table.cursor_row
+        selected = self.history_rows[old_index] if old_index < len(self.history_rows) else None
+        table.clear(columns=True)
+        widths = [11, 10, 7, 15, max(17, self.size.width - 63), 5]
+        for name, width in zip(("時間", "專案", "標籤", "名稱", "結果摘要", "已讀"), widths):
+            table.add_column(name, width=width)
+        self.history_rows = []
+
+        def add_task(agent: AgentInfo) -> None:
+            entry = self.state.task(agent.key)
+            timestamp = done_timestamp(agent)
+            stamp = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M") if timestamp else "時間未知"
+            status = "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
+            disposition = "隱藏 · " if entry.get("hidden") else ""
+            cells = (stamp, project_label(agent.project), ", ".join(entry.get("tags", [])),
+                     agent.name, disposition + status + " · " + agent.latest,
+                     "已讀" if entry.get("read") else "●未讀")
+            table.add_row(*(Text(truncate_display(value, width),
+                                style="#737b91" if entry.get("read") else "bold #c4c9d4")
+                            for value, width in zip(cells, widths)))
+            self.history_rows.append(("task", agent.key))
+
+        if self.history_grouped:
+            for project, members in group_agents_by_project(tasks).items():
+                closed = project in self.history_collapsed
+                cells = ("▸ 專案" if closed else "▾ 專案", project_label(project), "",
+                         "%d 筆" % len(members), "Space / Enter 展開" if closed else "Space / Enter 收合", "")
+                table.add_row(*(Text(truncate_display(value, width), style="bold #9ece6a")
+                                for value, width in zip(cells, widths)))
+                self.history_rows.append(("project", project))
+                for agent in ([] if closed else members):
+                    add_task(agent)
+        else:
+            for agent in tasks:
+                add_task(agent)
+        index = self.history_rows.index(selected) if selected in self.history_rows else min(
+            old_index, max(0, len(self.history_rows) - 1),
+        )
+        table.move_cursor(row=index)
+        mode = "依專案分組" if self.history_grouped else "表格"
+        summary = "歷史 · %s · %d 筆" % (mode, len(tasks))
+        if not tasks:
+            summary += " · " + ("搜尋／篩選無符合任務" if self.history_query or any(
+                self.history_filters.values()) else "目前沒有歷史任務")
+        self.query_one("#history-display", Static).update(summary)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id and event.select.id.startswith("filter-") and event.value is not Select.BLANK:
+            field = event.select.id[len("filter-"):]
+            if self.history_filters[field] != event.value:
+                self.history_filters[field] = str(event.value)
+                self.update_history()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "history-search":
+            self.history_query = event.value
+            self.update_history()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "history-search":
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_search_history(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            search = self.query_one("#history-search", Input)
+            search.display = True
+            search.focus()
+
+    def action_clear_history_search(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            search = self.query_one("#history-search", Input)
+            search.value = ""
+            search.display = False
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_toggle_history_mode(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            self.history_grouped = not self.history_grouped
+            self.update_history()
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_toggle_history_group(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active != "tab-history":
+            return
+        table = self.query_one("#history-table", DataTable)
+        if table.cursor_row < len(self.history_rows):
+            kind, key = self.history_rows[table.cursor_row]
+            if kind == "task":
+                if not self.history_grouped:
+                    return
+                # 分組模式下游標停在任務列時，收合該任務所屬專案並把游標移到專案列。
+                agent = next((a for a in self.current_agents if a.key == key), None)
+                if agent is None:
+                    return
+                project = agent.project
+            else:
+                project = key
+            if project in self.history_collapsed:
+                self.history_collapsed.remove(project)
+            else:
+                self.history_collapsed.add(project)
+            self.update_history()
+            if kind == "task" and ("project", project) in self.history_rows:
+                table.move_cursor(row=self.history_rows.index(("project", project)))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "history-table":
+            self.action_toggle_history_group()
+
+    def scroll_preview_to_end(self) -> None:
+        self.query_one("#preview-scroll", VerticalScroll).scroll_end(animate=False)
+
+    def move_task(self, delta: int) -> None:
+        tab = self.query_one("#main-tabs", TabbedContent).active
+        if tab == "tab-history":
+            table = self.query_one("#history-table", DataTable)
+            table.move_cursor(row=max(0, min(table.row_count - 1, table.cursor_row + delta)))
+            return
+        if tab != "tab-work":
+            return
+        keys = list(self._row_widgets)
+        if not keys:
+            return
+        index = keys.index(self.selected_key) if self.selected_key in keys else 0
+        key = keys[max(0, min(len(keys) - 1, index + delta))]
+        self.selected_key = key
+        self._row_widgets[key].focus()
+        self.update_selection()
+
+    def action_next_task(self) -> None:
+        self.move_task(1)
+
+    def action_previous_task(self) -> None:
+        self.move_task(-1)
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+    def action_open_task(self) -> None:
+        """SPEC §2.4: Enter opens the deep view, or the question popup."""
+        agent = self.selected_task()
+        if agent is None:
+            if self.query_one("#main-tabs", TabbedContent).active == "tab-work":
+                self.show_state_message("請先選擇一筆任務")
+            return
+        if agent.status == "question" and agent.question:
+            self.push_screen(
+                QuestionScreen(agent, agent.question),
+                lambda result: self.answer_question(agent, result),
+            )
+            return
+        self.open_terminal(agent)
+
+    def open_terminal(self, agent: AgentInfo) -> None:
+        if not self.state.task(agent.key).get("read"):
+            self.state.update_task(agent.key, read=True, run_start=agent.start_time)
+            if agent.key in self._row_widgets:
+                self._row_widgets[agent.key].refresh()
+            self.show_state_message(self.state.warning)
+        self.push_screen(TerminalScreen(agent))
+
+    def question_notice_token(self, agent: AgentInfo) -> str:
+        question = agent.question or {}
+        return "question::%s::%s::%s" % (
+            agent.key, question.get("id") or "", int(question.get("asked_at_ts") or 0),
+        )
+
+    def answer_question(self, agent: AgentInfo, result: Optional[Dict[str, Any]]) -> None:
+        if not result:
+            return
+        ok, message = write_answer_file(
+            agent.log_path.parent, agent.question or {}, result.get("choice", ""),
+            result.get("note", ""), now=time.time(),
+        )
+        if ok:
+            self.state.update_task(agent.key, read=True, run_start=agent.start_time)
+            self.show_state_message("已寫入 ANSWER.md：" + result.get("choice", ""))
+            self.last_snapshot = None
+            self.update_data()
+        else:
+            self.show_state_message(message)
+
+    def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
+        """Keep dashboard shortcuts inert while the shortcut table is open.
+
+        `q` intentionally stays enabled: the table itself advertises it, and
+        leaving the dashboard is not a change to the hidden screen.
+        """
+        if action in HELP_BLOCKED_ACTIONS and isinstance(self.screen, ModalScreen):
+            return False
+        if isinstance(self.focused, Input) and action not in ("clear_history_search",):
+            return False
+        return True
 
     def action_switch_tab(self, tab_id: str) -> None:
-        """Switch active tab on keys 1/2/3."""
-        try:
-            tc = self.query_one("#main-tabs", TabbedContent)
-            tc.active = tab_id
-        except Exception:
-            pass
+        # Hiding a focused pane otherwise moves focus to its next task, whose
+        # TabPane.Focused event would immediately activate the work tab again.
+        if isinstance(self.focused, (TaskRow, DataTable, Input, Select)):
+            self.set_focus(None)
+        self.query_one("#main-tabs", TabbedContent).active = tab_id
+        for tab in self.query(NavTab):
+            tab.set_class(tab.tab_id == tab_id, "current")
+        if tab_id == "tab-work":
+            self.call_after_refresh(self.restore_selection, True)
+            self.query_one("#key-bar", Static).update(
+                "Enter 深入 h 隱藏 d 完成 c 收專案 i 釘 t 標籤 u 已讀 │ e 展開 │ 1–4 ? q"
+            )
+        elif tab_id == "tab-history":
+            self.update_history()
+            self.query_one("#history-table", DataTable).focus()
+            self.query_one("#key-bar", Static).update(
+                "/ 搜尋 Tab 篩選 g 表格/分組 Space 收合 r 撈回 │ i t u │ 1–4 ? q"
+            )
+        else:
+            self.query_one("#key-bar", Static).update("1–4 分頁 │ p 專案 n 現在 f 未來 │ ? 快捷鍵 q 離開")
 
     def action_show_architecture_now(self) -> None:
         self.set_architecture_view("now")
@@ -2583,13 +4687,25 @@ class AgentWatchApp(App):
 
     def on_mount(self) -> None:
         self._ui_ready = True
+        self.update_layout()
+        self.action_switch_tab("tab-work")
+        self.data_svc.on_ready = self._data_ready
         self.quota_svc.refresh_in_background()
+        self.data_svc.refresh_in_background()
         self.update_data()
         self.set_interval(2.0, self.poll_data)
 
     def poll_data(self) -> None:
         self.quota_svc.refresh_in_background()
+        self.data_svc.refresh_in_background()
         self.update_data()
+
+    def _data_ready(self) -> None:
+        try:
+            self.call_from_thread(self.update_data)
+        except (RuntimeError, CancelledError):
+            # The reader can finish after the app has closed.
+            pass
 
     def make_snapshot(
         self,
@@ -2599,8 +4715,10 @@ class AgentWatchApp(App):
         quota_stale: bool = False,
         quota_error: str = "",
         errors: Tuple[str, ...] = (),
+        now: Optional[float] = None,
     ) -> tuple:
         """Snapshot displayed data without elapsed counters."""
+        current = time.time() if now is None else now
         agent_snaps = tuple(
             (
                 a.key,
@@ -2615,11 +4733,26 @@ class AgentWatchApp(App):
                 a.completion_time,
                 a.is_done_file,
                 a.stage,
+                a.project,
+                a.start_time,
+                board_bucket(a, current),
             )
             for a in agents
         )
         quota_data = json.dumps(quota_raw, ensure_ascii=False, sort_keys=True, default=str)
-        return (agent_snaps, quota_summary, quota_data, quota_stale, quota_error, errors)
+        return (agent_snaps, quota_summary, quota_data, quota_stale, quota_error, errors,
+                self.state.revision)
+
+    def update_quota_charts(self, raw: list, stale: bool, now: float) -> None:
+        """Move quota clocks without redrawing unchanged task data."""
+        charts = (
+            render_home_quota(raw, max(1, self.size.width - 2), stale, now),
+            render_full_quota_view(raw, self.size.width, stale, now),
+        )
+        if charts != getattr(self, "_last_quota_charts", None):
+            self.query_one("#compact-quota-line", Static).update(charts[0])
+            self.query_one("#quota-display", Static).update(charts[1])
+            self._last_quota_charts = charts
 
     def update_data(self, now: Optional[float] = None) -> bool:
         """
@@ -2628,9 +4761,22 @@ class AgentWatchApp(App):
         """
         if now is None:
             now = time.time()
+        self._now = now
+        if self._ui_ready:
+            self.query_one("#clock", Label).update(
+                time.strftime("%H:%M:%S", time.localtime(now))
+            )
 
         try:
-            agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
+            if self._ui_ready:
+                agents, errors = self.data_svc.snapshot()
+                for agent in agents:
+                    if agent.completion_time is None:
+                        agent.elapsed = format_elapsed(agent.start_time, now)
+                        if agent.elapsed_estimated:
+                            agent.elapsed = "~" + agent.elapsed
+            else:
+                agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
         except Exception as e:
             agents, errors = [], [f"讀取工作資料失敗：{e}"]
         quota_summary, quota_raw, quota_stale, quota_error = self.quota_svc.snapshot()
@@ -2639,26 +4785,48 @@ class AgentWatchApp(App):
         error_snapshot = tuple(errors) + ((quota_error,) if quota_stale and quota_error else ())
         if self.ui_error:
             error_snapshot += (self.ui_error,)
+        self.state.reconcile(agents, now)
+        if self.state.warning and self.state.warning != self.state_message:
+            self.show_state_message(self.state.warning)
 
         # Handle completion notifications
-        if not self.is_first_load:
+        first_load = self.is_first_load
+        if not first_load:
             for a in agents:
                 prev = self.previous_status.get(a.key)
-                if prev in ("running", "waiting") and a.status == "complete" and a.key not in self.notified_keys:
+                notice_key = f"{a.key}::{a.start_time}::{a.status}"
+                if (
+                    prev is not None and prev != a.status
+                    and a.status in {"complete", "partial", "failed", "blocked", "waiting"}
+                    and notice_key not in self.notified_keys
+                ):
                     notify_completion(a)
-                    self.notified_keys.add(a.key)
+                    self.notified_keys.add(notice_key)
         else:
             for a in agents:
                 if a.status == "complete":
                     self.notified_keys.add(a.key)
             self.is_first_load = False
 
+        overdue_questions: Dict[str, AgentInfo] = {}
+        for a in agents:
+            if a.status != "question" or not a.question:
+                continue
+            if question_wait_seconds(a.question, now) < QUESTION_OVERDUE_SECONDS:
+                continue
+            overdue_questions[self.question_notice_token(a)] = a
+        if first_load:
+            self.notified_questions.update(overdue_questions)
+        else:
+            for token, a in overdue_questions.items():
+                if token not in self.notified_questions:
+                    notify_question_overdue(a)
+                    self.notified_questions.add(token)
+
         self.previous_status = {a.key: a.status for a in agents}
-        active = [a for a in agents if is_active_agent(a)]
+        active = [a for a in agents if board_bucket(a, now) in ("attention", "running")]
         self.current_agents = agents
         self.current_active_agents = active
-        done = [a for a in agents if is_done_agent(a)]
-        recent_done, older_done = split_recent_done(done, now)
         timer_snapshot = tuple((a.key, a.elapsed) for a in active)
         timer_changed = timer_snapshot != self.last_timer_snapshot
         if timer_changed:
@@ -2672,12 +4840,15 @@ class AgentWatchApp(App):
             quota_stale,
             quota_error,
             error_snapshot,
+            now,
         )
         data_changed = current_snapshot != self.last_snapshot
         if not data_changed:
+            if self._ui_ready:
+                self.update_quota_charts(quota_raw, quota_stale, now)
             if timer_changed and self._ui_ready:
                 try:
-                    self.query_one("#active-timers", Static).update(render_elapsed_timers(active))
+                    self.update_board_timers(agents, now, self.size.width)
                 except Exception as e:
                     self.ui_error = f"計時畫面更新失敗：{e}"
             return False
@@ -2685,15 +4856,13 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        # Calculate counts
-        counts = {}
-        for a in agents:
-            counts[a.status] = counts.get(a.status, 0) + 1
-
+        counts = {key: 0 for key in ("attention", "running", "recent", "history", "hidden")}
+        for agent in agents:
+            counts[self.state.bucket(agent, now)] += 1
         stats_str = (
-            f"執行 {counts.get('running', 0)}  完成 {counts.get('complete', 0)}  "
-            f"等待 {counts.get('waiting', 0)}  異常 "
-            f"{sum(counts.get(s, 0) for s in ('failed', 'blocked', 'partial', 'no_report', 'error'))}"
+            f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
+            f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
+            f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
         )
         width = self.size.width if self._ui_ready else 80
 
@@ -2702,40 +4871,14 @@ class AgentWatchApp(App):
 
         try:
             self.query_one("#top-stats", Label).update(stats_str)
-            self.query_one("#compact-quota-line", Static).update(
-                f"⚡ 額度：{escape(truncate_display(quota_summary, max(20, width - 10)))}"
-                + ("  [#ff9e3b]資料過期[/#ff9e3b]" if quota_stale else "")
-            )
-            self.query_one("#data-errors", Static).update(
-                render_data_errors(list(error_snapshot), agents, width)
-            )
-            self.query_one("#active-timers", Static).update(render_elapsed_timers(active))
-            active_markup = render_active_flow(active, width)
-            self.query_one("#active-flow-display", Static).update(active_markup)
-            self.query_one("#recent-done-display", Static).update(
-                render_recent_done_tasks(recent_done, width, now)
-            )
-
-            done_collapsible = self.query_one("#done-collapsible", Collapsible)
-            done_collapsible.title = f"其他已完成／歸檔工作 ({len(older_done)})"
-            done_markup = render_done_tasks(older_done, width)
-            self.query_one("#done-tasks-display", Static).update(done_markup)
-
-            candidates = [a for a in agents if a.log_mtime > 0 and a.log_lines]
-            followed = max(candidates, key=lambda a: a.log_mtime) if candidates else None
-            log_title = self.query_one("#bottom-log-title", Label)
-            log_content = self.query_one("#bottom-log-content", Static)
-            log_width = max(20, width - 7)
-            if followed:
-                log_title.update(f"最新 LOG：{escape(truncate_display(followed.name, max(12, width - 20)))}")
-                recent_lines = [
-                    escape(truncate_display(line, log_width))
-                    for line in followed.log_lines[-6:]
-                ]
-                log_content.update("\n".join(recent_lines) if recent_lines else "尚無即時日誌")
-            else:
-                log_title.update("最新 LOG：無可讀日誌")
-                log_content.update("目前沒有可讀取的日誌內容")
+            self.update_quota_charts(quota_raw, quota_stale, now)
+            data_errors = self.query_one("#data-errors", Static)
+            errors_markup = render_data_errors(list(error_snapshot), agents, width)
+            data_errors.update(errors_markup)
+            data_errors.display = bool(errors_markup)
+            self.update_board(agents, now, width)
+            self.update_preview()
+            self.update_history()
 
             arch_markup = render_architecture_view(
                 agents,
@@ -2744,9 +4887,6 @@ class AgentWatchApp(App):
                 self.architecture_project_id,
             )
             self.query_one("#arch-display", Static).update(arch_markup)
-
-            quota_markup = render_full_quota_view(quota_raw, width, quota_stale)
-            self.query_one("#quota-display", Static).update(quota_markup)
 
         except Exception as e:
             self.ui_error = f"畫面更新失敗：{e}"
