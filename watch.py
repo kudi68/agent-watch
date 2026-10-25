@@ -886,6 +886,8 @@ class AgentInfo:
     start_source: str = ""
     elapsed_estimated: bool = False
     question: Optional[Dict[str, Any]] = None
+    note: str = ""
+    superseded_hint: str = ""
 
 
 # Sentinel so an injected reader and the built-in `ps` reader stay distinct:
@@ -1422,6 +1424,7 @@ def build_agent(
     model: Optional[str] = None,
     project: Optional[str] = None,
     started_at: Optional[float] = None,
+    note: str = "",
 ) -> AgentInfo:
     log_path = Path(log_str).expanduser()
     if not log_path.is_absolute():
@@ -1571,7 +1574,17 @@ def build_agent(
         start_source=start_source,
         elapsed_estimated=estimated,
         question=question,
+        note=note,
+        superseded_hint=parse_superseded_hint(note),
     )
+
+
+def parse_superseded_hint(note: str) -> str:
+    """Extract the named replacement from a SUPERSEDED note."""
+    if not note.startswith("SUPERSEDED("):
+        return ""
+    match = re.match(r"SUPERSEDED\(by\s+(.+?)(?:;|\))", note)
+    return match.group(1).strip() if match else ""
 
 
 def load_tsv_agents(
@@ -1596,8 +1609,8 @@ def load_tsv_agents(
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
-        if not 3 <= len(parts) <= 8:
-            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 8 欄）")
+        if not 3 <= len(parts) <= 9:
+            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 9 欄）")
             continue
         name, log_p, last_p = parts[0].strip(), parts[1].strip(), parts[2].strip()
         if not name or not log_p or not last_p:
@@ -1618,6 +1631,7 @@ def load_tsv_agents(
         harness = parts[4].strip() or None if len(parts) >= 5 else None
         model = parts[5].strip() or None if len(parts) >= 6 else None
         project = parts[6].strip() or None if len(parts) >= 7 else None
+        note = parts[8].strip() if len(parts) >= 9 else ""
         started_at = None
         if len(parts) >= 8 and parts[7].strip():
             raw_start = parts[7].strip()
@@ -1644,6 +1658,7 @@ def load_tsv_agents(
                 model=model,
                 project=project,
                 started_at=started_at,
+                note=note,
             )
         )
 
