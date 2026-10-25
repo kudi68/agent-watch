@@ -2,10 +2,14 @@
 """Unit tests for agent-watch v7 status logic, tabs, quota, and screen output."""
 
 import asyncio
+import contextlib
 import html
+import io
+import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -13,6 +17,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from textual.widgets import TabbedContent
+import watch
 
 from watch import (
     ARCHITECTURE_DATA,
@@ -65,7 +70,8 @@ def set_mtime(path: Path, timestamp: float) -> None:
 
 def git_output(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", str(repo), "-c", "user.name=agent-watch-test",
+         "-c", "user.email=agent-watch-test@example.invalid", *args],
         capture_output=True,
         text=True,
         check=True,
@@ -224,7 +230,7 @@ class TestAgentWatch(unittest.TestCase):
 
     def test_work_and_done_cards_show_harness_model_and_progress(self):
         agent = AgentInfo(
-            name="astra 用量調查",
+            name="example-project 用量調查",
             log_path=Path("/tmp/run.log"),
             last_path=Path("/tmp/REPORT.md"),
             status="running",
@@ -295,9 +301,9 @@ class TestAgentWatch(unittest.TestCase):
             },
         ]
         text = parse_quota_json(sample_quota)
-        self.assertIn("codex 5h 7%｜7d 17%", text)
-        self.assertIn("claude 7d 43%", text)
-        self.assertIn("opencode-go 7d 12%", text)
+        self.assertIn("Codex 5h 7% 7d 17%", text)
+        self.assertIn("Claude 7d 43%", text)
+        self.assertIn("OpenCode Go 7d 12%", text)
 
         # Quota empty or malformed
         self.assertEqual(parse_quota_json([]), "額度：無資料")
@@ -797,8 +803,6 @@ class TestAgentWatch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             git_output(root, "init", "-q")
-            git_output(root, "config", "user.email", "agent-watch-test@example.invalid")
-            git_output(root, "config", "user.name", "agent-watch-test")
             git_output(root, "commit", "-q", "--allow-empty", "-m", "base")
             base = git_output(root, "rev-parse", "HEAD")
             git_output(root, "update-ref", "refs/remotes/origin/main", base)
@@ -885,7 +889,7 @@ class TestAgentWatch(unittest.TestCase):
                 self.assertFalse(service.refresh_in_background())
 
         self.assertEqual(run.call_count, 1)
-        self.assertIn("無資料", summary)
+        self.assertIn("magpie 讀取失敗", summary)
         self.assertNotIn("88%", summary)
         self.assertNotIn("88%", render_full_quota_view(raw))
         self.assertTrue(stale)
@@ -1118,6 +1122,7 @@ class TestAgentWatch(unittest.TestCase):
             text=True,
             timeout=10,
             check=False,
+            env=dict(os.environ, AGENT_WATCH_PYTHON=sys.executable),
         )
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("agent-watch v8", help_result.stdout)
@@ -1337,6 +1342,94 @@ class TestAgentWatch(unittest.TestCase):
 
         bar_red = render_quota_bar(89.0, 10)
         self.assertIn("#f7768e", bar_red)
+
+
+class StageOneScreenTests(unittest.TestCase):
+    def test_t2_t5_t10_pinned_quota_board_and_expand_at_both_widths(self):
+        async def check_screens():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                now = time.time()
+                log = root / "active.log"
+                write_log(log, now - 120, "Current phase")
+                runs, done = root / "runs.tsv", root / "done.tsv"
+                runs.write_text(
+                    f"example-project active\t{log}\t{root / 'missing.md'}\t{os.getpid()}\tAgent A\tmodel-x\n"
+                )
+                rows = []
+                for index in range(6):
+                    report = root / ("result-%d.txt" % index)
+                    report.write_text("DONE\nNeutral fixture result\n")
+                    set_mtime(report, now - 10 - index)
+                    rows.append(f"example-project result-{index}\t{log}\t{report}")
+                done.write_text("\n".join(rows) + "\n")
+                payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
+                for width in (80, 120):
+                    app = AgentWatchApp(runs_path=runs, done_path=done)
+                    app.quota_svc.sessions_path = root
+                    with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                        app.quota_svc.fetch(force=True)
+                    app.quota_svc.refresh_in_background = lambda force=False: False
+                    async with app.run_test(size=(width, 40)) as pilot:
+                        await pilot.pause()
+                        text = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        first = "\n".join(text.splitlines()[:20])
+                        for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter", "example-project active"):
+                            self.assertIn(name, first)
+                        quota = app.query_one("#compact-quota-line")
+                        self.assertLessEqual(quota.size.height, 3)
+                        self.assertNotIn("…", "\n".join(text.splitlines()[3:3 + quota.size.height]))
+                        self.assertNotIn("work-scroll", [parent.id for parent in quota.ancestors])
+                        self.assertIn("另 3 筆", text)
+                        self.assertNotIn("result-3", text)
+                        redraws = app.redraw_count
+                        self.assertFalse(app.update_data(now=now + 60))
+                        await pilot.pause()
+                        timer_text = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        self.assertIn("已跑 3m", timer_text)
+                        self.assertEqual(app.redraw_count, redraws)
+                        await pilot.press("e")
+                        await pilot.pause()
+                        expanded = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        for index in range(6):
+                            self.assertIn("result-%d" % index, expanded)
+                        await pilot.press("e")
+                        await pilot.pause()
+                        self.assertFalse(app.ui_error)
+                        snapshot = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+                        (Path(__file__).parent / "shots" / ("v9-s1-%dx40.txt" % width)).write_text(snapshot)
+                        scroll = app.query_one("#work-scroll")
+                        scroll.scroll_end(animate=False)
+                        await pilot.pause()
+                        scrolled = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+                        self.assertIn("OpenRouter", "\n".join(scrolled.splitlines()[:10]))
+        asyncio.run(check_screens())
+
+    def test_once_uses_board_counts_and_balance_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            log, report = root / "run.log", root / "result.txt"
+            write_log(log, now - 60, "Current phase")
+            report.write_text("# Delivery notes\nReady for review\n")
+            set_mtime(report, now - 5)
+            runs, done = root / "runs.tsv", root / "done.tsv"
+            active_name = "example-project active " + "long task title " * 5
+            active_name = active_name.strip()
+            runs.write_text(f"{active_name}\t{log}\t{root / 'missing.md'}\t{os.getpid()}\n")
+            done.write_text(f"example-project review\t{log}\t{report}\n")
+            payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
+            output = io.StringIO()
+            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(watch.run_once_summary(runs, done), 0)
+            text = output.getvalue()
+            for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter", active_name):
+                self.assertIn(name, "\n".join(text.splitlines()[:25]))
+            self.assertIn("需處理 0 │ 進行中 1 │ 剛完成(2h) 1 │ 歷史 0 │ 總計 2", text)
+            self.assertIn("已回報", text)
+            self.assertIn("帳戶餘額 $19.58", text)
+            self.assertNotIn("Harness", text)
 
 
 if __name__ == "__main__":

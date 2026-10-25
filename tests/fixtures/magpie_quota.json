@@ -65,6 +65,15 @@
         "resetsAt": "2026-11-16T07:28:11+08:00"
       }
     ],
-    "readAt": "2026-10-25T15:00:54+08:00"
+    "lastServedAt": "2026-10-25T15:00:54+08:00"
+  },
+  {
+    "provider": "openrouter",
+    "name": "OpenRouter",
+    "kind": "balance",
+    "user": "quota-user@example.invalid",
+    "windows": [],
+    "balance": "$19.58",
+    "readAt": "2026-10-25T15:00:56+08:00"
   }
 ]

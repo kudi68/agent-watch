@@ -1,0 +1,40 @@
+ ⚡ AGENT WATCH v8   需處理 0 │ 進行中 1 │ 剛完成(2h) 6 │ 歷史 0 │ 總計 7
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ 額度 Claude 5h 19% 7d 46% │ Codex 5h 11% 7d 2% │ OpenCode Go 5h 4% 7d 14% 月 8% │ OpenRouter $19.58 │ 更新 16:18:09
+ 工作 (1)  架構 (2)  額度 (3)
+╸━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ ● 工作看板
+
+ ▌ example-project  需處理 0 · 進行中 1 · 剛完成 6
+ ▶ example-project active  Agent A · model-x · 已跑 2m  [進行中]
+   Current phase
+ ✓ 16:17 example-project result-0 │ Neutral fixture result
+ ✓ 16:17 example-project result-1 │ Neutral fixture result
+ ✓ 16:17 example-project result-2 │ Neutral fixture result
+   … 另 3 筆  [e] 展開
+ 歷史 0 筆
+
+
+
+
+
+
+
+
+
+
+
+
+ ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  最新 LOG：example-project result-0
+  16:18:08  2026-10-25T08:16:08Z session start
+  16:18:08  Current phase
+
+
+
+
+
+
+ q 離開 (Quit)  1 工作 (1)  2 架構 (2)  3 額度 (3)  e 展開剛完成 (E)  p 切換專案 (P)  n 現在 (N)  f 未來 (F)▏^p palette

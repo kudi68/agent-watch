@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from rich.markup import escape
+from rich.text import Text
 
 # Textual imports (conditional for --once flag speed)
 try:
@@ -102,6 +103,12 @@ PROJECT_OTHER = "other"
 RECENT_DONE_SECONDS = 2 * 60 * 60
 MAGPIE_TIMEOUT_SECONDS = 10
 QUOTA_REFRESH_SECONDS = 60
+QUOTA_PROVIDER_NAMES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "opencode-go": "OpenCode Go",
+    "openrouter": "OpenRouter",
+}
 
 
 def keyword_matches(keyword: str, text: str) -> bool:
@@ -858,17 +865,16 @@ def last_status_from_content(content: str) -> Optional[str]:
 
 def is_pid_alive(pid: int) -> Optional[bool]:
     """None means inspection failed, not that the process has ended."""
+    if pid <= 0:
+        return None
     try:
-        result = subprocess.run(
-            ["pgrep", "-l", "."], capture_output=True, text=True, timeout=2, check=False,
-        )
-        if result.returncode not in (0, 1):
-            return None
-        return any(
-            line.split()[0] == str(pid)
-            for line in result.stdout.splitlines() if line.split()
-        )
-    except (OSError, subprocess.SubprocessError):
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
         return None
 
 
@@ -997,8 +1003,15 @@ def build_agent(
         clean_last_lines = [
             clean_text(l) for l in last_content.splitlines() if clean_text(l) and not is_noise(clean_text(l))
         ]
-        conclusion_lines = [line for line in clean_last_lines if not line.startswith("#")]
-        latest = (conclusion_lines or clean_last_lines or ["任務已回報"])[0]
+        conclusion_lines = [
+            line for line in clean_last_lines
+            if not line.startswith("#") and not re.fullmatch(
+                r"(?:(?:STATUS|狀態|判定)\s*[:：]\s*)?"
+                r"(?:DONE|COMPLETE|COMPLETED|PARTIAL|FAILED|BLOCKED|REPORTED|完成|部分完成|失敗|受阻)",
+                line.replace("**", "").strip(), re.IGNORECASE,
+            )
+        ]
+        latest = (conclusion_lines or ["完成" if status == "complete" else "任務已回報"])[0]
     elif log_lines:
         latest = log_lines[-1].partition("  ")[2] or log_lines[-1]
     else:
@@ -1151,6 +1164,65 @@ def split_recent_done(
     recent.sort(key=sort_key, reverse=True)
     older.sort(key=sort_key, reverse=True)
     return recent, older
+
+
+def task_bucket(agent: AgentInfo, now: Optional[float] = None) -> str:
+    """Partition every task once, allowing ended issues to age into history."""
+    current = time.time() if now is None else now
+    if agent.status == "running":
+        return "running"
+    ended = agent.completion_time
+    if ended is None and is_done_agent(agent):
+        ended = done_timestamp(agent)
+    if ended is not None and current - ended > RECENT_DONE_SECONDS:
+        return "history"
+    if agent.status in {"waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
+        return "attention"
+    if agent.status in {"complete", "reported", "partial"}:
+        if ended is not None and 0 <= current - ended <= RECENT_DONE_SECONDS:
+            return "recent"
+        return "history"
+    return "attention"
+
+
+def count_buckets(agents: List[AgentInfo], now: Optional[float] = None) -> Dict[str, int]:
+    current = time.time() if now is None else now
+    counts = dict(attention=0, running=0, recent=0, history=0, total=len(agents))
+    for agent in agents:
+        counts[task_bucket(agent, current)] += 1
+    return counts
+
+
+def format_bucket_counts(agents: List[AgentInfo], now: float) -> str:
+    counts = count_buckets(agents, now)
+    return (
+        f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
+        f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ 總計 {counts['total']}"
+    )
+
+
+def work_board_groups(agents: List[AgentInfo], now: float) -> Dict[str, List[AgentInfo]]:
+    all_groups = group_agents_by_project(agents)
+    groups = group_agents_by_project([a for a in agents if task_bucket(a, now) != "history"])
+    latest_finish = {
+        project: max(
+            (done_timestamp(a) or 0 for a in tasks if is_done_agent(a)),
+            default=0,
+        )
+        for project, tasks in all_groups.items()
+    }
+    order = {"attention": 0, "running": 1, "recent": 2}
+    for tasks in groups.values():
+        tasks.sort(key=lambda a: (
+            order[task_bucket(a, now)],
+            -(a.start_time or 0) if task_bucket(a, now) == "running" else -(done_timestamp(a) or 0),
+            a.key,
+        ))
+    return dict(sorted(groups.items(), key=lambda item: (
+        min(order[task_bucket(a, now)] for a in item[1]),
+        -latest_finish[item[0]],
+        project_sort_key(item[0]),
+    )))
 
 
 # ==============================================================================
@@ -1379,8 +1451,10 @@ def normalize_magpie_item(value: Any) -> Optional[Dict[str, Any]]:
     return {
         "provider": provider,
         "name": value.get("name") or provider,
+        "kind": value.get("kind"),
+        "balance": value.get("balance"),
         "plan": value.get("plan"),
-        "asOf": value.get("readAt") or value.get("asOf") or value.get("as_of"),
+        "asOf": value.get("readAt"),
         "windows": windows,
     }
 
@@ -1468,27 +1542,33 @@ class QuotaService:
             return [], f"magpie quota 讀取失敗：{e}"
 
     def _read_quota(self) -> Tuple[str, list, str]:
-        """magpie is the live source; a failed read shows no numbers at all."""
+        """Use magpie values or this read's local Codex session fallback."""
         magpie_items, magpie_error = self._read_magpie_quota()
-        if magpie_error:
-            return parse_quota_json([]), [], magpie_error
-
         items = list(magpie_items)
-        errors: List[str] = []
-        # magpie is a live read; a row without readAt still has valid numbers and
-        # gets this fetch's timestamp as its provenance, never an older cached one.
+        errors: List[str] = [magpie_error] if magpie_error else []
         fetched_at = time.time()
         for item in items:
-            if valid_quota_windows(item) and quota_epoch(item.get("asOf")) is None:
-                item["asOf"] = fetched_at
+            item["fetchedAt"] = fetched_at
         providers = {str(item.get("provider") or "").lower() for item in items}
-        if "codex" not in providers:
-            # Older magpie builds may omit codex; the session rate_limits are real data too.
+        codex_has_data = any(
+            str(item.get("provider", "")).lower() == "codex" and quota_item_has_data(item)
+            for item in items
+        )
+        if not codex_has_data:
             codex_item, codex_error = read_codex_quota_item(self.sessions_path)
             if codex_error:
                 errors.append(codex_error)
-            if valid_quota_windows(codex_item):
+            if quota_item_has_data(codex_item):
+                items = [item for item in items if str(item.get("provider", "")).lower() != "codex"]
                 items.insert(0, codex_item)
+                providers.add("codex")
+        for provider in QUOTA_PROVIDER_NAMES:
+            if provider not in providers:
+                items.append({
+                    "provider": provider, "windows": [],
+                    "reason": "magpie 讀取失敗" if magpie_error else "無資料",
+                    "fetchedAt": fetched_at,
+                })
         return parse_quota_json(items), items, "；".join(errors)
 
     def fetch(self, force: bool = False) -> Tuple[str, list]:
@@ -1520,8 +1600,28 @@ def valid_quota_windows(item: Dict[str, Any]) -> List[Tuple[str, float, Dict[str
     return result
 
 
+def quota_item_has_data(item: Dict[str, Any]) -> bool:
+    """A balance or valid windows with known read provenance are usable."""
+    balance = item.get("balance")
+    has_time = any(quota_epoch(item.get(key)) is not None for key in ("asOf", "fetchedAt"))
+    return bool(
+        (isinstance(balance, str) and balance.strip())
+        or (has_time and valid_quota_windows(item))
+    )
+
+
+def quota_data_time(item: Dict[str, Any]) -> str:
+    if quota_epoch(item.get("asOf")) is not None:
+        return format_quota_source_time(item["asOf"])
+    fetched = quota_epoch(item.get("fetchedAt"))
+    if fetched is not None:
+        clock = datetime.fromtimestamp(fetched, ZoneInfo("Asia/Taipei")).strftime("%H:%M:%S")
+        return f"magpie 未提供（本次讀取 {clock}）"
+    return "時間未確認"
+
+
 def parse_quota_json(data: list) -> str:
-    """Format a compact line only when both a value and source time are valid."""
+    """Keep the home summary short; source and reset times live in details."""
     if not isinstance(data, list):
         return "額度：無資料"
     parts = []
@@ -1533,21 +1633,45 @@ def parse_quota_json(data: list) -> str:
         if not provider or provider.lower() in seen:
             continue
         seen.add(provider.lower())
-        source_time = format_quota_source_time(item.get("asOf"))
+        name = QUOTA_PROVIDER_NAMES.get(provider.lower(), provider)
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            parts.append(f"{provider}：無資料")
+        if not quota_item_has_data(item):
+            parts.append(f"{name}：{item.get('reason') or '無資料'}")
             continue
-        abbreviations = {"5 小時": "5h", "7 天": "7d", "month": "month"}
+        abbreviations = {"5 小時": "5h", "7 天": "7d", "month": "月"}
         values = []
-        for label, used, window in windows:
+        for label, used, _ in windows:
             window_name = abbreviations.get(label, label)
-            reset = ""
-            if quota_epoch(window.get("resetsAt") or window.get("resets_at")) is not None:
-                reset = f"（重置 {format_reset_time(window.get('resetsAt') or window.get('resets_at'))}）"
-            values.append(f"{window_name} {int(round(used))}%{reset}")
-        parts.append(f"{provider} {'｜'.join(values)}（資料時間 {source_time}）")
-    return "  ".join(parts) if parts else "額度：無資料"
+            values.append(f"{window_name} {int(round(used))}%")
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            values.append(item["balance"])
+        parts.append(f"{name} {' '.join(values)}")
+    if not parts:
+        return "額度：無資料"
+    updated = max(
+        (quota_epoch(item.get("fetchedAt")) or quota_epoch(item.get("asOf")) or 0
+         for item in data if isinstance(item, dict)), default=0,
+    )
+    clock = datetime.fromtimestamp(updated, ZoneInfo("Asia/Taipei")).strftime("%H:%M:%S") if updated else "未確認"
+    return " │ ".join(parts) + f" │ 更新 {clock}"
+
+
+def render_compact_quota(summary: str, width: int = 80) -> str:
+    """Wrap at provider separators, preserving every service without ellipsis."""
+    lines: List[str] = []
+    current = "額度 "
+    for part in summary.split(" │ "):
+        candidate = current + (" │ " if current != "額度 " else "") + part
+        if display_width(candidate) <= width:
+            current = candidate
+        else:
+            if current.strip() != "額度":
+                lines.append(current)
+            wrapped = wrap_display(part, max(1, width))
+            lines.extend(wrapped[:-1])
+            current = wrapped[-1]
+    lines.append(current)
+    return "\n".join(lines)
 
 
 def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = False) -> str:
@@ -1570,20 +1694,22 @@ def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = Fals
         plan = item.get("plan")
         title = name if not plan else f"{name} ({plan})"
         lines.append(f"[bold #c0caf5]{escape(title)}[/bold #c0caf5]")
-        source_time = format_quota_source_time(item.get("asOf"))
+        source_time = quota_data_time(item)
         lines.append(f"  [#565f89]資料時間：{escape(source_time)}[/#565f89]")
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            lines.append("  [#ff9e3b]無資料[/#ff9e3b]")
+        if not quota_item_has_data(item):
+            lines.append(f"  [#ff9e3b]{escape(str(item.get('reason') or '無資料'))}[/#ff9e3b]")
             rendered = True
             continue
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            lines.append(f"  帳戶餘額 {escape(item['balance'])}")
+            rendered = True
         for label, used, window in windows:
             reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"))
             pct = int(round(used))
             bar = render_quota_bar(used, 8)
             lines.append(
                 f"  {label} {bar} {pct:>3}%  重置 {escape(reset)}"
-                f"  ·  資料時間 {escape(source_time)}"
             )
             rendered = True
 
@@ -1600,16 +1726,18 @@ def render_plain_quota_details(quota_data: list) -> List[str]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("provider") or "未知服務")
-        source_time = format_quota_source_time(item.get("asOf"))
+        source_time = quota_data_time(item)
         windows = valid_quota_windows(item)
-        if quota_epoch(item.get("asOf")) is None or not windows:
-            lines.append(f"  * {name}: 無資料（資料時間 {source_time}）")
+        if not quota_item_has_data(item):
+            lines.append(f"  * {name}: {item.get('reason') or '無資料'}（資料時間：{source_time}）")
             continue
+        if isinstance(item.get("balance"), str) and item["balance"].strip():
+            lines.append(f"  * {name}: 帳戶餘額 {item['balance']}（資料時間：{source_time}）")
         for label, used, window in windows:
             reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"))
             lines.append(
                 f"  * {name} {label}: {int(round(used))}%"
-                f"（重置 {reset}，資料時間 {source_time}）"
+                f"（重置 {reset}，資料時間：{source_time}）"
             )
     return lines or ["  * 無資料"]
 
@@ -2031,6 +2159,71 @@ def format_completion_time(timestamp: Optional[float]) -> str:
     return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Taipei")).strftime("%H:%M")
 
 
+def compact_elapsed(agent: AgentInfo) -> str:
+    if agent.start_time is None or not re.fullmatch(r"\d+:\d{2}:\d{2}", agent.elapsed):
+        return agent.elapsed
+    hours, minutes, seconds = (int(part) for part in agent.elapsed.split(":"))
+    total = hours * 60 + minutes
+    return f"{total}m" if total else f"{seconds}s"
+
+
+def render_board_active(agents: List[AgentInfo], width: int) -> str:
+    lines = []
+    for agent in agents:
+        badge = STATUS_BADGE_MARKUP.get(agent.status, "")
+        available = max(16, width - 4)
+        badge_width = display_width(Text.from_markup(badge).plain) + 1 if badge else 0
+        identity = f"{agent.harness} · {agent.model} · 已跑 {compact_elapsed(agent)}"
+        identity = truncate_display(identity, max(8, available - badge_width - 12))
+        name_width = max(1, available - badge_width - display_width(identity) - 4)
+        name = truncate_display(agent.name, name_width)
+        title = f"▶ {name}  {identity}"
+        lines.append(f"[#7dcfff]{escape(title)}[/] {badge}")
+        detail = agent.stage or agent.latest
+        if detail and detail != UNKNOWN_IDENTITY:
+            lines.append(f"  [#a9b1d6]{escape(truncate_display(detail, max(12, width - 6)))}[/]")
+        if agent.error:
+            lines.append(f"  [#ff9e3b]{escape(truncate_display(agent.error, max(12, width - 6)))}[/]")
+    return "\n".join(lines)
+
+
+def render_board_recent(agents: List[AgentInfo], width: int, expanded: bool = False) -> str:
+    lines = []
+    for agent in agents if expanded else agents[:3]:
+        marker = "⚠" if agent.status == "partial" else "✓"
+        label = " 已回報" if agent.status == "reported" else ""
+        text = f"{marker} {format_completion_time(agent.completion_time)} {agent.name}{label} │ {agent.latest}"
+        lines.append(f"[#e0af68]{escape(truncate_display(text, max(16, width - 4)))}[/]")
+    if not expanded and len(agents) > 3:
+        lines.append(f"[#565f89]  … 另 {len(agents) - 3} 筆  \\[e] 展開[/]")
+    return "\n".join(lines)
+
+
+def render_history_summary(agents: List[AgentInfo], now: float) -> str:
+    history = [a for a in agents if task_bucket(a, now) == "history"]
+    groups = group_agents_by_project(history)
+    counts = "／".join(f"{project_label(project)} {len(tasks)}" for project, tasks in groups.items())
+    return f"歷史 {len(history)} 筆" + (f"（{counts}）" if counts else "")
+
+
+def render_work_board(
+    agents: List[AgentInfo], width: int = 80, now: Optional[float] = None,
+    expand_recent: bool = False,
+) -> str:
+    current = time.time() if now is None else now
+    lines = []
+    for project, tasks in work_board_groups(agents, current).items():
+        lines.append(f"[bold #bb9af7]▌ {escape(project_label(project))}[/]")
+        active = [a for a in tasks if task_bucket(a, current) != "recent"]
+        recent = [a for a in tasks if task_bucket(a, current) == "recent"]
+        if active:
+            lines.append(render_board_active(active, width))
+        if recent:
+            lines.append(render_board_recent(recent, width, expand_recent))
+    lines.append(escape(render_history_summary(agents, current)))
+    return "\n".join(lines)
+
+
 def render_active_flow(active_agents: List[AgentInfo], width: int = 80) -> str:
     """Render active flow as bordered text cards without recreating widgets."""
     if not active_agents:
@@ -2198,95 +2391,22 @@ def run_once_summary(
     if quota_stale:
         quota_text += "（資料過期）"
 
-    status_tags = {
-        "running": "進行中 (藍)",
-        "complete": "完成 (綠)",
-        "waiting": "等待 (橘)",
-        "failed": "失敗 (紅)",
-        "blocked": "受阻 (橘)",
-        "partial": "部分完成 (黃)",
-        "no_report": "已結束、無結果報告 (橘)",
-        "unconfirmed": "結果未確認",
-        "error": "異常 (灰)",
-    }
-
-    counts = {}
-    for a in agents:
-        counts[a.status] = counts.get(a.status, 0) + 1
-
-    print("================================================================================")
+    print("=" * 80)
     print(f" AGENT WATCH v8 (單次摘要)  |  時間: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}")
-    print(f" 額度: {quota_text}")
-    print(
-        f" 統計: 總計 {len(agents)} | 進行中 {counts.get('running', 0)} | "
-        f"完成 {counts.get('complete', 0)} | 卡住 {counts.get('waiting', 0)} | "
-        f"失敗 {counts.get('failed', 0)} | 異常 {counts.get('error', 0)}"
-    )
-    print("================================================================================")
+    print(render_compact_quota(quota_text, 80))
+    print(format_bucket_counts(agents, now))
+    print("【工作看板】")
+    # Plain output has no viewport: retain full task names for search and review.
+    board_width = max([80] + [
+        display_width(a.name) + display_width(a.harness) + display_width(a.model) + 40
+        for a in agents if task_bucket(a, now) != "history"
+    ])
+    print(Text.from_markup(render_work_board(agents, board_width, now)).plain)
 
     if errors:
         print("資料提示:")
         for err in errors:
             print(f"  * {err}")
-        print("--------------------------------------------------------------------------------")
-
-    active_agents = [a for a in agents if is_active_agent(a)]
-    completed_agents = [a for a in agents if is_done_agent(a)]
-    recent_agents, older_agents = split_recent_done(completed_agents, now)
-
-    print("【剛完成 · 最近 2 小時 · 最新在上】")
-    if not recent_agents:
-        print("  (目前沒有剛完成的 agent)")
-    else:
-        recent_groups = group_agents_by_project(recent_agents)
-        ordered_recent = sorted(
-            recent_groups.items(),
-            key=lambda item: max((done_timestamp(agent) or 0.0) for agent in item[1]),
-            reverse=True,
-        )
-        for project_id, project_agents in ordered_recent:
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                tag = status_tags.get(a.status, a.status)
-                print(f"  [●] {a.name} | 狀態: {tag} | 完成: {format_completion_time(a.completion_time)}")
-                print(f"      成果: {a.latest}")
-
-    print("\n【分頁 1：進行中任務流程】")
-    if not active_agents:
-        print("  (目前沒有進行中的 agent)")
-    else:
-        index = 0
-        active_groups = group_agents_by_project(active_agents)
-        for project_id, project_agents in active_groups.items():
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                index += 1
-                tag = status_tags.get(a.status, a.status)
-                print(f"  [{index:02d}] {a.name}")
-                print(
-                    f"       狀態: {tag} | Harness: {a.harness} | 模型: {a.model} | 已跑: {a.elapsed}"
-                )
-                print(f"       目前階段: {a.stage or UNKNOWN_IDENTITY}")
-                print(f"       最新: {a.latest}")
-
-    print("\n【分頁 1：其他已完成任務】")
-    if not older_agents:
-        print("  (目前沒有其他已完成的 agent)")
-    else:
-        index = 0
-        older_groups = group_agents_by_project(older_agents)
-        for project_id, project_agents in older_groups.items():
-            print(f"  ── {project_label(project_id)} ({len(project_agents)}) ──")
-            for a in project_agents:
-                index += 1
-                tag = status_tags.get(a.status, a.status)
-                print(
-                    f"  [✓{index:02d}] {a.name} | 狀態: {tag} | "
-                    f"Harness: {a.harness} | 模型: {a.model} | 已跑: {a.elapsed} | "
-                    f"完成: {format_completion_time(a.completion_time)}"
-                )
-                print(f"        目前階段: {a.stage or UNKNOWN_IDENTITY}")
-                print(f"        成果: {a.latest}")
 
     print("\n【分頁 2：架構狀態】")
     view = ARCHITECTURE_DATA["architectures"]["now"]
@@ -2388,15 +2508,12 @@ TabPane {
 #compact-quota-line {
     background: #16161e;
     color: #7dcfff;
-    border: dashed #3b4261;
     padding: 0 1;
-    height: 3;
+    height: auto;
 }
 
-#active-timers {
+#work-board, .project-section, .active-task-list, .recent-task-list, #history-summary {
     height: auto;
-    margin-top: 1;
-    margin-bottom: 1;
 }
 
 #active-flow-display {
@@ -2472,6 +2589,7 @@ class AgentWatchApp(App):
         ("1", "switch_tab('tab-work')", "工作 (1)"),
         ("2", "switch_tab('tab-arch')", "架構 (2)"),
         ("3", "switch_tab('tab-quota')", "額度 (3)"),
+        ("e", "toggle_recent", "展開剛完成 (E)"),
         ("p", "cycle_project", "切換專案 (P)"),
         ("n", "show_architecture_now", "現在 (N)"),
         ("f", "show_architecture_future", "未來 (F)"),
@@ -2500,24 +2618,23 @@ class AgentWatchApp(App):
         self.architecture_view_id = "now"
         self.architecture_project_id = next(iter(ARCHITECTURE_DATA["projects"]))
         self.current_active_agents: List[AgentInfo] = []
+        self.expand_recent = False
+        self._board_active_widgets: Dict[str, Static] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
             yield Label("⚡ AGENT WATCH v8", id="top-title")
             yield Label("載入中...", id="top-stats")
+        yield Static("額度：載入中...", id="compact-quota-line")
 
         with TabbedContent(initial="tab-work", id="main-tabs"):
             with TabPane("工作 (1)", id="tab-work"):
                 with Vertical(id="work-page"):
                     with VerticalScroll(id="work-scroll"):
-                        yield Label("● 工作狀態", classes="flow-title")
+                        yield Label("● 工作看板", classes="flow-title")
                         yield Static(id="data-errors")
-                        yield Static(id="recent-done-display")
-                        yield Static("⚡ 額度：載入中...", id="compact-quota-line")
-                        yield Static(id="active-timers")
-                        yield Static(id="active-flow-display")
-                        with Collapsible(title="其他已完成／歸檔工作 (0)", id="done-collapsible", collapsed=True):
-                            yield Static(id="done-tasks-display")
+                        yield Vertical(id="work-board")
+                        yield Static(id="history-summary")
                     with Vertical(id="work-log-box"):
                         yield Label("最新 LOG：無", id="bottom-log-title")
                         yield Static("尚無即時日誌", id="bottom-log-content")
@@ -2531,6 +2648,49 @@ class AgentWatchApp(App):
                     yield Static(id="quota-display")
 
         yield Footer()
+
+    def action_toggle_recent(self) -> None:
+        self.expand_recent = not self.expand_recent
+        self.last_snapshot = None
+        self.update_data()
+
+    def on_resize(self) -> None:
+        if self._ui_ready:
+            self.last_snapshot = None
+            self.update_data()
+
+    def update_board(self, agents: List[AgentInfo], now: float, width: int) -> None:
+        board = self.query_one("#work-board", Vertical)
+        board.remove_children()
+        self._board_active_widgets = {}
+        sections = []
+        for project, tasks in work_board_groups(agents, now).items():
+            active = [a for a in tasks if task_bucket(a, now) != "recent"]
+            recent = [a for a in tasks if task_bucket(a, now) == "recent"]
+            counts = count_buckets(tasks, now)
+            title = (
+                f"▌ {project_label(project)}  需處理 {counts['attention']} · "
+                f"進行中 {counts['running']} · 剛完成 {counts['recent']}"
+            )
+            active_widget = Static(render_board_active(active, width), classes="active-task-list")
+            self._board_active_widgets[project] = active_widget
+            sections.append(Vertical(
+                Static(escape(title), classes="flow-title"),
+                active_widget,
+                Static(render_board_recent(recent, width, self.expand_recent), classes="recent-task-list"),
+                classes="project-section",
+            ))
+        if sections:
+            board.mount(*sections)
+        self.query_one("#history-summary", Static).update(escape(render_history_summary(agents, now)))
+
+    def update_board_timers(self, agents: List[AgentInfo], now: float, width: int) -> None:
+        for project, tasks in work_board_groups(agents, now).items():
+            widget = self._board_active_widgets.get(project)
+            if widget is not None:
+                active = [a for a in tasks if task_bucket(a, now) != "recent"]
+                if active:
+                    widget.update(render_board_active(active, width))
 
     def action_switch_tab(self, tab_id: str) -> None:
         """Switch active tab on keys 1/2/3."""
@@ -2599,6 +2759,7 @@ class AgentWatchApp(App):
         quota_stale: bool = False,
         quota_error: str = "",
         errors: Tuple[str, ...] = (),
+        now: Optional[float] = None,
     ) -> tuple:
         """Snapshot displayed data without elapsed counters."""
         agent_snaps = tuple(
@@ -2615,6 +2776,9 @@ class AgentWatchApp(App):
                 a.completion_time,
                 a.is_done_file,
                 a.stage,
+                a.project,
+                a.start_time,
+                task_bucket(a, now),
             )
             for a in agents
         )
@@ -2654,11 +2818,9 @@ class AgentWatchApp(App):
             self.is_first_load = False
 
         self.previous_status = {a.key: a.status for a in agents}
-        active = [a for a in agents if is_active_agent(a)]
+        active = [a for a in agents if task_bucket(a, now) in ("attention", "running")]
         self.current_agents = agents
         self.current_active_agents = active
-        done = [a for a in agents if is_done_agent(a)]
-        recent_done, older_done = split_recent_done(done, now)
         timer_snapshot = tuple((a.key, a.elapsed) for a in active)
         timer_changed = timer_snapshot != self.last_timer_snapshot
         if timer_changed:
@@ -2672,12 +2834,13 @@ class AgentWatchApp(App):
             quota_stale,
             quota_error,
             error_snapshot,
+            now,
         )
         data_changed = current_snapshot != self.last_snapshot
         if not data_changed:
             if timer_changed and self._ui_ready:
                 try:
-                    self.query_one("#active-timers", Static).update(render_elapsed_timers(active))
+                    self.update_board_timers(agents, now, self.size.width)
                 except Exception as e:
                     self.ui_error = f"計時畫面更新失敗：{e}"
             return False
@@ -2685,16 +2848,7 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        # Calculate counts
-        counts = {}
-        for a in agents:
-            counts[a.status] = counts.get(a.status, 0) + 1
-
-        stats_str = (
-            f"執行 {counts.get('running', 0)}  完成 {counts.get('complete', 0)}  "
-            f"等待 {counts.get('waiting', 0)}  異常 "
-            f"{sum(counts.get(s, 0) for s in ('failed', 'blocked', 'partial', 'no_report', 'error'))}"
-        )
+        stats_str = format_bucket_counts(agents, now)
         width = self.size.width if self._ui_ready else 80
 
         if not self._ui_ready:
@@ -2703,23 +2857,12 @@ class AgentWatchApp(App):
         try:
             self.query_one("#top-stats", Label).update(stats_str)
             self.query_one("#compact-quota-line", Static).update(
-                f"⚡ 額度：{escape(truncate_display(quota_summary, max(20, width - 10)))}"
-                + ("  [#ff9e3b]資料過期[/#ff9e3b]" if quota_stale else "")
+                escape(render_compact_quota(quota_summary, max(1, width - 2)))
             )
             self.query_one("#data-errors", Static).update(
                 render_data_errors(list(error_snapshot), agents, width)
             )
-            self.query_one("#active-timers", Static).update(render_elapsed_timers(active))
-            active_markup = render_active_flow(active, width)
-            self.query_one("#active-flow-display", Static).update(active_markup)
-            self.query_one("#recent-done-display", Static).update(
-                render_recent_done_tasks(recent_done, width, now)
-            )
-
-            done_collapsible = self.query_one("#done-collapsible", Collapsible)
-            done_collapsible.title = f"其他已完成／歸檔工作 ({len(older_done)})"
-            done_markup = render_done_tasks(older_done, width)
-            self.query_one("#done-tasks-display", Static).update(done_markup)
+            self.update_board(agents, now, width)
 
             candidates = [a for a in agents if a.log_mtime > 0 and a.log_lines]
             followed = max(candidates, key=lambda a: a.log_mtime) if candidates else None

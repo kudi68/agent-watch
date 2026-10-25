@@ -67,7 +67,15 @@ class StatusRegressions(unittest.TestCase):
     def test_report_conclusion_is_first_line_not_trailing_caveat(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = self.load(Path(tmp), "DONE\n主要成果\n\n歷史失敗但已修正\n")[0]
-            self.assertEqual(a.latest, "DONE")
+            self.assertEqual(a.latest, "主要成果")
+
+    def test_summary_skips_pure_status_lines(self):
+        for marker in ("DONE", "STATUS: DONE", "判定：**DONE**", "# DONE", "PARTIAL"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                a = self.load(Path(tmp), marker + "\n已完成備份打包\n")[0]
+                self.assertEqual(a.latest, "已完成備份打包")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.load(Path(tmp), "DONE\n")[0].latest, "完成")
 
     def test_editing_another_tsv_row_does_not_invalidate_fresh_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,9 +89,119 @@ class StatusRegressions(unittest.TestCase):
             self.assertEqual(watch.load_all_agents(root / "runs.tsv", root / "done.tsv")[0][0].status, "complete")
 
     def test_process_inventory_failure_never_means_dead(self):
-        result = Mock(returncode=3, stdout="", stderr="Cannot get process list")
-        with patch("watch.subprocess.run", return_value=result):
+        with patch("watch.os.kill", side_effect=OSError("inspection unavailable")):
             self.assertIsNone(watch.is_pid_alive(1234))
+
+    def test_parent_pid_is_alive(self):
+        self.assertTrue(watch.is_pid_alive(os.getppid()))
+        with patch("watch.os.kill", side_effect=ProcessLookupError):
+            self.assertFalse(watch.is_pid_alive(1234))
+        with patch("watch.os.kill", side_effect=PermissionError):
+            self.assertTrue(watch.is_pid_alive(1234))
+        self.assertIsNone(watch.is_pid_alive(0))
+
+
+def example_agent(name, status, now, project="example-project", **kwargs):
+    fields = dict(
+        name=name, status=status, log_path=Path("/tmp/example/run.log"),
+        last_path=Path("/tmp/example/LAST.md"), model="model-x", harness="Agent A",
+        start_time=now - 120, elapsed="00:02:00", latest="成果摘要",
+        completion_time=None, project=project, key=name,
+    )
+    fields.update(kwargs)
+    return watch.AgentInfo(**fields)
+
+
+class BoardRegressions(unittest.TestCase):
+    def test_t4_projects_prioritize_attention_running_recent_then_history(self):
+        now = 1_800_000_000
+        agents = [
+            example_agent("old-result", "complete", now, "project-a", completion_time=now - 8000),
+            example_agent("active-build", "running", now, "example-project"),
+            example_agent("recent-result", "reported", now, "project-c", completion_time=now - 10),
+            example_agent("needs-input", "waiting", now, "project-b"),
+        ]
+        text = watch.render_work_board(agents, now=now)
+        self.assertLess(text.index("Project B"), text.index("example-project"))
+        self.assertLess(text.index("example-project"), text.index("Project C"))
+        self.assertNotIn("old-result", text)
+        self.assertIn("歷史 1 筆（project-a 1）", text)
+
+    def test_buckets_cover_statuses_and_expire_old_failures(self):
+        now = 1_800_000_000
+        for status in ("waiting", "blocked", "failed", "no_report", "unconfirmed", "error"):
+            with self.subTest(status=status):
+                a = example_agent("issue", status, now)
+                self.assertEqual(watch.task_bucket(a, now), "attention")
+                a.completion_time = now - 7201
+                self.assertEqual(watch.task_bucket(a, now), "history")
+        for status in ("complete", "reported", "partial"):
+            a = example_agent("result", status, now, completion_time=now - 7200)
+            self.assertEqual(watch.task_bucket(a, now), "recent")
+            self.assertEqual(watch.task_bucket(a, now + 1), "history")
+        a = example_agent("active", "running", now, completion_time=now - 8000)
+        self.assertEqual(watch.task_bucket(a, now), "running")
+
+    def test_t5_recent_limit_and_timing_stay_with_their_cards(self):
+        now = 1_800_000_000
+        agents = [
+            example_agent("result-%d" % i, "partial" if i == 0 else "complete", now,
+                          completion_time=now - i)
+            for i in range(6)
+        ]
+        agents += [
+            example_agent("older-active", "running", now, start_time=now - 180, elapsed="00:03:00"),
+            example_agent("newer-active", "running", now),
+        ]
+        text = watch.render_work_board(agents, now=now)
+        self.assertIn("另 3 筆", text)
+        self.assertIn("⚠", text)
+        self.assertNotIn("result-3", text)
+        self.assertNotIn("Harness", text)
+        self.assertNotIn("▼", text)
+        self.assertLess(text.index("newer-active"), text.index("older-active"))
+        self.assertLess(text.index("older-active"), text.index("result-0"))
+        self.assertIn("Agent A · model-x · 已跑 3m", text)
+        self.assertEqual(sum("result-" in line for line in text.splitlines()), 3)
+        expanded = watch.render_work_board(agents, now=now, expand_recent=True)
+        self.assertEqual(sum("result-" in line for line in expanded.splitlines()), 6)
+
+    def test_t6_counts_partition_64_tasks(self):
+        now = 1_800_000_000
+        agents = [example_agent("active-%d" % i, "running", now) for i in range(3)]
+        agents += [example_agent("recent-%d" % i, ("complete", "reported", "partial")[i % 3],
+                                 now, completion_time=now - i) for i in range(26)]
+        agents += [example_agent("old-%d" % i, ("complete", "failed", "blocked")[i % 3],
+                                 now, completion_time=now - 8000 - i) for i in range(35)]
+        counts = watch.count_buckets(agents, now)
+        self.assertEqual(counts, dict(attention=0, running=3, recent=26, history=35, total=64))
+        self.assertEqual(sum(counts[key] for key in ("attention", "running", "recent", "history")), 64)
+
+    def test_project_ties_use_last_finish_and_long_cards_keep_timer(self):
+        now = 1_800_000_000
+        agents = [
+            example_agent("active-a", "running", now, "project-a", log_mtime=now),
+            example_agent("active-b", "running", now, "project-b", log_mtime=now - 100),
+            example_agent("result-a", "complete", now, "project-a", completion_time=now - 500),
+            example_agent("result-b", "complete", now, "project-b", completion_time=now - 50),
+        ]
+        text = watch.render_work_board(agents, now=now)
+        self.assertLess(text.index("Project B"), text.index("project-a"))
+        long = example_agent("Very long task name " * 5, "running", now)
+        from rich.text import Text
+        lines = Text.from_markup(watch.render_board_active([long], 80)).plain.splitlines()
+        self.assertIn("Agent A · model-x · 已跑 2m", lines[0])
+        self.assertTrue(all(watch.display_width(line) <= 76 for line in lines))
+
+    def test_snapshot_changes_at_two_hour_boundary(self):
+        now = 1_800_000_000
+        agents = [example_agent("edge", "complete", now, completion_time=now - 7200)]
+        app = watch.AgentWatchApp()
+        with patch("watch.time.time", return_value=now):
+            first = app.make_snapshot(agents, "", [])
+        with patch("watch.time.time", return_value=now + 1):
+            later = app.make_snapshot(agents, "", [])
+        self.assertNotEqual(first, later)
 
 
 class QuotaRegressions(unittest.TestCase):
@@ -94,21 +212,47 @@ class QuotaRegressions(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.sessions = Path(self._tmp.name)
 
+    def test_missing_provider_keeps_its_place_in_home_summary(self):
+        service = watch.QuotaService(sessions_path=self.sessions)
+        with patch("watch.subprocess.run", return_value=Mock(
+            returncode=0, stdout='[{"provider":"openrouter","balance":"$0.00"}]',
+        )):
+            summary, raw = service.fetch(force=True)
+        for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter"):
+            self.assertIn(name, summary)
+        self.assertIn("Claude：無資料", summary)
+        self.assertIn("OpenRouter $0.00", summary)
+        self.assertEqual(len(raw), 4)
+
     def test_magpie_fixture_parses_every_provider_window(self):
         payload = self.FIXTURE.read_text(encoding="utf-8")
         service = watch.QuotaService(sessions_path=self.sessions)
         with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
             summary, raw = service.fetch(force=True)
         providers = [item["provider"] for item in raw]
-        self.assertEqual(providers, ["claude", "codex", "opencode-go"])
-        self.assertIn("claude 5h 19%", summary)
+        self.assertEqual(providers, ["claude", "codex", "opencode-go", "openrouter"])
+        self.assertIn("Claude 5h 19%", summary)
         self.assertIn("7d 46%", summary)
-        self.assertIn("codex 5h 11%", summary)
+        self.assertIn("Codex 5h 11%", summary)
         self.assertIn("7d 2%", summary)
-        self.assertIn("opencode-go 5h 4%", summary)
-        self.assertIn("month 8%", summary)
-        self.assertRegex(summary, r"重置 \d{2}:\d{2}|\d{2}/\d{2} \d{2}:\d{2}")
-        self.assertIn("資料時間", summary)
+        self.assertIn("OpenCode Go 5h 4% 7d 14% 月 8%", summary)
+        self.assertIn("OpenRouter $19.58", summary)
+        self.assertNotIn("無資料", summary)
+        self.assertNotIn("重置", summary)
+        self.assertNotIn("資料時間", summary)
+        self.assertEqual(summary.count("更新"), 1)
+        self.assertEqual(raw[-1]["kind"], "balance")
+        self.assertEqual(raw[-1]["balance"], "$19.58")
+        details = watch.render_full_quota_view(raw)
+        self.assertIn("帳戶餘額 $19.58", details)
+        self.assertIn("資料時間：magpie 未提供（本次讀取", details)
+        self.assertIn("帳戶餘額 $19.58", "\n".join(watch.render_plain_quota_details(raw)))
+        wrapped = watch.render_compact_quota(summary, 80)
+        for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter"):
+            self.assertIn(name, wrapped)
+        self.assertNotIn("…", wrapped)
+        self.assertLessEqual(len(wrapped.splitlines()), 3)
+        self.assertTrue(all(watch.display_width(line) <= 80 for line in wrapped.splitlines()))
 
     def test_magpie_partial_row_shows_no_data_only_for_that_provider(self):
         payload = json.dumps([
@@ -120,8 +264,8 @@ class QuotaRegressions(unittest.TestCase):
         service = watch.QuotaService(sessions_path=self.sessions)
         with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
             summary, _ = service.fetch(force=True)
-        self.assertIn("claude 5h 30%", summary)
-        self.assertIn("codex：無資料", summary)
+        self.assertIn("Claude 5h 30%", summary)
+        self.assertIn("Codex：無資料", summary)
 
     def test_magpie_row_without_readat_uses_fetch_time(self):
         payload = json.dumps([{
@@ -136,10 +280,11 @@ class QuotaRegressions(unittest.TestCase):
         service = watch.QuotaService(sessions_path=self.sessions)
         with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
             summary, raw = service.fetch(force=True)
-        self.assertIn("opencode-go 5h 4%", summary)
+        self.assertIn("OpenCode Go 5h 4%", summary)
         self.assertIn("7d 14%", summary)
-        self.assertIn("month 8%", summary)
-        self.assertIsNotNone(watch.quota_epoch(raw[0]["asOf"]))
+        self.assertIn("月 8%", summary)
+        self.assertIsNone(raw[0]["asOf"])
+        self.assertIsNotNone(watch.quota_epoch(raw[0]["fetchedAt"]))
 
     def test_magpie_failure_shows_no_data_without_crashing(self):
         for result in (
@@ -151,16 +296,17 @@ class QuotaRegressions(unittest.TestCase):
                 service = watch.QuotaService(sessions_path=self.sessions)
                 with patch("watch.subprocess.run", return_value=result):
                     summary, raw = service.fetch(force=True)
-                self.assertEqual("額度：無資料", summary)
-                self.assertEqual([], raw)
+                self.assertIn("Claude：magpie 讀取失敗", summary)
+                self.assertIn("OpenRouter：magpie 讀取失敗", summary)
+                self.assertEqual(len(raw), 4)
                 self.assertTrue(service.stale)
 
     def test_magpie_timeout_shows_no_data(self):
         service = watch.QuotaService(sessions_path=self.sessions)
         with patch("watch.subprocess.run", side_effect=watch.subprocess.TimeoutExpired("magpie", 10)):
             summary, raw = service.fetch(force=True)
-        self.assertEqual("額度：無資料", summary)
-        self.assertEqual([], raw)
+        self.assertIn("magpie 讀取失敗", summary)
+        self.assertEqual(len(raw), 4)
         self.assertIn("逾時", service.last_error)
 
     def test_codex_session_limits_used_when_magpie_omits_codex(self):
@@ -184,7 +330,14 @@ class QuotaRegressions(unittest.TestCase):
             codex = [item for item in raw if item["provider"] == "codex"][0]
             self.assertEqual(codex["asOf"], "2026-10-25T06:00:00Z")
             self.assertEqual([window["used"] for window in codex["windows"]], [12.0, 34.0])
-            self.assertIn("codex 5h 12%｜7d 34%", summary)
+            self.assertIn("Codex 5h 12% 7d 34%", summary)
+
+            with patch("watch.subprocess.run", return_value=Mock(returncode=1, stdout="")):
+                summary, raw = service.fetch(force=True)
+            self.assertIn("Codex 5h 12% 7d 34%", summary)
+            self.assertIn("Claude：magpie 讀取失敗", summary)
+            self.assertTrue(service.stale)
+            self.assertIn("12%", watch.render_full_quota_view(raw, stale=True))
 
     def test_magpie_codex_value_replaces_old_cached_numbers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -200,7 +353,7 @@ class QuotaRegressions(unittest.TestCase):
                 "windows": [{"name": "5 hours", "used": 55}]}]))
             with patch("watch.subprocess.run", return_value=magpie):
                 summary, raw = service.fetch(force=True)
-            self.assertIn("codex 5h 55%", summary)
+            self.assertIn("Codex 5h 55%", summary)
             self.assertNotIn("88%", summary)
             self.assertEqual(raw[0]["asOf"], "2026-10-25T06:01:00Z")
 
@@ -228,7 +381,7 @@ class QuotaRegressions(unittest.TestCase):
             with patch("watch.subprocess.run", return_value=Mock(returncode=1, stdout="")):
                 summary, raw = service.fetch(force=True)
             self.assertNotIn("88%", summary)
-            self.assertIn("無資料", summary)
+            self.assertIn("magpie 讀取失敗", summary)
             self.assertNotIn("88%", watch.render_full_quota_view(raw))
 
 
