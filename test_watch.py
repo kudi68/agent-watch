@@ -2155,10 +2155,18 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.history_grouped)
             self.assertEqual(app.history_rows[0], ("project", "example-project"))
             self.assertEqual(app.history_rows[1:4], [("task", a.key) for a in (agents[0], agents[2], agents[3])])
+            # Switching to grouped mode keeps the cursor on the previously selected task,
+            # so select the project header before exercising collapse/expand.
+            table = app.query_one("#history-table", watch.DataTable)
+            table.move_cursor(row=app.history_rows.index(("project", "example-project")))
+            await pilot.pause()
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
             await pilot.press("space")
             self.assertIn("example-project", app.history_collapsed)
             self.assertNotIn(("task", agents[0].key), app.history_rows)
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
             await pilot.press("enter")
+            self.assertNotIn("example-project", app.history_collapsed)
             self.assertIn(("task", agents[0].key), app.history_rows)
             self.assertFalse(app.ui_error)
 
