@@ -1,4 +1,5 @@
 """v8 regressions at TSV, quota and rendered-output boundaries."""
+import asyncio
 import json
 import os
 import subprocess
@@ -7,6 +8,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+from rich.text import Text
 
 import watch
 
@@ -689,9 +692,9 @@ class QuotaRegressions(unittest.TestCase):
             summary, raw = service.fetch(force=True)
         providers = [item["provider"] for item in raw]
         self.assertEqual(providers, ["claude", "codex", "opencode-go", "openrouter"])
-        self.assertIn("Claude 5h 19%", summary)
+        self.assertIn("Claude 5h 50%", summary)
         self.assertIn("7d 46%", summary)
-        self.assertIn("Codex 5h 11%", summary)
+        self.assertIn("Codex 5h 85%", summary)
         self.assertIn("7d 2%", summary)
         self.assertIn("OpenCode Go 5h 4% 7d 14% 月 8%", summary)
         self.assertIn("OpenRouter $19.58", summary)
@@ -703,7 +706,7 @@ class QuotaRegressions(unittest.TestCase):
         self.assertEqual(raw[-1]["balance"], "$19.58")
         details = watch.render_full_quota_view(raw)
         self.assertIn("帳戶餘額 $19.58", details)
-        self.assertIn("資料時間：magpie 未提供（本次讀取", details)
+        self.assertIn("資料時間：2026-10-25 15:00:54", details)
         self.assertIn("帳戶餘額 $19.58", "\n".join(watch.render_plain_quota_details(raw)))
         wrapped = watch.render_compact_quota(summary, 80)
         for name in ("Claude", "Codex", "OpenCode Go", "OpenRouter"):
@@ -822,7 +825,7 @@ class QuotaRegressions(unittest.TestCase):
                 text = watch.render_full_quota_view([{"provider": "claude",
                     "asOf": "2026-10-25T06:00:00Z", "windows": [{"name": "5 hours", "used": value}]}])
                 self.assertIn("無資料", text)
-                self.assertNotIn("%", watch.clean_text(text).split("claude")[-1])
+                self.assertNotIn("▓", text)
         valid = [{"provider": "codex", "asOf": "2026-10-25T06:00:00Z",
                   "windows": [{"name": "5 hours", "used": 12}]}]
         text = watch.render_full_quota_view(valid)
@@ -841,6 +844,182 @@ class QuotaRegressions(unittest.TestCase):
             self.assertNotIn("88%", summary)
             self.assertIn("magpie 讀取失敗", summary)
             self.assertNotIn("88%", watch.render_full_quota_view(raw))
+
+    @staticmethod
+    def plain(markup):
+        return "\n".join(Text.from_markup(line).plain for line in markup.splitlines())
+
+    def fixture_raw(self):
+        payload = self.FIXTURE.read_text(encoding="utf-8")
+        service = watch.QuotaService(sessions_path=self.sessions)
+        with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+            _, raw = service.fetch(force=True)
+        return raw
+
+    def test_fixture_verifies_burn_ahead_critical_colours_and_order(self):
+        now = watch.quota_epoch("2026-10-25T14:30:00+08:00")
+        self.assertIsNotNone(now)
+        markup = watch.render_full_quota_view(self.fixture_raw(), 80, now=now)
+        lines = self.plain(markup).splitlines()
+        positions = [
+            lines.index(name)
+            for name in ("Codex (plus)", "Claude (pro)", "OpenCode Go", "OpenRouter")
+        ]
+        self.assertEqual(positions, sorted(positions))
+        codex_row = markup.splitlines()[positions[0] + 1]
+        claude_row = markup.splitlines()[positions[1] + 1]
+        # Fixture at 14:30: Codex 5h is 85% (critical), Claude 5h is
+        # 50% used vs 25% elapsed (25 points ahead of the clock).
+        self.assertIn("85% 告急", Text.from_markup(codex_row).plain)
+        self.assertIn("#f7768e", codex_row)
+        self.assertIn("50% 燒太快", Text.from_markup(claude_row).plain)
+        self.assertIn("#e0af68", claude_row)
+        self.assertIn("│", Text.from_markup(codex_row).plain)
+        self.assertTrue(all(watch.display_width(line) <= 80 for line in lines))
+
+    def test_pacing_thresholds_are_constants_and_critical_wins(self):
+        self.assertEqual(
+            (watch.QUOTA_BURN_AHEAD_PERCENT, watch.QUOTA_CRITICAL_PERCENT), (15, 85)
+        )
+        self.assertEqual(watch.quota_window_status(45, 30), ("#e0af68", "燒太快"))
+        self.assertEqual(watch.quota_window_status(44.9, 30), ("#9ece6a", ""))
+        self.assertEqual(watch.quota_window_status(85, 0), ("#f7768e", "告急"))
+        self.assertEqual(watch.quota_window_status(84, 0), ("#e0af68", "燒太快"))
+        self.assertEqual(watch.quota_window_status(85, 90), ("#f7768e", "告急"))
+
+    def test_quota_chart_marks_time_progress_inside_the_bar(self):
+        now = watch.quota_epoch("2026-10-25T14:30:00+08:00")
+        self.assertAlmostEqual(
+            watch.quota_time_progress(
+                {"name": "5 hours", "resetsAt": "2026-10-25T18:15:00+08:00"}, now
+            ),
+            25.0,
+        )
+        self.assertAlmostEqual(
+            watch.quota_time_progress(
+                {"name": "7 days", "resetsAt": "2026-11-01T14:11:51+08:00"}, now
+            ),
+            0.18,
+            places=2,
+        )
+        self.assertIsNone(
+            watch.quota_time_progress(
+                {"name": "mystery", "resetsAt": "2026-10-25T18:15:00+08:00"}, now
+            )
+        )
+        chart = Text.from_markup(watch.render_quota_chart(50, 25, 12)).plain
+        self.assertEqual(chart, "▓▓▓│▓▓░░░░░░")
+        self.assertEqual(chart.count("│"), 1)
+
+    def test_unknown_window_length_never_judges_burn_ahead(self):
+        now = watch.quota_epoch("2026-10-25T14:30:00+08:00")
+        item = {
+            "provider": "codex",
+            "asOf": "2026-10-25T14:29:00+08:00",
+            "windows": [{
+                "name": "mystery", "used": 60,
+                "resetsAt": "2026-10-26T14:30:00+08:00",
+            }],
+        }
+        markup = watch.render_full_quota_view([item], 80, now=now)
+        plain = self.plain(markup)
+        self.assertIn("時間進度未知", plain)
+        self.assertNotIn("燒太快", plain)
+        self.assertIn("60%", plain)
+        self.assertNotIn("燒太快", watch.render_home_quota([item], 80, now=now))
+
+    def test_missing_readat_reports_when_this_read_happened(self):
+        fetched = watch.quota_epoch("2026-10-25T15:00:00+08:00")
+        item = {
+            "provider": "opencode-go",
+            "name": "OpenCode Go",
+            "fetchedAt": fetched,
+            "windows": [{
+                "name": "5 hours", "used": 4,
+                "resetsAt": "2026-10-25T16:14:48+08:00",
+            }],
+        }
+        plain = self.plain(watch.render_full_quota_view(
+            [item], 80, now=watch.quota_epoch("2026-10-25T14:30:00+08:00"),
+        ))
+        self.assertIn("資料時間：未提供（本次讀取 15:00:00）", plain)
+        self.assertNotIn("magpie 未提供", plain)
+
+    def test_home_compact_bars_share_pacing_colours_and_fit_80(self):
+        now = watch.quota_epoch("2026-10-25T14:30:00+08:00")
+        raw = self.fixture_raw()
+        markup = watch.render_home_quota(raw, 78, now=now)
+        lines = [Text.from_markup(line).plain for line in markup.splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(watch.display_width(line) <= 78 for line in lines))
+        joined = " ".join(lines)
+        positions = [joined.index(name) for name in ("Codex", "Claude", "OpenCode Go", "OpenRouter")]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("85% 告急", joined)
+        self.assertIn("50% 燒太快", joined)
+        self.assertIn("#f7768e", markup)
+        self.assertIn("#e0af68", markup)
+        self.assertNotIn("…", markup)
+        wide = watch.render_home_quota(raw, 118, now=now)
+        self.assertEqual(len(wide.splitlines()), 1)
+        self.assertIn("OpenRouter $19.58", Text.from_markup(wide).plain)
+
+
+class QuotaSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "magpie_quota.json"
+    NOW = watch.quota_epoch("2026-10-25T14:30:00+08:00")
+
+    @staticmethod
+    def screen_text(app):
+        return "\n".join(strip.text for strip in app.screen._compositor.render_strips())
+
+    async def test_s4_quota_snapshots_keep_four_providers_at_80_and_120(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+            runs.write_text("")
+            done.write_text("")
+            state = root / "state.json"
+            state.write_text('{"version": 1, "tasks": {}, "projects": {}}')
+            payload = self.FIXTURE.read_text(encoding="utf-8")
+            service = watch.QuotaService(sessions_path=root / "sessions")
+            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                summary, raw = service.fetch(force=True)
+            before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+            shots = Path(__file__).parent / "shots" if os.environ.get(
+                "AGENT_WATCH_UPDATE_S4_SHOTS") else root / "shots"
+            shots.mkdir(parents=True, exist_ok=True)
+            for width in (80, 120):
+                app = watch.AgentWatchApp(runs_path=runs, done_path=done, state_path=state)
+                app.quota_svc.cached_summary = summary
+                app.quota_svc.cached_raw = raw
+                app.quota_svc.refresh_in_background = lambda force=False: False
+                app.data_svc.refresh_in_background = lambda: False
+                async with app.run_test(size=(width, 40)) as pilot:
+                    await pilot.press("3")
+                    await pilot.pause()
+                    app.update_data(now=self.NOW)
+                    await pilot.pause()
+                    text = self.screen_text(app)
+                    lines = text.splitlines()
+                    self.assertEqual(len(lines), 40)
+                    self.assertTrue(all(watch.display_width(line) <= width for line in lines))
+                    self.assertFalse(app.ui_error)
+                    for name in ("Codex", "Claude", "OpenCode Go", "OpenRouter"):
+                        self.assertIn(name, text)
+                    self.assertIn("85% 告急", text)
+                    self.assertIn("50% 燒太快", text)
+                    self.assertIn("資料時間：", text)
+                    self.assertNotIn("…", text)
+                    (shots / ("v10-s4-quota-%dx40.txt" % width)).write_text(
+                        "\n".join(line.rstrip() for line in lines) + "\n",
+                        encoding="utf-8",
+                    )
+            self.assertEqual(
+                before,
+                [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)],
+            )
+            print("v10-s4 quota snapshots 80x40/120x40; TSV bytes and mtime_ns UNCHANGED")
 
 
 class ProjectGroupingRegressions(unittest.TestCase):

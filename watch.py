@@ -2,6 +2,7 @@
 """agent-watch v8: Textual dashboard for reliable run status and quota monitoring."""
 
 import argparse
+import calendar
 import copy
 import json
 import math
@@ -145,9 +146,11 @@ RECENT_DONE_SECONDS = 2 * 60 * 60
 FUTURE_SKEW_TOLERANCE_SECONDS = 5 * 60
 MAGPIE_TIMEOUT_SECONDS = 10
 QUOTA_REFRESH_SECONDS = 60
+QUOTA_BURN_AHEAD_PERCENT = 15
+QUOTA_CRITICAL_PERCENT = 85
 QUOTA_PROVIDER_NAMES = {
-    "claude": "Claude",
     "codex": "Codex",
+    "claude": "Claude",
     "opencode-go": "OpenCode Go",
     "openrouter": "OpenRouter",
 }
@@ -1558,7 +1561,7 @@ def get_quota_color(pct: float) -> str:
 
 
 def render_quota_bar(pct: float, width: int = 10) -> str:
-    """Render horizontal bar chart for quota percentage with threshold colors."""
+    """Legacy bar API; v10 views use render_quota_chart with window pacing."""
     clamped = max(0.0, min(100.0, pct))
     filled_len = int(round(clamped / 100.0 * width))
     empty_len = width - filled_len
@@ -1566,6 +1569,73 @@ def render_quota_bar(pct: float, width: int = 10) -> str:
     filled_part = f"[{hex_color}]{'█' * filled_len}[/]" if filled_len > 0 else ""
     empty_part = f"[#414868]{'░' * empty_len}[/]" if empty_len > 0 else ""
     return f"\\[{filled_part}{empty_part}\\]"
+
+
+def quota_time_progress(window: Dict[str, Any], now: Optional[float] = None) -> Optional[float]:
+    """Infer elapsed percentage only when the window duration and reset are known."""
+    reset = quota_epoch(window.get("resetsAt") or window.get("resets_at"))
+    if reset is None:
+        return None
+    minutes = window.get("window_minutes")
+    name = str(window.get("name") or "").strip().casefold()
+    if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and math.isfinite(minutes) and minutes > 0:
+        seconds = minutes * 60
+    elif name in ("5 hours", "5 hour", "5h", "5 小時"):
+        seconds = 5 * 3600
+    elif name in ("7 days", "7 day", "7d", "weekly", "7 天"):
+        seconds = 7 * 86400
+    elif name in ("30 days", "30 day", "30d"):
+        seconds = 30 * 86400
+    elif name in ("month", "monthly", "月"):
+        end = datetime.fromtimestamp(reset, ZoneInfo("Asia/Taipei"))
+        year, month = (end.year - 1, 12) if end.month == 1 else (end.year, end.month - 1)
+        start = end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1]))
+        seconds = reset - start.timestamp()
+    else:
+        return None
+    current = time.time() if now is None else now
+    return max(0.0, min(100.0, 100 * (current - reset + seconds) / seconds))
+
+
+def quota_window_status(used: float, progress: Optional[float]) -> Tuple[str, str]:
+    """Critical usage takes precedence over burning ahead of the clock."""
+    if used >= QUOTA_CRITICAL_PERCENT:
+        return "#f7768e", "告急"
+    if progress is not None and used - progress >= QUOTA_BURN_AHEAD_PERCENT:
+        return "#e0af68", "燒太快"
+    return "#9ece6a", ""
+
+
+def render_quota_chart(used: float, progress: Optional[float], width: int = 12) -> str:
+    width = max(1, width)
+    filled = int(round(used / 100 * width))
+    marker = None if progress is None else int(round(progress / 100 * (width - 1)))
+    color, _ = quota_window_status(used, progress)
+    cells = []
+    for index in range(width):
+        if index == marker:
+            cells.append("[bold #c0caf5]│[/]")
+        elif index < filled:
+            cells.append(f"[{color}]▓[/]")
+        else:
+            cells.append("[#737b91]░[/]")
+    return "".join(cells)
+
+
+def ordered_quota_items(data: list) -> list:
+    """Use canonical provider order without discarding additional accounts."""
+    items = [
+        item for item in data
+        if isinstance(item, dict) and str(item.get("provider") or "").strip()
+    ] if isinstance(data, list) else []
+    if not items:
+        return []
+    ordered = []
+    for provider in QUOTA_PROVIDER_NAMES:
+        matches = [item for item in items if str(item.get("provider", "")).casefold() == provider]
+        ordered.extend(matches or [{"provider": provider, "windows": []}])
+    ordered.extend(item for item in items if str(item.get("provider", "")).casefold() not in QUOTA_PROVIDER_NAMES)
+    return ordered
 
 
 def quota_epoch(value: Any) -> Optional[float]:
@@ -1595,14 +1665,14 @@ def format_quota_source_time(value: Any) -> str:
     )
 
 
-def format_reset_time(value: Any) -> str:
+def format_reset_time(value: Any, now: Optional[float] = None) -> str:
     """Format an ISO or epoch reset time in Taipei time; never infer a missing value."""
     epoch = quota_epoch(value)
     if epoch is None:
         return "未提供"
     reset = datetime.fromtimestamp(epoch, ZoneInfo("Asia/Taipei"))
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if reset.date() == now.date():
+    current = datetime.fromtimestamp(time.time() if now is None else now, ZoneInfo("Asia/Taipei"))
+    if reset.date() == current.date():
         return reset.strftime("%H:%M")
     return reset.strftime("%m/%d %H:%M")
 
@@ -1754,6 +1824,7 @@ def normalize_magpie_item(value: Any) -> Optional[Dict[str, Any]]:
                     "name": str(window.get("name") or "額度窗口"),
                     "used": used,
                     "resetsAt": window.get("resetsAt") or window.get("resets_at"),
+                    "window_minutes": window.get("window_minutes"),
                 }
             )
     return {
@@ -1911,7 +1982,7 @@ def valid_quota_windows(item: Dict[str, Any]) -> List[Tuple[str, float, Dict[str
 def quota_item_has_data(item: Dict[str, Any]) -> bool:
     """A balance or valid windows with known read provenance are usable."""
     balance = item.get("balance")
-    has_time = any(quota_epoch(item.get(key)) is not None for key in ("asOf", "fetchedAt"))
+    has_time = any(quota_epoch(item.get(key)) is not None for key in ("readAt", "asOf", "fetchedAt"))
     return bool(
         (isinstance(balance, str) and balance.strip())
         or (has_time and valid_quota_windows(item))
@@ -1919,12 +1990,13 @@ def quota_item_has_data(item: Dict[str, Any]) -> bool:
 
 
 def quota_data_time(item: Dict[str, Any]) -> str:
-    if quota_epoch(item.get("asOf")) is not None:
-        return format_quota_source_time(item["asOf"])
+    source = item.get("readAt") or item.get("asOf")
+    if quota_epoch(source) is not None:
+        return format_quota_source_time(source)
     fetched = quota_epoch(item.get("fetchedAt"))
     if fetched is not None:
         clock = datetime.fromtimestamp(fetched, ZoneInfo("Asia/Taipei")).strftime("%H:%M:%S")
-        return f"magpie 未提供（本次讀取 {clock}）"
+        return f"未提供（本次讀取 {clock}）"
     return "時間未確認"
 
 
@@ -1934,7 +2006,7 @@ def parse_quota_json(data: list) -> str:
         return "額度：無資料"
     parts = []
     seen = set()
-    for item in data:
+    for item in ordered_quota_items(data):
         if not isinstance(item, dict):
             continue
         provider = str(item.get("provider") or "").strip()
@@ -1982,11 +2054,13 @@ def render_compact_quota(summary: str, width: int = 80) -> str:
     return "\n".join(lines)
 
 
-def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = False) -> str:
+def render_full_quota_view(
+    quota_data: list, width: int = 80, stale: bool = False, now: Optional[float] = None,
+) -> str:
     """Render each quota window on its own short line for narrow terminals."""
     lines = [
         "[bold #7aa2f7]● 服務額度用量[/bold #7aa2f7]",
-        "[#565f89]每 60 秒背景更新；使用率超過 80% 黃色、超過 85% 紅色[/#565f89]",
+        "[#a9b1bd]│ 時間進度；用量領先 ≥15 點黃、用量 ≥85% 紅；每 60 秒更新[/]",
     ]
     if stale:
         lines.append("[bold #ff9e3b]部分來源讀取失敗；只顯示本次取得且有時間的有效數字[/bold #ff9e3b]")
@@ -1995,30 +2069,38 @@ def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = Fals
         return "\n".join(lines)
 
     rendered = False
-    for item in quota_data:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or item.get("provider") or "未知服務")
+    for item in ordered_quota_items(quota_data):
+        provider = str(item.get("provider", "")).casefold()
+        name = QUOTA_PROVIDER_NAMES.get(provider, str(item.get("name") or provider))
         plan = item.get("plan")
         title = name if not plan else f"{name} ({plan})"
         lines.append(f"[bold #c0caf5]{escape(title)}[/bold #c0caf5]")
         source_time = quota_data_time(item)
-        lines.append(f"  [#565f89]資料時間：{escape(source_time)}[/#565f89]")
         windows = valid_quota_windows(item)
         if not quota_item_has_data(item):
+            lines.append(f"  [#a9b1bd]資料時間：{escape(source_time)}[/]")
             lines.append(f"  [#ff9e3b]{escape(str(item.get('reason') or '無資料'))}[/#ff9e3b]")
             rendered = True
             continue
         if isinstance(item.get("balance"), str) and item["balance"].strip():
             lines.append(f"  帳戶餘額 {escape(item['balance'])}")
+            lines.append(f"  [#a9b1bd]資料時間：{escape(source_time)}[/]")
             rendered = True
         for label, used, window in windows:
-            reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"))
-            pct = int(round(used))
-            bar = render_quota_bar(used, 8)
-            lines.append(
-                f"  {label} {bar} {pct:>3}%  重置 {escape(reset)}"
-            )
+            reset = format_reset_time(window.get("resetsAt") or window.get("resets_at"), now)
+            progress = quota_time_progress(window, now)
+            color, tag = quota_window_status(used, progress)
+            if progress is None:
+                tag = (tag + " " if tag else "") + "時間進度未知"
+            short_label = {"5 小時": "5h", "7 天": "7d"}.get(label, label)
+            bar = render_quota_chart(used, progress, max(6, min(20, width - 62)))
+            row = f"  {escape(short_label)} {bar} [{color}]{used:g}% {tag}[/]  重置 {escape(reset)}"
+            stamp = f"資料時間：{escape(source_time)}"
+            if display_width(Text.from_markup(row + "  " + stamp).plain) <= max(1, width - 4):
+                lines.append(row + "  [#a9b1bd]" + stamp + "[/]")
+            else:
+                lines.append(row)
+                lines.append("    [#a9b1bd]" + stamp + "[/]")
             rendered = True
 
     if not rendered:
@@ -2030,7 +2112,7 @@ def render_full_quota_view(quota_data: list, width: int = 80, stale: bool = Fals
 def render_plain_quota_details(quota_data: list) -> List[str]:
     """Render sanitized plain-text quota details for --once."""
     lines = []
-    for item in quota_data if isinstance(quota_data, list) else []:
+    for item in ordered_quota_items(quota_data):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("provider") or "未知服務")
@@ -2770,27 +2852,50 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     return result
 
 
-def render_home_quota(raw: list, width: int, stale: bool = False) -> str:
-    """Compact bars only; the time-progress calculation belongs to stage 4."""
+def render_home_quota(
+    raw: list, width: int, stale: bool = False, now: Optional[float] = None,
+) -> str:
+    """Show the most urgent window per provider, using the full chart's algorithm."""
     parts = []
-    for provider in ("codex", "claude", "opencode-go", "openrouter"):
-        item = next((entry for entry in raw if entry.get("provider") == provider), {})
+    items = ordered_quota_items(raw)
+    for provider in QUOTA_PROVIDER_NAMES:
         name = QUOTA_PROVIDER_NAMES[provider]
-        windows = valid_quota_windows(item)
-        if windows:
-            label, used, _ = windows[0]
-            bar = render_quota_bar(used, 4).replace("\\]", "]")
-            value = f"{bar} {escape(label)} {used:g}%"
-        elif item.get("balance"):
-            value = escape(str(item["balance"]))
+        candidates = []
+        balances = []
+        for item in items:
+            if str(item.get("provider", "")).casefold() != provider:
+                continue
+            if isinstance(item.get("balance"), str) and item["balance"].strip():
+                balances.append(item["balance"])
+            if quota_item_has_data(item):
+                for label, used, window in valid_quota_windows(item):
+                    progress = quota_time_progress(window, now)
+                    color, tag = quota_window_status(used, progress)
+                    severity = 2 if tag == "告急" else 1 if tag else 0
+                    candidates.append((severity, label, used, progress, color, tag))
+        if candidates:
+            _, label, used, progress, color, tag = max(candidates, key=lambda entry: entry[0])
+            label = {"5 小時": "5h", "7 天": "7d"}.get(label, label)
+            bar = render_quota_chart(used, progress, 6)
+            value = f"{escape(label)} {bar} [{color}]{used:g}%{' ' + tag if tag else ''}[/]"
+        elif balances:
+            value = escape(balances[0])
         else:
             value = "[#737b91]無資料[/]"
         parts.append(f"{name} {value}")
+    if stale:
+        parts[0] = "[#f7768e]過期 [/]" + parts[0]
     separator = "   "
-    full = separator.join(parts)
-    if display_width(Text.from_markup(full).plain) > width:
-        full = separator.join(parts[:2]) + "\n" + separator.join(parts[2:])
-    return ("[#f7768e]過期 [/]" if stale else "") + full
+    lines = []
+    current = ""
+    for part in parts:
+        candidate = current + (separator if current else "") + part
+        if current and display_width(Text.from_markup(candidate).plain) > width:
+            lines.append(current)
+            current = part
+        else:
+            current = candidate
+    return "\n".join(lines + [current])
 
 
 def render_work_board(
@@ -4066,6 +4171,17 @@ class AgentWatchApp(App):
         return (agent_snaps, quota_summary, quota_data, quota_stale, quota_error, errors,
                 self.state.revision)
 
+    def update_quota_charts(self, raw: list, stale: bool, now: float) -> None:
+        """Move quota clocks without redrawing unchanged task data."""
+        charts = (
+            render_home_quota(raw, max(1, self.size.width - 2), stale, now),
+            render_full_quota_view(raw, self.size.width, stale, now),
+        )
+        if charts != getattr(self, "_last_quota_charts", None):
+            self.query_one("#compact-quota-line", Static).update(charts[0])
+            self.query_one("#quota-display", Static).update(charts[1])
+            self._last_quota_charts = charts
+
     def update_data(self, now: Optional[float] = None) -> bool:
         """
         Update static content only when its data changes; update elapsed numbers separately.
@@ -4140,6 +4256,8 @@ class AgentWatchApp(App):
         )
         data_changed = current_snapshot != self.last_snapshot
         if not data_changed:
+            if self._ui_ready:
+                self.update_quota_charts(quota_raw, quota_stale, now)
             if timer_changed and self._ui_ready:
                 try:
                     self.update_board_timers(agents, now, self.size.width)
@@ -4165,9 +4283,7 @@ class AgentWatchApp(App):
 
         try:
             self.query_one("#top-stats", Label).update(stats_str)
-            self.query_one("#compact-quota-line", Static).update(
-                render_home_quota(quota_raw, max(1, width - 2), quota_stale)
-            )
+            self.update_quota_charts(quota_raw, quota_stale, now)
             data_errors = self.query_one("#data-errors", Static)
             errors_markup = render_data_errors(list(error_snapshot), agents, width)
             data_errors.update(errors_markup)
@@ -4183,9 +4299,6 @@ class AgentWatchApp(App):
                 self.architecture_project_id,
             )
             self.query_one("#arch-display", Static).update(arch_markup)
-
-            quota_markup = render_full_quota_view(quota_raw, width, quota_stale)
-            self.query_one("#quota-display", Static).update(quota_markup)
 
         except Exception as e:
             self.ui_error = f"畫面更新失敗：{e}"
