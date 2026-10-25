@@ -2170,6 +2170,19 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIn(("task", agents[0].key), app.history_rows)
             self.assertFalse(app.ui_error)
 
+    async def test_grouped_space_on_task_row_collapses_project_and_moves_cursor(self):
+        app, agents = self.history_fixture()
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.press("2", "g")
+            table = app.query_one("#history-table", watch.DataTable)
+            # 切到分組模式會保留原本的任務游標，這次刻意不先移到專案列。
+            self.assertEqual(app.history_rows[table.cursor_row], ("task", agents[0].key))
+            await pilot.press("space")
+            self.assertIn("example-project", app.history_collapsed)
+            self.assertNotIn(("task", agents[0].key), app.history_rows)
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            self.assertFalse(app.ui_error)
+
     async def test_grouped_search_input_filters_and_escape_clear(self):
         app, agents = self.history_fixture()
         async with app.run_test(size=(80, 40)) as pilot:

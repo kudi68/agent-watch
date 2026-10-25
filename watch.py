@@ -3881,13 +3881,24 @@ class AgentWatchApp(App):
             return
         table = self.query_one("#history-table", DataTable)
         if table.cursor_row < len(self.history_rows):
-            kind, project = self.history_rows[table.cursor_row]
-            if kind == "project":
-                if project in self.history_collapsed:
-                    self.history_collapsed.remove(project)
-                else:
-                    self.history_collapsed.add(project)
-                self.update_history()
+            kind, key = self.history_rows[table.cursor_row]
+            if kind == "task":
+                if not self.history_grouped:
+                    return
+                # 分組模式下游標停在任務列時，收合該任務所屬專案並把游標移到專案列。
+                agent = next((a for a in self.current_agents if a.key == key), None)
+                if agent is None:
+                    return
+                project = agent.project
+            else:
+                project = key
+            if project in self.history_collapsed:
+                self.history_collapsed.remove(project)
+            else:
+                self.history_collapsed.add(project)
+            self.update_history()
+            if kind == "task" and ("project", project) in self.history_rows:
+                table.move_cursor(row=self.history_rows.index(("project", project)))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "history-table":
