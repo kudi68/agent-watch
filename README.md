@@ -107,7 +107,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `/` | History: search name, project, tags and result summary |
 | `Tab` | History: focus project / tag / read / hidden filters |
 | `g` | History: switch table / project groups |
-| `Space` / `Enter` | History: collapse / expand selected project group |
+| `Space` / `Enter` | History: collapse / expand selected project group (Space on a task row collapses its project) |
 | `r` | History: bring selected task back to Work |
 | `p` / `n` / `f` | Architecture: cycle project / "now" / "future" view |
 | `?` | Full shortcut table; `Esc` / `?` returns |
@@ -122,6 +122,7 @@ Start the full-screen dashboard in an interactive terminal:
 
 `g` 在表格與依專案分組之間切換。每組內按完成時間由新到舊排序；選中綠色專案列，
 按 Space 或 Enter 收合／展開。分組模式沿用相同搜尋與篩選，收合狀態在本次開啟期間保留。
+在分組模式下，選中任務列按 Space 也會收合它所屬的專案，游標會跳到該專案列。
 選中任務按 `r` 取消隱藏與手動完成，展開所屬專案並回到工作頁。超過兩小時的任務也會
 留在工作頁，直到手動隱藏、歸到已完成或收起專案。
 
