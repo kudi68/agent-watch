@@ -101,6 +101,8 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
 ARCHITECTURE_DATA = load_architecture_data()
 PROJECT_OTHER = "other"
 RECENT_DONE_SECONDS = 2 * 60 * 60
+# Tolerate small clock skew so a just-finished task is not aged into history.
+FUTURE_SKEW_TOLERANCE_SECONDS = 5 * 60
 MAGPIE_TIMEOUT_SECONDS = 10
 QUOTA_REFRESH_SECONDS = 60
 QUOTA_PROVIDER_NAMES = {
@@ -1156,7 +1158,10 @@ def split_recent_done(
     for agent in done_agents:
         timestamp = done_timestamp(agent)
         age = current - timestamp if timestamp is not None else None
-        if age is not None and 0 <= age <= RECENT_DONE_SECONDS:
+        if (
+            age is not None
+            and -FUTURE_SKEW_TOLERANCE_SECONDS <= age <= RECENT_DONE_SECONDS
+        ):
             recent.append(agent)
         else:
             older.append(agent)
@@ -1179,7 +1184,10 @@ def task_bucket(agent: AgentInfo, now: Optional[float] = None) -> str:
     if agent.status in {"waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
         return "attention"
     if agent.status in {"complete", "reported", "partial"}:
-        if ended is not None and 0 <= current - ended <= RECENT_DONE_SECONDS:
+        if (
+            ended is not None
+            and -FUTURE_SKEW_TOLERANCE_SECONDS <= current - ended <= RECENT_DONE_SECONDS
+        ):
             return "recent"
         return "history"
     return "attention"
@@ -1317,7 +1325,7 @@ def quota_window_label(window: Dict[str, Any]) -> str:
     if "7 day" in name or "7d" in name or minutes == 10080:
         return "7 天"
     if "month" in name or "30 day" in name or minutes == 43200:
-        return "month"
+        return "月"
     label = str(window.get("name") or "").strip()
     return label or "額度窗口"
 
@@ -1638,7 +1646,7 @@ def parse_quota_json(data: list) -> str:
         if not quota_item_has_data(item):
             parts.append(f"{name}：{item.get('reason') or '無資料'}")
             continue
-        abbreviations = {"5 小時": "5h", "7 天": "7d", "month": "月"}
+        abbreviations = {"5 小時": "5h", "7 天": "7d"}
         values = []
         for label, used, _ in windows:
             window_name = abbreviations.get(label, label)

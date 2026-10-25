@@ -55,6 +55,7 @@ from watch import (
     render_recent_done_tasks,
     render_quota_bar,
     split_recent_done,
+    task_bucket,
 )
 
 
@@ -66,6 +67,16 @@ def write_log(path: Path, start_time: float, *messages: str) -> None:
 
 def set_mtime(path: Path, timestamp: float) -> None:
     os.utime(path, (timestamp, timestamp))
+
+
+def snapshot_dir(fallback: Path) -> Path:
+    """Write snapshots to a temp dir unless AGENT_WATCH_UPDATE_SHOTS is set."""
+    if os.environ.get("AGENT_WATCH_UPDATE_SHOTS"):
+        target = Path(__file__).parent / "shots"
+    else:
+        target = fallback
+    target.mkdir(parents=True, exist_ok=True)
+    return target
 
 
 def git_output(repo: Path, *args: str) -> str:
@@ -311,6 +322,14 @@ class TestAgentWatch(unittest.TestCase):
         self.assertEqual(parse_quota_json(None), "額度：無資料")
         no_time = [{"provider": "codex", "windows": [{"name": "5 hours", "used": 7}]}]
         self.assertNotIn("7%", parse_quota_json(no_time))
+
+        month = [{
+            "provider": "opencode-go",
+            "asOf": "2026-10-25T06:00:00Z",
+            "windows": [{"name": "month", "used": 30}],
+        }]
+        self.assertIn("OpenCode Go 月 30%", parse_quota_json(month))
+        self.assertIn("月 ", render_full_quota_view(month))
 
     def test_determine_status(self):
         now = 100000.0
@@ -726,6 +745,27 @@ class TestAgentWatch(unittest.TestCase):
         self.assertNotIn("project-d 舊完成", markup)
         self.assertIn("Project D (1)", render_done_tasks(older))
 
+    def test_future_completion_within_clock_skew_stays_recent(self):
+        now = time.time()
+        agent = AgentInfo(
+            name="project-d 時鐘偏差",
+            log_path=Path("/tmp/project-d/run.log"),
+            last_path=Path("/tmp/project-d/LAST.md"),
+            status="complete",
+            model="model-x",
+            start_time=now - 300,
+            elapsed="00:05:00",
+            latest="DONE",
+            harness="Codex",
+            completion_time=now + 60,
+            project="project-d",
+        )
+        self.assertEqual(task_bucket(agent, now), "recent")
+        self.assertEqual(task_bucket(agent, now + 300), "recent")
+        self.assertEqual(
+            task_bucket(agent, now + RECENT_DONE_SECONDS + 120), "history"
+        )
+
     def test_active_work_is_grouped_by_project(self):
         agents = [
             AgentInfo(
@@ -1038,8 +1078,7 @@ class TestAgentWatch(unittest.TestCase):
             )
             set_mtime(active_log, now + 1)
 
-            shots_dir = Path(__file__).parent / "shots"
-            shots_dir.mkdir(exist_ok=True)
+            shots_dir = snapshot_dir(root / "shots")
             captures = (
                 ("work-80x30.svg", (80, 30), "tab-work"),
                 ("work-100x35.svg", (100, 35), "tab-work"),
@@ -1075,6 +1114,8 @@ class TestAgentWatch(unittest.TestCase):
                     svg = app.export_screenshot(title=filename)
                     (shots_dir / filename).write_text(svg, encoding="utf-8")
                     exported[filename] = svg
+                    self.assertGreater(len(svg), 500)
+                    self.assertTrue((shots_dir / filename).is_file())
             temp_root.cleanup()
             return exported
 
@@ -1108,9 +1149,6 @@ class TestAgentWatch(unittest.TestCase):
         self.assertIn("▼", future80_text)
         self.assertIn("服務額度用量", quota_text)
         self.assertIn("2026-10-25 14:00:00", quota_text)
-        for filename, svg in exported.items():
-            self.assertGreater(len(svg), 500)
-            self.assertTrue((Path(__file__).parent / "shots" / filename).is_file())
 
     def test_v8_launcher_and_text_snapshots(self):
         root = Path(__file__).parent
@@ -1364,6 +1402,7 @@ class StageOneScreenTests(unittest.TestCase):
                     rows.append(f"example-project result-{index}\t{log}\t{report}")
                 done.write_text("\n".join(rows) + "\n")
                 payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
+                snapshots = snapshot_dir(root / "shots")
                 for width in (80, 120):
                     app = AgentWatchApp(runs_path=runs, done_path=done)
                     app.quota_svc.sessions_path = root
@@ -1397,7 +1436,7 @@ class StageOneScreenTests(unittest.TestCase):
                         await pilot.pause()
                         self.assertFalse(app.ui_error)
                         snapshot = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
-                        (Path(__file__).parent / "shots" / ("v9-s1-%dx40.txt" % width)).write_text(snapshot)
+                        (snapshots / ("v9-s1-%dx40.txt" % width)).write_text(snapshot)
                         scroll = app.query_one("#work-scroll")
                         scroll.scroll_end(animate=False)
                         await pilot.pause()
