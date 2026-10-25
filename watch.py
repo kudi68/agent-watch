@@ -3076,8 +3076,26 @@ class TaskRow(Static, can_focus=True):
         self.post_message(self.Selected(self.agent.key))
 
 
+# Dashboard-wide actions that must stay inert while the full-screen help table is
+# up. Textual 8.2.8 already drops App bindings behind a modal screen, but the App
+# is the last resort in the binding chain (and priority bindings skip that
+# truncation), so the intent is stated explicitly and tested.
+HELP_BLOCKED_ACTIONS = frozenset({
+    "switch_tab",               # 1-4
+    "toggle_recent",            # e
+    "cycle_project",            # p
+    "show_architecture_now",    # n
+    "show_architecture_future",  # f
+})
+
+
 class HelpScreen(ModalScreen):
-    BINDINGS = [("escape", "dismiss", "返回"), ("question_mark", "dismiss", "返回")]
+    BINDINGS = [
+        ("escape", "dismiss", "返回"),
+        ("question_mark", "dismiss", "返回"),
+        # The table itself advertises `q` as the way out, so keep it live here.
+        ("q", "app.quit", "離開"),
+    ]
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="help-scroll") as panel:
@@ -3226,10 +3244,15 @@ class AgentWatchApp(App):
             running = [a for a in tasks if board_bucket(a, now) == "running"]
             recent = [a for a in tasks if board_bucket(a, now) == "recent"]
             visible = running + (recent if self.expand_recent else recent[:3])
-            visible_groups.append((project, visible, len(recent) - min(3, len(recent))))
+            visible_groups.append(
+                (project, visible, len(recent) - min(3, len(recent)), len(recent))
+            )
         structure = (
             tuple(a.key for a in attention),
-            tuple((project, tuple(a.key for a in tasks), extra) for project, tasks, extra in visible_groups),
+            tuple(
+                (project, tuple(a.key for a in tasks), extra, recent_count)
+                for project, tasks, extra, recent_count in visible_groups
+            ),
             self.expand_recent,
         )
         if structure == self._board_structure:
@@ -3257,7 +3280,7 @@ class AgentWatchApp(App):
             f"需處理 · {len(attention)} · 等回答／卡住／失敗／無報告"
         )
         sections = []
-        for project, tasks, extra in visible_groups:
+        for project, tasks, extra, recent_count in visible_groups:
             children = [row(a) for a in tasks]
             if extra and not self.expand_recent:
                 children.append(Static(
@@ -3265,7 +3288,9 @@ class AgentWatchApp(App):
                 ))
             section = Vertical(*children, classes="project-section")
             running_count = sum(board_bucket(a, now) == "running" for a in tasks)
-            section.border_title = f"{project_label(project)} · 進行中 {running_count} · 剛完成"
+            section.border_title = (
+                f"{project_label(project)} · 進行中 {running_count} · 剛完成 {recent_count}"
+            )
             sections.append(section)
         if sections:
             board.mount(*sections)
@@ -3356,6 +3381,16 @@ class AgentWatchApp(App):
 
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
+        """Keep dashboard shortcuts inert while the shortcut table is open.
+
+        `q` intentionally stays enabled: the table itself advertises it, and
+        leaving the dashboard is not a change to the hidden screen.
+        """
+        if action in HELP_BLOCKED_ACTIONS and isinstance(self.screen, HelpScreen):
+            return False
+        return True
 
     def action_switch_tab(self, tab_id: str) -> None:
         # Hiding a focused pane otherwise moves focus to its next task, whose

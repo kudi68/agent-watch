@@ -1792,6 +1792,9 @@ class V10MainPageTests(unittest.IsolatedAsyncioTestCase):
             agents[1].log_lines = ["long line " * 20, "wrapped line " * 20, "預覽最末行必須可見"]
             app.update_data(now=self.now)
             await pilot.pause()
+            # scroll_end() applies its offset on the following frame, so a single
+            # pause can still show the old scroll position (pre-existing flake).
+            await pilot.pause()
             self.assertIn("預覽最末行必須可見", self.screen_text(app))
             self.assertFalse(app.ui_error)
 
@@ -1813,6 +1816,65 @@ class V10MainPageTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(app.selected_key, "recent-3")
             self.assertIn(app.selected_key, app._row_widgets)
             self.assertFalse(app.ui_error)
+
+    async def test_project_box_title_shows_recent_count_including_zero(self):
+        agents = self.fixture_agents()[5:]
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            titles = {section.border_title for section in app.query(".project-section")}
+            self.assertEqual(titles, {
+                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4",
+                f"{watch.project_label('project-a')} · 進行中 1 · 剛完成 0",
+            })
+            # Collapsing only changes the visible rows; the count stays at the total.
+            self.assertIn("另 1 筆", self.screen_text(app))
+            await pilot.press("e")
+            await pilot.pause()
+            titles = {section.border_title for section in app.query(".project-section")}
+            self.assertIn(
+                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4", titles
+            )
+            self.assertNotIn("另 1 筆", self.screen_text(app))
+            self.assertFalse(app.ui_error)
+
+    async def test_shortcut_table_keeps_dashboard_shortcuts_inert(self):
+        agents = self.fixture_agents()
+        app = self.fixture_app(agents)
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            project, view = app.architecture_project_id, app.architecture_view_id
+            selected = app.selected_key
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen)
+            await pilot.press("e", "p", "n", "f", "1", "2", "3", "4")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen, "Global keys must not close the table")
+            self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, "tab-work")
+            self.assertFalse(app.expand_recent)
+            self.assertEqual(app.architecture_project_id, project)
+            self.assertEqual(app.architecture_view_id, view)
+            self.assertEqual(app.selected_key, selected)
+            # The guard itself must reject the actions, not just rely on Textual
+            # truncating the binding chain at the modal screen.
+            for action in ("toggle_recent", "cycle_project", "show_architecture_now",
+                           "show_architecture_future", "switch_tab('tab-history')"):
+                self.assertFalse(await app.run_action(action), action)
+            self.assertFalse(app.expand_recent)
+            # q stays live: the table itself advertises it as the way out.
+            self.assertTrue(app.check_action("quit", ()))
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            self.assertTrue(app.expand_recent, "Shortcuts work again once the table closes")
+            self.assertFalse(app.ui_error)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.HelpScreen)
+            await pilot.press("q")
+            self.assertFalse(app.is_running, "q must still quit while the table is open")
 
     async def test_help_full_screen_and_fixed_key_bar(self):
         app = self.fixture_app()
