@@ -32,7 +32,10 @@ try:
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.message import Message
     from textual.screen import ModalScreen
-    from textual.widgets import DataTable, Input, Label, Select, Static, TabbedContent, TabPane
+    from textual.widgets import (
+        DataTable, Input, Label, OptionList, Select, Static, TabbedContent, TabPane,
+    )
+    from textual.widgets.option_list import Option
 except ImportError:
     App = object  # type: ignore
 
@@ -148,6 +151,12 @@ MAGPIE_TIMEOUT_SECONDS = 10
 QUOTA_REFRESH_SECONDS = 60
 QUOTA_BURN_AHEAD_PERCENT = 15
 QUOTA_CRITICAL_PERCENT = 85
+# SPEC §3.3: a question left unanswered for 30 minutes turns red and notifies.
+QUESTION_OVERDUE_SECONDS = 30 * 60
+QUESTION_FILENAME = "QUESTION.md"
+ANSWER_FILENAME = "ANSWER.md"
+TERMINAL_TAIL_LINES = 400
+TERMINAL_TAIL_BYTES = 512 * 1024
 QUOTA_PROVIDER_NAMES = {
     "codex": "Codex",
     "claude": "Claude",
@@ -620,6 +629,239 @@ def record_timestamp(data: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def question_key_value(line: str) -> Optional[Tuple[str, str]]:
+    """Parse a `key: value` line from QUESTION.md / ANSWER.md."""
+    match = re.match(r"^([A-Za-z_]+)\s*[:：]\s*(.*)$", line.strip())
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def parse_question(text: str) -> Dict[str, Any]:
+    """Parse SPEC §3.3 QUESTION.md; `error` keeps unreadable files answerless."""
+    question: Dict[str, Any] = dict(
+        id="", asked_at=None, asked_at_text="", question="", options=[],
+        raw=text, error="",
+    )
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].strip().upper().startswith("# QUESTION"):
+        question["error"] = "缺少 # QUESTION 標題"
+        return question
+
+    values: Dict[str, str] = {}
+    options: List[Tuple[str, str]] = []
+    option_error = ""
+    in_options = False
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if in_options:
+            match = re.match(r"^[-*]\s*([^:：\s]+)\s*[:：]\s*(.+?)\s*$", stripped)
+            if match:
+                options.append((match.group(1), match.group(2)))
+                continue
+            if question_key_value(stripped) is None:
+                option_error = option_error or "選項格式錯誤：" + stripped
+                continue
+            in_options = False
+        pair = question_key_value(stripped)
+        if pair is None:
+            continue
+        key, value = pair
+        if key == "options":
+            in_options = True
+            if value:
+                option_error = option_error or "options 必須另起一行列出"
+        else:
+            values[key] = value
+
+    question["id"] = values.get("id", "")
+    question["asked_at_text"] = values.get("asked_at", "")
+    question["question"] = values.get("question", "")
+    question["options"] = options
+    codes = [code for code, _ in options]
+    if not question["id"]:
+        question["error"] = "缺少 id"
+    elif not question["question"]:
+        question["error"] = "缺少 question"
+    elif not options:
+        question["error"] = "缺少 options 或沒有可用選項"
+    elif len(set(codes)) != len(codes):
+        question["error"] = "選項代號重複"
+    elif option_error:
+        question["error"] = option_error
+    if question["asked_at_text"]:
+        question["asked_at"] = parse_timestamp(question["asked_at_text"])
+    return question
+
+
+def parse_answer(text: str) -> Dict[str, Any]:
+    """Parse ANSWER.md; a mismatched id is treated as no answer."""
+    answer: Dict[str, Any] = dict(id="", choice="", note="", answered_at="", error="")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].strip().upper().startswith("# ANSWER"):
+        answer["error"] = "缺少 # ANSWER 標題"
+        return answer
+    for line in lines[1:]:
+        if line.strip().startswith("#"):
+            continue
+        pair = question_key_value(line)
+        if pair is None:
+            continue
+        key, value = pair
+        if key in ("id", "choice", "note", "answered_at"):
+            answer[key] = value
+    if not answer["id"]:
+        answer["error"] = "缺少 id"
+    elif not answer["choice"]:
+        answer["error"] = "缺少 choice"
+    return answer
+
+
+def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
+    """Read QUESTION.md beside the run log; None when the task has no question."""
+    path = Path(directory) / QUESTION_FILENAME
+    try:
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+    question = parse_question(text)
+    question["path"] = str(path)
+    question["mtime"] = info.st_mtime
+    asked = question.get("asked_at")
+    question["asked_at_ts"] = asked if asked is not None else info.st_mtime
+    question["asked_at_estimated"] = asked is None
+    answer_text = ""
+    try:
+        answer_path = path.with_name(ANSWER_FILENAME)
+        if stat.S_ISREG(answer_path.stat().st_mode):
+            answer_text = answer_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        answer_text = ""
+    answer = parse_answer(answer_text) if answer_text.strip() else None
+    question["answer"] = answer
+    question["answered"] = bool(
+        question["id"] and answer is not None and not answer["error"]
+        and answer["id"] == question["id"]
+    )
+    return question
+
+
+def question_is_active(question: Optional[Dict[str, Any]],
+                       completion_time: Optional[float] = None) -> bool:
+    """An unanswered question is attention until a matching ANSWER.md exists."""
+    if not question or question.get("answered"):
+        return False
+    asked = question.get("asked_at_ts") or question.get("mtime") or 0
+    if completion_time is not None and asked <= completion_time:
+        # A leftover question older than the finished run belongs to an older run.
+        return False
+    return True
+
+
+def question_wait_seconds(question: Optional[Dict[str, Any]], now: float) -> int:
+    if not question:
+        return 0
+    asked = question.get("asked_at_ts") or question.get("mtime") or now
+    return max(0, int(now - asked))
+
+
+def format_question_wait(seconds: int) -> str:
+    minutes = max(0, int(seconds)) // 60
+    if minutes < 60:
+        return "已等 %dm" % minutes
+    hours, minutes = divmod(minutes, 60)
+    return "已等 %dh%02dm" % (hours, minutes)
+
+
+def write_answer_file(directory: Path, question: Dict[str, Any], choice: str,
+                      note: str = "", now: Optional[float] = None) -> Tuple[bool, str]:
+    """Write ANSWER.md atomically with the question's id (SPEC §3.3)."""
+    if question.get("error"):
+        return False, "問題格式錯誤，不能回答"
+    codes = [code for code, _ in question.get("options", [])]
+    if not choice or choice not in codes:
+        return False, "選項不存在"
+    if not question.get("id"):
+        return False, "問題缺少 id，不能回答"
+    stamp = datetime.fromtimestamp(now if now is not None else time.time()).astimezone()
+    clean_note = " ".join(str(note or "").splitlines()).strip()
+    content = (
+        "# ANSWER\n"
+        "id: %s\n"
+        "answered_at: %s\n"
+        "choice: %s\n"
+        "note: %s\n"
+    ) % (question["id"], stamp.isoformat(timespec="seconds"), choice, clean_note)
+    target = Path(directory) / ANSWER_FILENAME
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(Path(directory)),
+            prefix="." + ANSWER_FILENAME + "-", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError as exc:
+        return False, "ANSWER.md 寫入失敗：" + str(exc)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    return True, str(target)
+
+
+def read_log_tail(path: Path, limit: int = TERMINAL_TAIL_LINES) -> List[str]:
+    """Read only the log tail, like `tail -n`, without scanning the whole file."""
+    if str(path) == "/dev/null":
+        return []
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            block = min(size, TERMINAL_TAIL_BYTES)
+            stream.seek(size - block)
+            data = stream.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    return text.splitlines()[-limit:]
+
+
+def humanize_log_line(line: str) -> str:
+    """Turn one tail line into plain language; JSON events never show raw keys."""
+    cleaned = clean_text(line)
+    if not cleaned or is_noise(cleaned):
+        return ""
+    stripped = cleaned.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            return " ".join(summarize_jsonl_step(data).splitlines()).strip()
+    return " ".join(cleaned.splitlines()).strip()
+
+
+def humanize_log_lines(lines: List[str]) -> List[str]:
+    result = []
+    for line in lines:
+        summary = humanize_log_line(line)
+        if summary:
+            result.append(summary)
+    return result
+
+
 @dataclass
 class AgentInfo:
     name: str
@@ -643,6 +885,7 @@ class AgentInfo:
     project: str = PROJECT_OTHER
     start_source: str = ""
     elapsed_estimated: bool = False
+    question: Optional[Dict[str, Any]] = None
 
 
 # Sentinel so an injected reader and the built-in `ps` reader stay distinct:
@@ -1272,6 +1515,11 @@ def build_agent(
             completion_time = event_status[0]
     if completion_time is not None and elapsed_start is not None and elapsed_start > completion_time:
         elapsed_start = None
+    question = None if is_null_log else read_task_question(log_path.parent)
+    if question is not None and question_is_active(question, completion_time):
+        # SPEC §3.3: an unanswered question is a needs-attention task even while
+        # its PID is alive, so it must leave the running bucket.
+        status = "question"
     elapsed = format_elapsed(elapsed_start, completion_time if completion_time is not None else now)
     estimated = start_source == "log" and elapsed_start is not None
     if estimated:
@@ -1322,6 +1570,7 @@ def build_agent(
         project=resolved_project,
         start_source=start_source,
         elapsed_estimated=estimated,
+        question=question,
     )
 
 
@@ -1539,37 +1788,6 @@ def work_board_groups(agents: List[AgentInfo], now: float) -> Dict[str, List[Age
 # ==============================================================================
 # Quota Logic & Magpie Fetching
 # ==============================================================================
-
-def get_quota_color_and_tag(pct: float) -> Tuple[str, str]:
-    """
-    Returns (color_name, hex_code) based on quota usage:
-    - Over 85%: Red (#f7768e)
-    - Over 80%: Yellow (#e0af68)
-    - <= 80%: Green (#9ece6a)
-    """
-    if pct > 85:
-        return "red", "#f7768e"
-    elif pct > 80:
-        return "yellow", "#e0af68"
-    else:
-        return "green", "#9ece6a"
-
-
-def get_quota_color(pct: float) -> str:
-    """Return color name ('red', 'yellow', 'green') for percentage."""
-    return get_quota_color_and_tag(pct)[0]
-
-
-def render_quota_bar(pct: float, width: int = 10) -> str:
-    """Legacy bar API; v10 views use render_quota_chart with window pacing."""
-    clamped = max(0.0, min(100.0, pct))
-    filled_len = int(round(clamped / 100.0 * width))
-    empty_len = width - filled_len
-    _, hex_color = get_quota_color_and_tag(clamped)
-    filled_part = f"[{hex_color}]{'█' * filled_len}[/]" if filled_len > 0 else ""
-    empty_part = f"[#414868]{'░' * empty_len}[/]" if empty_len > 0 else ""
-    return f"\\[{filled_part}{empty_part}\\]"
-
 
 def quota_time_progress(window: Dict[str, Any], now: Optional[float] = None) -> Optional[float]:
     """Infer elapsed percentage only when the window duration and reset are known."""
@@ -2848,7 +3066,21 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     result.append(elapsed + " " * (elapsed_width - display_width(elapsed)), style="bold " + color)
     result.append(" │ " + status + " " * max(0, status_width - display_width(status)))
     detail = agent.stage or agent.latest or "尚無進度"
-    result.append("\n" + truncate_display("  " + detail, width), style="#a9b1bd")
+    wait_text = ""
+    if agent.question:
+        if agent.question.get("error"):
+            detail = "問題格式錯誤：" + agent.question["error"]
+        else:
+            detail = agent.question.get("question") or detail
+        if agent.status == "question" and not agent.question.get("answered"):
+            wait_text = "  " + format_question_wait(
+                question_wait_seconds(agent.question, now)
+            )
+    detail_width = max(1, width - display_width(wait_text))
+    result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
+    if wait_text:
+        overdue = question_wait_seconds(agent.question, now) >= QUESTION_OVERDUE_SECONDS
+        result.append(wait_text, style="bold #f7768e" if overdue else "bold #e0af68")
     return result
 
 
@@ -3063,6 +3295,32 @@ def notify_completion(agent: AgentInfo):
     try:
         subprocess.Popen(
             ["afplay", f"/System/Library/Sounds/{'Glass' if agent.status == 'complete' else 'Basso' if agent.status == 'failed' else 'Ping'}.aiff"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        pass
+
+
+def notify_question_overdue(agent: AgentInfo):
+    """Notify once when a QUESTION.md has waited past the 30-minute limit."""
+    question = agent.question or {}
+    label = question.get("id") or "問題"
+    message = "%s 的 %s 已等超過 30 分鐘" % (agent.name, label)
+    script = 'display notification "%s" with title "Agent Watch · 等回答"' % message.replace('"', '\\"')
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError:
+        pass
+    try:
+        subprocess.Popen(
+            ["afplay", "/System/Library/Sounds/Basso.aiff"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
@@ -3315,6 +3573,76 @@ HelpScreen {
 #help-content {
     height: auto;
 }
+TerminalScreen {
+    background: #101216;
+}
+#terminal-panel {
+    height: 1fr;
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+    background: #101216;
+    padding: 0 1;
+}
+#terminal-title {
+    height: 1;
+    color: #9ece6a;
+    text-style: bold;
+}
+#terminal-scroll {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
+#terminal-content {
+    height: auto;
+    color: #c4c9d4;
+}
+#terminal-search {
+    height: 3;
+    display: none;
+}
+#terminal-hint {
+    height: 1;
+    color: #737b91;
+}
+QuestionScreen {
+    align: center middle;
+    background: #101216;
+}
+#question-panel {
+    width: 90%;
+    height: auto;
+    max-height: 90%;
+    border: solid #f7768e;
+    border-title-color: #f7768e;
+    background: #101216;
+    padding: 0 1;
+}
+#question-agent {
+    height: 1;
+    color: #f7768e;
+    text-style: bold;
+}
+#question-text, #question-error, #question-raw {
+    height: auto;
+    margin-bottom: 1;
+}
+#question-error {
+    color: #f7768e;
+}
+#question-raw {
+    color: #a9b1bd;
+}
+#question-options {
+    height: auto;
+    max-height: 8;
+}
+#question-note {
+    height: 3;
+}
+#question-hint {
+    height: 1;
+    color: #737b91;
+}
 """
 
 
@@ -3426,7 +3754,7 @@ HELP_BLOCKED_ACTIONS = frozenset({
     "show_architecture_future",  # f
     "hide_task", "finish_task", "collapse_project", "toggle_pin", "toggle_read",
     "edit_tags", "restore_task", "toggle_history_mode", "toggle_history_group",
-    "search_history", "next_task", "previous_task",
+    "search_history", "next_task", "previous_task", "open_task",
 })
 
 
@@ -3469,6 +3797,8 @@ class HelpScreen(ModalScreen):
                 "  k / ↑        上一筆任務\n"
                 "  Tab / Shift+Tab  移動焦點\n"
                 "  滑鼠點選      選中任務並預覽\n"
+                "  Enter        深入畫面：全螢幕唯讀終端機（Esc 返回）\n"
+                "               有 QUESTION.md 時開選項彈窗\n"
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
@@ -3494,6 +3824,202 @@ class HelpScreen(ModalScreen):
             )
 
 
+class TerminalScreen(ModalScreen):
+    """Full-screen read-only tail of a run log; Esc returns without touching the run."""
+
+    BINDINGS = [
+        ("escape", "back", "返回"),
+        ("slash", "focus_search", "搜尋"),
+        ("j", "scroll_down", "下一行"),
+        ("k", "scroll_up", "上一行"),
+        ("home", "scroll_home", "頂端"),
+        ("end", "scroll_end", "末端"),
+    ]
+
+    def __init__(self, agent: AgentInfo):
+        super().__init__()
+        self.agent = agent
+        self.query_text = ""
+        self._last_markup = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="terminal-panel") as panel:
+            panel.border_title = "深入畫面 · Esc 返回"
+            yield Static(self.title_text(), id="terminal-title", markup=False)
+            with VerticalScroll(id="terminal-scroll"):
+                yield Static("讀取 run.log…", id="terminal-content", markup=False)
+            yield Input(placeholder="搜尋日誌；Enter 套用，Esc 清除", id="terminal-search")
+            yield Static(
+                "j/k ↑↓ 捲動 · PgUp/PgDn 翻頁 · / 搜尋 · Esc 返回（唯讀，不會影響任務）",
+                id="terminal-hint",
+            )
+
+    def title_text(self) -> str:
+        name = "無 log" if str(self.agent.log_path) == "/dev/null" else Path(self.agent.log_path).name
+        return "%s · %s %s · %s（唯讀）" % (
+            self.agent.name, self.agent.harness, self.agent.model, name,
+        )
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+        self.query_one("#terminal-scroll", VerticalScroll).focus()
+        self.set_interval(1.0, self.refresh_content)
+
+    def refresh_content(self) -> None:
+        scroll = self.query_one("#terminal-scroll", VerticalScroll)
+        at_bottom = scroll.scroll_offset.y >= max(0, scroll.max_scroll_y - 1)
+        lines = humanize_log_lines(read_log_tail(Path(self.agent.log_path)))
+        content = self.query_one("#terminal-content", Static)
+        if lines:
+            text = render_terminal_text(lines, self.query_text)
+        else:
+            text = Text("（沒有可讀的日誌內容）", style="#737b91")
+        markup = text.plain + "|" + self.query_text
+        if markup == self._last_markup:
+            return
+        self._last_markup = markup
+        content.update(text)
+        if at_bottom:
+            self.call_after_refresh(scroll.scroll_end, animate=False)
+
+    def action_focus_search(self) -> None:
+        search = self.query_one("#terminal-search", Input)
+        search.display = True
+        search.focus()
+
+    def action_back(self) -> None:
+        search = self.query_one("#terminal-search", Input)
+        if search.display or self.query_text:
+            search.value = ""
+            search.display = False
+            self.query_text = ""
+            self._last_markup = None
+            self.refresh_content()
+            self.query_one("#terminal-scroll", VerticalScroll).focus()
+            return
+        self.dismiss()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "terminal-search":
+            self.query_text = event.value.strip()
+            self._last_markup = None
+            self.refresh_content()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "terminal-search":
+            event.input.display = False
+            self.query_text = event.value.strip()
+            self._last_markup = None
+            self.refresh_content()
+            self.query_one("#terminal-scroll", VerticalScroll).focus()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_down(animate=False)
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_up(animate=False)
+
+    def action_scroll_home(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_home(animate=False)
+
+    def action_scroll_end(self) -> None:
+        self.query_one("#terminal-scroll", VerticalScroll).scroll_end(animate=False)
+
+
+class QuestionScreen(ModalScreen):
+    """SPEC §3.3 options popup; malformed questions only show their raw text."""
+
+    BINDINGS = [("escape", "dismiss(None)", "取消")]
+
+    def __init__(self, agent: AgentInfo, question: Dict[str, Any]):
+        super().__init__()
+        self.agent = agent
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        question = self.question
+        with Vertical(id="question-panel") as panel:
+            panel.border_title = "等回答 · %s" % self.agent.name
+            wait = format_question_wait(question_wait_seconds(question, time.time()))
+            yield Static(
+                "%s · %s%s" % (
+                    self.agent.name, wait,
+                    " · 已等超過 30 分鐘" if question_wait_seconds(
+                        question, time.time()) >= QUESTION_OVERDUE_SECONDS else "",
+                ),
+                id="question-agent", markup=False,
+            )
+            if question.get("error"):
+                yield Static(
+                    "問題格式錯誤：%s（只顯示原文，不能選）" % question["error"],
+                    id="question-error", markup=False,
+                )
+                yield Static(question.get("raw", ""), id="question-raw", markup=False)
+            else:
+                yield Static(question.get("question", ""), id="question-text", markup=False)
+                yield OptionList(
+                    *[Option("%s  %s" % (code, label), id=code)
+                      for code, label in question.get("options", [])],
+                    id="question-options",
+                )
+                yield Input(
+                    placeholder="可留一行備註（Tab 到這裡，Enter 送出）",
+                    id="question-note",
+                )
+            yield Static(
+                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · Esc 取消",
+                id="question-hint",
+            )
+
+    def on_mount(self) -> None:
+        options = self.query("#question-options")
+        if options:
+            options.first().focus()
+    def _dismiss_with(self, choice: str, note: str = "") -> None:
+        self.dismiss(dict(choice=choice, note=note))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self._dismiss_with(str(event.option.id or ""))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "question-note":
+            return
+        event.stop()
+        options = self.query("#question-options")
+        codes = [code for code, _ in self.question.get("options", [])]
+        if not options or not codes:
+            return
+        index = options.first().highlighted
+        choice = codes[index if index is not None else 0]
+        self._dismiss_with(choice, event.value)
+
+
+def render_terminal_text(lines: List[str], query: str = "") -> Text:
+    """Render humanized tail lines; a search query is highlighted per line."""
+    text = Text()
+    query_folded = query.casefold()
+    for index, line in enumerate(lines):
+        if index:
+            text.append("\n")
+        if not query_folded:
+            text.append(line, style="#c4c9d4")
+            continue
+        folded = line.casefold()
+        start = 0
+        position = folded.find(query_folded, start)
+        if position < 0:
+            text.append(line, style="#c4c9d4")
+            continue
+        while position >= 0:
+            text.append(line[start:position], style="#c4c9d4")
+            text.append(line[position:position + len(query)], style="bold #e0af68")
+            start = position + len(query)
+            position = folded.find(query_folded, start)
+        text.append(line[start:], style="#c4c9d4")
+    return text
+
+
 class AgentWatchApp(App):
     """Textual terminal dashboard for monitoring agents with tabs and flicker-free updates."""
 
@@ -3508,6 +4034,7 @@ class AgentWatchApp(App):
         ("down", "next_task", "下一筆"),
         ("k", "previous_task", "上一筆"),
         ("up", "previous_task", "上一筆"),
+        ("enter", "open_task", "深入畫面"),
         ("question_mark", "show_help", "快捷鍵"),
         ("e", "toggle_recent", "展開剛完成 (E)"),
         ("p", "cycle_project", "切換專案 (P)"),
@@ -3541,6 +4068,7 @@ class AgentWatchApp(App):
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.notified_keys: Set[str] = set()
+        self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
         self.is_first_load = True
         self.last_snapshot: Any = None
@@ -3621,7 +4149,7 @@ class AgentWatchApp(App):
                 with VerticalScroll(id="arch-scroll"):
                     yield Static(id="arch-display")
 
-        yield Static("1–4 分頁 │ j/k ↑↓ 選取 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
+        yield Static("1–4 分頁 │ j/k ↑↓ 選取 │ Enter 深入 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
 
     def action_toggle_recent(self) -> None:
         self.expand_recent = not self.expand_recent
@@ -4038,6 +4566,50 @@ class AgentWatchApp(App):
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    def action_open_task(self) -> None:
+        """SPEC §2.4: Enter opens the deep view, or the question popup."""
+        agent = self.selected_task()
+        if agent is None:
+            if self.query_one("#main-tabs", TabbedContent).active == "tab-work":
+                self.show_state_message("請先選擇一筆任務")
+            return
+        if agent.status == "question" and agent.question:
+            self.push_screen(
+                QuestionScreen(agent, agent.question),
+                lambda result: self.answer_question(agent, result),
+            )
+            return
+        self.open_terminal(agent)
+
+    def open_terminal(self, agent: AgentInfo) -> None:
+        if not self.state.task(agent.key).get("read"):
+            self.state.update_task(agent.key, read=True, run_start=agent.start_time)
+            if agent.key in self._row_widgets:
+                self._row_widgets[agent.key].refresh()
+            self.show_state_message(self.state.warning)
+        self.push_screen(TerminalScreen(agent))
+
+    def question_notice_token(self, agent: AgentInfo) -> str:
+        question = agent.question or {}
+        return "question::%s::%s::%s" % (
+            agent.key, question.get("id") or "", int(question.get("asked_at_ts") or 0),
+        )
+
+    def answer_question(self, agent: AgentInfo, result: Optional[Dict[str, Any]]) -> None:
+        if not result:
+            return
+        ok, message = write_answer_file(
+            agent.log_path.parent, agent.question or {}, result.get("choice", ""),
+            result.get("note", ""), now=time.time(),
+        )
+        if ok:
+            self.state.update_task(agent.key, read=True, run_start=agent.start_time)
+            self.show_state_message("已寫入 ANSWER.md：" + result.get("choice", ""))
+            self.last_snapshot = None
+            self.update_data()
+        else:
+            self.show_state_message(message)
+
     def check_action(self, action: str, parameters: tuple) -> Optional[bool]:
         """Keep dashboard shortcuts inert while the shortcut table is open.
 
@@ -4061,7 +4633,7 @@ class AgentWatchApp(App):
         if tab_id == "tab-work":
             self.call_after_refresh(self.restore_selection, True)
             self.query_one("#key-bar", Static).update(
-                "h 隱藏 d 完成 c 收專案 i 釘 t 標籤 u 已讀 │ e 展開 │ 1–4 ? q"
+                "Enter 深入 h 隱藏 d 完成 c 收專案 i 釘 t 標籤 u 已讀 │ e 展開 │ 1–4 ? q"
             )
         elif tab_id == "tab-history":
             self.update_history()
@@ -4218,7 +4790,8 @@ class AgentWatchApp(App):
             self.show_state_message(self.state.warning)
 
         # Handle completion notifications
-        if not self.is_first_load:
+        first_load = self.is_first_load
+        if not first_load:
             for a in agents:
                 prev = self.previous_status.get(a.key)
                 notice_key = f"{a.key}::{a.start_time}::{a.status}"
@@ -4234,6 +4807,21 @@ class AgentWatchApp(App):
                 if a.status == "complete":
                     self.notified_keys.add(a.key)
             self.is_first_load = False
+
+        overdue_questions: Dict[str, AgentInfo] = {}
+        for a in agents:
+            if a.status != "question" or not a.question:
+                continue
+            if question_wait_seconds(a.question, now) < QUESTION_OVERDUE_SECONDS:
+                continue
+            overdue_questions[self.question_notice_token(a)] = a
+        if first_load:
+            self.notified_questions.update(overdue_questions)
+        else:
+            for token, a in overdue_questions.items():
+                if token not in self.notified_questions:
+                    notify_question_overdue(a)
+                    self.notified_questions.add(token)
 
         self.previous_status = {a.key: a.status for a in agents}
         active = [a for a in agents if board_bucket(a, now) in ("attention", "running")]

@@ -33,8 +33,6 @@ from watch import (
     extract_model_from_line,
     format_completion_time,
     format_elapsed,
-    get_quota_color,
-    get_quota_color_and_tag,
     get_worker_status,
     infer_project,
     is_node_active,
@@ -54,7 +52,6 @@ from watch import (
     render_done_tasks,
     render_full_quota_view,
     render_recent_done_tasks,
-    render_quota_bar,
     split_recent_done,
     task_bucket,
 )
@@ -1366,41 +1363,16 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 self.assertIn("┌", rendered)
                 self.assertIn("▼", rendered)
 
-    def test_quota_thresholds(self):
-        """Verify quota color thresholds: <= 80% Green, > 80% Yellow, > 85% Red."""
-        # Standard green (<= 80%)
-        self.assertEqual(get_quota_color(0.0), "green")
-        self.assertEqual(get_quota_color(50.0), "green")
-        self.assertEqual(get_quota_color(80.0), "green")
-        color, hex_code = get_quota_color_and_tag(80.0)
-        self.assertEqual(color, "green")
-        self.assertEqual(hex_code, "#9ece6a")
-
-        # Yellow (> 80% and <= 85%)
-        self.assertEqual(get_quota_color(80.1), "yellow")
-        self.assertEqual(get_quota_color(82.0), "yellow")
-        self.assertEqual(get_quota_color(85.0), "yellow")
-        color, hex_code = get_quota_color_and_tag(85.0)
-        self.assertEqual(color, "yellow")
-        self.assertEqual(hex_code, "#e0af68")
-
-        # Red (> 85%)
-        self.assertEqual(get_quota_color(85.1), "red")
-        self.assertEqual(get_quota_color(90.0), "red")
-        self.assertEqual(get_quota_color(100.0), "red")
-        color, hex_code = get_quota_color_and_tag(90.0)
-        self.assertEqual(color, "red")
-        self.assertEqual(hex_code, "#f7768e")
-
-        # Bar chart contains threshold colors
-        bar_green = render_quota_bar(50.0, 10)
-        self.assertIn("#9ece6a", bar_green)
-
-        bar_yellow = render_quota_bar(82.0, 10)
-        self.assertIn("#e0af68", bar_yellow)
-
-        bar_red = render_quota_bar(89.0, 10)
-        self.assertIn("#f7768e", bar_red)
+    def test_quota_uses_one_threshold_source(self):
+        """The legacy >80/>85 helpers are gone; quota_window_status is the only rule."""
+        for name in ("get_quota_color_and_tag", "get_quota_color", "render_quota_bar"):
+            self.assertFalse(hasattr(watch, name), name + " must not come back")
+        self.assertEqual(watch.quota_window_status(84.9, None), ("#9ece6a", ""))
+        self.assertEqual(watch.quota_window_status(85.0, 10), ("#f7768e", "告急"))
+        self.assertEqual(watch.quota_window_status(50.0, 20), ("#e0af68", "燒太快"))
+        chart = watch.render_quota_chart(90.0, 50.0, 10)
+        self.assertIn("#f7768e", chart)
+        self.assertNotIn("#e0af68", chart)
 
 
 class StageOneScreenTests(IsolatedState, unittest.TestCase):
@@ -2315,6 +2287,363 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
                             )
             self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
             print("v10-s3 fixture state isolated; TSV bytes and mtime_ns UNCHANGED")
+
+
+class TestQuestionFiles(unittest.TestCase):
+    """SPEC §3.3: QUESTION.md / ANSWER.md parsing and atomic answering."""
+
+    QUESTION = (
+        "# QUESTION\n"
+        "id: q1\n"
+        "asked_at: 2026-10-25T10:00:00Z\n"
+        "question: 要先修 A 還是 B？\n"
+        "options:\n"
+        "- A: 先修 A\n"
+        "- B: 先修 B（推薦）\n"
+        "- C: 兩個都先不修\n"
+    )
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-question-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def test_valid_question_parses_id_options_and_wait(self):
+        parsed = watch.parse_question(self.QUESTION)
+        self.assertEqual(parsed["error"], "")
+        self.assertEqual(parsed["id"], "q1")
+        self.assertEqual([code for code, _ in parsed["options"]], ["A", "B", "C"])
+        self.assertIn("推薦", parsed["options"][1][1])
+        self.assertEqual(
+            watch.format_question_wait(watch.question_wait_seconds(
+                {"asked_at_ts": parsed["asked_at"]}, parsed["asked_at"] + 185)),
+            "已等 3m",
+        )
+        self.assertEqual(watch.format_question_wait(31 * 60), "已等 31m")
+        self.assertEqual(watch.format_question_wait(2 * 3600 + 5 * 60), "已等 2h05m")
+
+    def test_missing_id_question_or_options_is_an_error(self):
+        for body, expected in (
+            ("id: q1\nquestion: x\noptions:\n- A: a\n", "缺少 # QUESTION"),
+            ("# QUESTION\nquestion: x\noptions:\n- A: a\n", "缺少 id"),
+            ("# QUESTION\nid: q1\noptions:\n- A: a\n", "缺少 question"),
+            ("# QUESTION\nid: q1\nquestion: x\n", "缺少 options"),
+            ("# QUESTION\nid: q1\nquestion: x\noptions:\n- A\n", "缺少 options"),
+            ("# QUESTION\nid: q1\nquestion: x\noptions:\n- A: a\n- A: b\n", "重複"),
+        ):
+            with self.subTest(body=body):
+                self.assertIn(expected, watch.parse_question(body)["error"])
+        self.assertTrue(watch.question_is_active(watch.parse_question("# QUESTION\nid: q1\n")))
+
+    def test_answer_requires_matching_id_and_choice(self):
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        question = watch.read_task_question(self.root)
+        self.assertTrue(watch.question_is_active(question))
+        (self.root / "ANSWER.md").write_text("# ANSWER\nid: q9\nchoice: B\n")
+        self.assertFalse(watch.read_task_question(self.root)["answered"], "stale id is not an answer")
+        self.assertTrue(watch.question_is_active(watch.read_task_question(self.root)))
+
+        ok, _ = watch.write_answer_file(self.root, question, "D")
+        self.assertFalse(ok)
+        self.assertFalse((self.root / "ANSWER.md").read_text().endswith("choice: D\n"))
+
+        ok, _ = watch.write_answer_file(self.root, question, "B", "先 B 再 A", now=1792922400)
+        self.assertTrue(ok)
+        content = (self.root / "ANSWER.md").read_text()
+        self.assertEqual(
+            content.splitlines()[:4],
+            ["# ANSWER", "id: q1", "answered_at: 2026-10-25T18:00:00+08:00", "choice: B"],
+        )
+        self.assertIn("note: 先 B 再 A", content)
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+        self.assertTrue(watch.read_task_question(self.root)["answered"])
+
+    def test_stale_question_after_completion_is_not_active(self):
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        question = watch.read_task_question(self.root)
+        self.assertTrue(watch.question_is_active(question, completion_time=question["asked_at"] - 60))
+        self.assertFalse(watch.question_is_active(question, completion_time=question["asked_at"] + 60))
+        question["answered"] = True
+        self.assertFalse(watch.question_is_active(question))
+
+    def test_tsv_question_status_and_answer_clears_attention(self):
+        now = parse_timestamp("2026-10-25T10:10:00Z")
+        log = self.root / "run.log"
+        write_log(log, now - 600, "等回答中")
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        set_mtime(self.root / "QUESTION.md", now - 120)
+        runs, done = self.root / "runs.tsv", self.root / "done.tsv"
+        runs.write_text("ask-task\t%s\t%s\t\tClaude\tmodel-q\taw\n" % (log, self.root / "REPORT.md"))
+        done.write_text("")
+        agents, errors = load_all_agents(runs, done, LogParser(process_start_reader=None), now)
+        self.assertEqual(errors, [])
+        self.assertEqual(agents[0].status, "question")
+        self.assertEqual(agents[0].question["id"], "q1")
+        self.assertTrue(watch.write_answer_file(self.root, agents[0].question, "A", now=now)[0])
+        agents, _ = load_all_agents(runs, done, LogParser(process_start_reader=None), now)
+        self.assertNotEqual(agents[0].status, "question")
+        self.assertTrue(agents[0].question["answered"])
+
+
+class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """SPEC §2.4 / §3.3: read-only terminal, question popup, ANSWER.md, 30m alert."""
+
+    fixture_app = V10MainPageTests.fixture_app
+    screen_text = staticmethod(V10MainPageTests.screen_text)
+
+    QUESTION = TestQuestionFiles.QUESTION
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def deep_dir(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-deep-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        log = root / "run.log"
+        log.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"text","text":"白話第一句"}]}}\n'
+            '{"type":"system","subtype":"init","model":"fixture-model","timestamp":"2026-10-25T09:59:00Z"}\n'
+            "工具完成\n"
+        )
+        return root, log
+
+    def write_question(self, root, asked_at, body=None):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(asked_at))
+        text = body if body is not None else self.QUESTION.replace(
+            "2026-10-25T10:00:00Z", stamp,
+        )
+        path = root / "QUESTION.md"
+        path.write_text(text)
+        set_mtime(path, asked_at)
+
+    def question_agent(self, root, log, status="question", question=None, **values):
+        if question is None:
+            question = watch.read_task_question(root)
+        defaults = dict(
+            name="question-task", log_path=log, last_path=root / "REPORT.md",
+            status=status, harness="Claude", model="claude-fixture",
+            start_time=self.now - 900, elapsed="00:15:00", latest="等回答",
+            log_lines=["等回答中"], log_mtime=self.now - 1, project="example-project",
+            key="question-task::%s::%s" % (log, root / "REPORT.md"), question=question,
+        )
+        defaults.update(values)
+        return AgentInfo(**defaults)
+
+    async def test_enter_terminal_escape_keeps_pid_and_log_untouched(self):
+        root, log = self.deep_dir()
+        agent = self.question_agent(root, log, status="running", question=None, pid=os.getpid())
+        before = (log.stat().st_mtime_ns, log.read_bytes())
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.TerminalScreen)
+            text = self.screen_text(app)
+            self.assertIn("白話第一句", text)
+            self.assertIn("初始化 Claude (fixture-model)", text)
+            self.assertNotIn('{"type"', text)
+            self.assertTrue(app.state.task(agent.key)["read"], "deep view marks the task read")
+            app.update_data(now=self.now + 5)
+            self.assertIsInstance(app.screen, watch.TerminalScreen)
+            self.assertFalse(app.ui_error)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, watch.TerminalScreen)
+            self.assertEqual(app.selected_key, agent.key)
+            self.assertEqual(app.focused.agent.key, agent.key)
+            self.assertEqual(app.current_agents[0].pid, os.getpid())
+            os.kill(os.getpid(), 0)  # the dashboard never signals the run
+        self.assertEqual(before, (log.stat().st_mtime_ns, log.read_bytes()))
+
+    async def test_terminal_search_scroll_and_live_tail(self):
+        root, log = self.deep_dir()
+        agent = self.question_agent(root, log, status="running", question=None)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            search = app.screen.query_one("#terminal-search", watch.Input)
+            search.value = "工具"
+            await pilot.pause()
+            screen = app.screen
+            self.assertEqual(screen.query_text, "工具")
+            rendered = screen.query_one("#terminal-content", watch.Static).render()
+            self.assertIn("工具完成", rendered.plain)
+            self.assertIn("224,175,104", " ".join(str(span.style) for span in rendered.spans))
+            await pilot.press("enter")
+            await pilot.pause()
+            log.write_text(log.read_text() + "即時追加一行\n")
+            screen.refresh_content()
+            await pilot.pause()
+            self.assertIn(
+                "即時追加一行",
+                screen.query_one("#terminal-content", watch.Static).render().plain,
+            )
+            self.assertFalse(app.ui_error)
+
+    async def test_question_popup_writes_answer_with_matching_id(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 120)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertIn("等回答", self.screen_text(app))
+            self.assertIn("已等 2m", self.screen_text(app))
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.QuestionScreen)
+            self.assertIn("要先修 A 還是 B？", self.screen_text(app))
+            options = app.screen.query_one("#question-options", watch.OptionList)
+            options.highlighted = 1
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            answer = (root / "ANSWER.md").read_text()
+            self.assertIn("id: q1", answer)
+            self.assertIn("choice: B", answer)
+            self.assertIn("answered_at: ", answer)
+            self.assertIn("note: ", answer)
+            self.assertEqual(list(root.glob("*.tmp")), [])
+            self.assertTrue(watch.read_task_question(root)["answered"])
+            self.assertFalse(app.ui_error)
+
+    async def test_question_note_input_and_escape_cancel(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 60)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("escape")
+            self.assertFalse((root / "ANSWER.md").exists(), "Esc cancels without writing")
+            await pilot.press("enter")
+            await pilot.pause()
+            app.screen.query_one("#question-options", watch.OptionList).highlighted = 2
+            note = app.screen.query_one("#question-note", watch.Input)
+            note.focus()
+            note.value = "先 C"
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            answer = (root / "ANSWER.md").read_text()
+            self.assertIn("choice: C", answer)
+            self.assertIn("note: 先 C", answer)
+
+    async def test_malformed_question_shows_raw_and_cannot_answer(self):
+        root, log = self.deep_dir()
+        self.write_question(
+            root, self.now - 60,
+            body="# QUESTION\nid: q9\nquestion: 壞掉的問題\n- 沒有 options 段落\n",
+        )
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            screen = self.screen_text(app)
+            self.assertIn("問題格式錯誤", screen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.QuestionScreen)
+            self.assertFalse(app.screen.query("#question-options"), "no options for bad format")
+            self.assertFalse(app.screen.query("#question-note"))
+            self.assertIn("只顯示原文", self.screen_text(app))
+            self.assertIn("壞掉的問題", self.screen_text(app))
+            await pilot.press("escape")
+            await pilot.pause()
+        self.assertFalse((root / "ANSWER.md").exists())
+
+    async def test_thirty_minute_question_turns_red_and_notifies_once(self):
+        old_root, old_log = self.deep_dir()
+        self.write_question(old_root, self.now - 31 * 60)
+        old = self.question_agent(old_root, old_log)
+        text = watch.render_task_row(old, 76, self.now)
+        self.assertIn("已等 31m", text.plain)
+        self.assertIn("#f7768e", " ".join(str(span.style) for span in text.spans))
+        self.assertTrue(all(display_width(line) <= 76 for line in text.plain.splitlines()))
+
+        young_root, young_log = self.deep_dir()
+        self.write_question(young_root, self.now - 29 * 60)
+        young = self.question_agent(young_root, young_log)
+        young_text = watch.render_task_row(young, 76, self.now)
+        self.assertIn("已等 29m", young_text.plain)
+        self.assertIn("#e0af68", " ".join(str(span.style) for span in young_text.spans))
+
+        app = self.fixture_app([old])
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            app.is_first_load = False
+            # The first paint records already-overdue questions without alerting;
+            # this test checks the crossing itself.
+            app.notified_questions.clear()
+            with patch("watch.notify_question_overdue") as notify:
+                app.update_data(now=self.now - 2 * 60)  # 29 minutes
+                notify.assert_not_called()
+                app.update_data(now=self.now)  # 31 minutes
+                self.assertEqual(notify.call_count, 1)
+                app.update_data(now=self.now + 30)
+                self.assertEqual(notify.call_count, 1, "one alert per question id")
+            self.assertIn("已等 31m", self.screen_text(app))
+
+    async def test_s5_fixture_snapshots_and_registry_mtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+            runs.write_text("")
+            done.write_text("")
+            before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+            shots = Path(__file__).parent / "shots" if os.environ.get(
+                "AGENT_WATCH_UPDATE_S5_SHOTS") else root / "shots"
+            shots.mkdir(parents=True, exist_ok=True)
+            for width in (80, 120):
+                cases = []
+                work_root, work_log = self.deep_dir()
+                self.write_question(work_root, self.now - 31 * 60)
+                cases.append(("work-question", self.question_agent(work_root, work_log)))
+                term_root, term_log = self.deep_dir()
+                cases.append(("terminal", self.question_agent(
+                    term_root, term_log, status="running", question=None,
+                )))
+                q_root, q_log = self.deep_dir()
+                self.write_question(q_root, self.now - 300)
+                cases.append(("question", self.question_agent(q_root, q_log)))
+                for name, agent in cases:
+                    app = self.fixture_app([agent])
+                    app.runs_path, app.done_path = runs, done
+                    with patch("watch.load_all_agents", side_effect=AssertionError("No live registry")), \
+                         patch("watch.subprocess.run", side_effect=AssertionError("No live service")):
+                        async with app.run_test(size=(width, 40)) as pilot:
+                            await pilot.pause()
+                            if name != "work-question":
+                                await pilot.press("enter")
+                                await pilot.pause()
+                            text = self.screen_text(app)
+                            self.assertEqual(len(text.splitlines()), 40)
+                            self.assertTrue(all(display_width(line) <= width for line in text.splitlines()))
+                            self.assertFalse(app.ui_error)
+                            if name == "terminal":
+                                self.assertIn("白話第一句", text)
+                            elif name == "question":
+                                self.assertIn("要先修 A 還是 B？", text)
+                            else:
+                                self.assertIn("已等 31m", text)
+                            (shots / ("v10-s5-%s-%dx40.txt" % (name, width))).write_text(
+                                "\n".join(line.rstrip() for line in text.splitlines()) + "\n",
+                                encoding="utf-8",
+                            )
+            self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+            print("v10-s5 fixtures isolated; TSV bytes and mtime_ns UNCHANGED")
 
 
 if __name__ == "__main__":

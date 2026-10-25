@@ -98,6 +98,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `3` | Quota tab |
 | `4` | Architecture tab |
 | `j` / `k`, arrows | Select next / previous task |
+| `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup |
 | `e` | Work: expand / collapse recent completions |
 | `h` / `d` | Hide / move to completed history (ended tasks without attention only) |
 | `c` | Collapse the selected task's project; a new running task reopens it |
@@ -142,6 +143,28 @@ hidden、done_manual、read、pinned、tags、updated_at；`projects` 保存 col
 畫面只保留一則提示，不會反覆跳通知。第一次成功操作才建立／替換 state 檔。
 本版不處理多個看板同時寫入的鎖定，最後寫入者覆蓋較早的狀態。
 看板不寫入派工 TSV，`--once` 維持原本的唯讀摘要，不讀寫操作狀態。
+
+### 深入畫面與回答選項（v10 第⑤段）
+
+在工作頁選中任務按 `Enter`，進入全螢幕唯讀終端機：內容是該任務 `run.log` 的尾端
+（最多 400 行），每 1 秒自動更新，Claude／Codex 的 JSON 事件會翻成白話。
+`j`／`k`、↑↓ 捲動，PgUp／PgDn 翻頁，`/` 搜尋（Enter 套用；有搜尋字時
+Esc 先清除搜尋，再按一次 Esc 回工作頁）。
+`Esc` 回到工作頁，選取位置不變；看板只讀檔，不會送訊號給任務，PID 與 log 都不受影響。
+進過全螢幕的任務會標成已讀。
+
+任務資料夾（`run.log` 旁）出現 `QUESTION.md` 且沒有相同 `id` 的 `ANSWER.md` 時，
+任務會進「需處理」並顯示「已等 Xm」。按 `Enter` 開選項彈窗，↑↓ 選、Enter 送出；
+也可 Tab 到備註欄留一行。看板依照 SPEC §3.3 格式在同一個資料夾寫 `ANSWER.md`
+（先寫暫存檔再 atomic rename），`id` 沿用問題的 `id`。格式錯誤（缺 `id`、
+`question`、`options`）或選項壞掉時，只顯示「問題格式錯誤」與原文，不給選項、
+也不寫檔。`asked_at` 無法解析時以檔案時間起算。
+
+等超過 30 分鐘（`QUESTION_OVERDUE_SECONDS`）時，「已等」會變紅，並沿用完成通知
+機制跳一次桌面通知＋聲音；同一個問題只通知一次。`ANSWER.md` 出現且 `id` 相符後，
+任務隔一次輪詢就離開需處理區。看板不會叫醒或重啟 agent，也不會替人選答案。
+若舊的 `QUESTION.md` 比已完成的報告還舊，視為上一輪留下的檔案，不會讓完成的任務
+卡在需處理。
 
 Run once and print a plain-text summary instead of the full-screen UI (works
 without a TTY, useful for logs and CI):
@@ -259,6 +282,13 @@ To persist v10's Textual 80x40 / 120x40 work and architecture text snapshots:
 ```bash
 AGENT_WATCH_UPDATE_SHOTS=1 .venv/bin/python -m unittest \
   test_watch.V10ScreenAndWorkerTests.test_v10_fixture_snapshots_and_registry_mtimes
+```
+
+Deep-view (stage ⑤) terminal and question-popup snapshots:
+
+```bash
+AGENT_WATCH_UPDATE_S5_SHOTS=1 .venv/bin/python -m unittest \
+  test_watch.V10DeepViewTests.test_s5_fixture_snapshots_and_registry_mtimes
 ```
 
 The fixture tests compare registry bytes and nanosecond mtimes before/after reads.
