@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import unicodedata
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,9 @@ from rich.text import Text
 try:
     from textual.app import App, ComposeResult
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.widgets import Collapsible, Footer, Label, Static, TabbedContent, TabPane
+    from textual.message import Message
+    from textual.screen import ModalScreen
+    from textual.widgets import Label, Static, TabbedContent, TabPane
 except ImportError:
     App = object  # type: ignore
 
@@ -1483,16 +1486,22 @@ def task_bucket(agent: AgentInfo, now: Optional[float] = None) -> str:
     return "attention"
 
 
-def count_buckets(agents: List[AgentInfo], now: Optional[float] = None) -> Dict[str, int]:
+def count_buckets(
+    agents: List[AgentInfo], now: Optional[float] = None,
+    bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
+) -> Dict[str, int]:
     current = time.time() if now is None else now
     counts = dict(attention=0, running=0, recent=0, history=0, total=len(agents))
     for agent in agents:
-        counts[task_bucket(agent, current)] += 1
+        counts[bucket_fn(agent, current)] += 1
     return counts
 
 
-def format_bucket_counts(agents: List[AgentInfo], now: float) -> str:
-    counts = count_buckets(agents, now)
+def format_bucket_counts(
+    agents: List[AgentInfo], now: float,
+    bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
+) -> str:
+    counts = count_buckets(agents, now, bucket_fn)
     return (
         f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
         f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ 總計 {counts['total']}"
@@ -2509,6 +2518,93 @@ def render_history_summary(agents: List[AgentInfo], now: float) -> str:
     return f"歷史 {len(history)} 筆" + (f"（{counts}）" if counts else "")
 
 
+BOARD_COLORS = {
+    "running": "#e0af68",
+    "recent": "#9ece6a",
+    "history": "#737b91",
+    "attention": "#f7768e",
+}
+BOARD_STATUS_LABELS = {
+    "running": "進行中", "waiting": "等候中", "blocked": "卡住",
+    "failed": "失敗", "no_report": "無報告", "unconfirmed": "待確認",
+    "error": "資料錯誤", "complete": "剛完成", "reported": "已回報",
+    "partial": "部分完成", "question": "等回答",
+}
+WIDE_BOARD_COLUMNS = 120
+
+
+def board_bucket(agent: AgentInfo, now: float) -> str:
+    # Issues remain actionable even after the recent-completion window ends.
+    # Stage 5 may supply question tasks without adding file I/O to the UI.
+    if agent.status in {"question", "waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
+        return "attention"
+    return task_bucket(agent, now)
+
+
+def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False) -> Text:
+    """Reserve separate elapsed/status columns before fitting task identity."""
+    width = max(1, width)
+    bucket = board_bucket(agent, now)
+    color = BOARD_COLORS[bucket]
+    marker = "› " if selected else "  "
+    status = BOARD_STATUS_LABELS.get(agent.status, "待確認")
+    if bucket == "history":
+        status = "已完成"
+    if bucket in ("recent", "history"):
+        line = "{}{} {} │ {} │ {}".format(
+            marker, format_completion_time(agent.completion_time),
+            agent.name, status, agent.latest,
+        )
+        return Text(truncate_display(line, width), style=color)
+
+    elapsed = "已跑 " + compact_elapsed(agent)
+    elapsed_width = max(14, display_width(elapsed))
+    status_width = 8
+    # Three separators plus the cursor. Shrink model, then title, then agent.
+    budget = width - 2 - 9 - elapsed_width - status_width
+    name_width = min(display_width(agent.name), max(1, budget - 10), 26)
+    identity_width = max(0, budget - name_width)
+    identity = agent.harness + " · " + agent.model
+    if display_width(identity) > identity_width:
+        model_width = identity_width - display_width(agent.harness + " · ")
+        if model_width >= 1:
+            identity = agent.harness + " · " + truncate_display(agent.model, model_width)
+        else:
+            identity = truncate_display(agent.harness, identity_width)
+    name = truncate_display(agent.name, name_width)
+    name += " " * max(0, name_width - display_width(name))
+    identity += " " * max(0, identity_width - display_width(identity))
+    result = Text(marker + name + " │ " + identity + " │ ", style=color)
+    result.append(elapsed + " " * (elapsed_width - display_width(elapsed)), style="bold " + color)
+    result.append(" │ " + status + " " * max(0, status_width - display_width(status)))
+    detail = agent.stage or agent.latest or "尚無進度"
+    result.append("\n" + truncate_display("  " + detail, width), style="#a9b1bd")
+    return result
+
+
+def render_home_quota(raw: list, width: int, stale: bool = False) -> str:
+    """Compact bars only; the time-progress calculation belongs to stage 4."""
+    parts = []
+    for provider in ("codex", "claude", "opencode-go", "openrouter"):
+        item = next((entry for entry in raw if entry.get("provider") == provider), {})
+        name = QUOTA_PROVIDER_NAMES[provider]
+        windows = valid_quota_windows(item)
+        if windows:
+            label, used, _ = windows[0]
+            bar = render_quota_bar(used, 4).replace("\\]", "]")
+            value = f"{bar} {escape(label)} {used:g}%"
+        elif item.get("balance"):
+            value = escape(str(item["balance"]))
+        else:
+            value = "[#737b91]無資料[/]"
+        parts.append(f"{name} {value}")
+    separator = "   "
+    full = separator.join(parts)
+    if display_width(Text.from_markup(full).plain) > width:
+        full = separator.join(parts[:2]) + "\n" + separator.join(parts[2:])
+    return ("[#f7768e]過期 [/]" if stale else "") + full
+
+
 def render_work_board(
     agents: List[AgentInfo], width: int = 80, now: Optional[float] = None,
     expand_recent: bool = False,
@@ -2755,116 +2851,141 @@ def run_once_summary(
 
 APP_CSS = """
 Screen {
-    background: #0f1117;
-    color: #c0caf5;
+    background: #101216;
+    color: #c4c9d4;
 }
-
 #top-bar {
-    height: 3;
-    background: #1a1b26;
-    border-bottom: heavy #3b4261;
+    height: 1;
+    background: #1b1e24;
+}
+#top-title {
+    width: 9;
+    color: #a9b1bd;
+}
+.nav-tab {
+    width: 11;
+    height: 1;
+    color: #a9b1bd;
+}
+.nav-tab.current {
+    color: #9ece6a;
+    text-style: bold;
+}
+#clock {
+    width: 1fr;
+    text-align: right;
+    padding-right: 1;
+}
+#main-tabs {
+    height: 1fr;
+}
+#main-tabs ContentTabs {
+    display: none;
+}
+TabPane {
+    padding: 0;
+}
+#compact-quota-line {
+    height: auto;
+    max-height: 2;
+    padding: 0 1;
+    background: #181b20;
+}
+#work-page {
+    layout: vertical;
+    height: 1fr;
     padding: 0 1;
 }
-
-#top-title {
-    color: #7aa2f7;
-    text-style: bold;
-    width: 20;
+#work-page.wide {
+    layout: horizontal;
 }
-
-#top-stats {
-    color: #a9b1d6;
-    width: 1fr;
-}
-
-TabbedContent {
-    height: 1fr;
-}
-
-TabPane {
-    padding: 1;
-}
-
-#work-page {
-    height: 1fr;
-}
-
 #work-scroll {
+    width: 1fr;
     height: 1fr;
     min-height: 3;
+    scrollbar-size: 1 1;
 }
-
-.flow-title {
-    color: #bb9af7;
-    text-style: bold;
-    height: 1;
+#work-page.wide #work-scroll {
+    width: 2fr;
+    margin-right: 1;
 }
-
 #data-errors {
     height: auto;
-    color: #ff9e3b;
+    color: #f7768e;
 }
-
-#recent-done-display {
+#attention-box, .project-section, #pinned-box {
     height: auto;
-    margin-bottom: 1;
-}
-
-#compact-quota-line {
-    background: #16161e;
-    color: #7dcfff;
+    border: solid #444b59;
     padding: 0 1;
+    border-title-color: #a9b1bd;
+}
+#attention-box {
+    border: solid #f7768e;
+    border-title-color: #f7768e;
+}
+#attention-list, #work-board {
     height: auto;
 }
-
-#work-board, .project-section, .active-task-list, .recent-task-list, #history-summary {
-    height: auto;
+#pinned-box {
+    color: #737b91;
 }
-
-#active-flow-display {
-    height: auto;
-    margin-bottom: 1;
-}
-
-#done-collapsible {
-    background: #1a1b26;
-    border: solid #3b4261;
-    margin-top: 1;
-    margin-bottom: 1;
-}
-
-#done-tasks-display {
-    height: auto;
-    padding: 0 1;
-}
-
-#work-log-box {
-    height: 9;
-    min-height: 9;
-    max-height: 9;
-    background: #16161e;
-    border-top: double #7aa2f7;
-    padding: 0 1;
-}
-
-#bottom-log-title {
-    color: #7dcfff;
-    text-style: bold;
+.empty-row, .more-recent, #top-stats, #history-summary {
     height: 1;
-    content-align: left middle;
+    color: #737b91;
 }
-
+.task-row {
+    height: auto;
+    min-height: 1;
+}
+.task-row:focus, .task-row.selected {
+    background: #222831;
+}
+.project-section.selected, #attention-box.selected {
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+}
+#work-log-box {
+    height: 7;
+    min-height: 7;
+    border: solid #444b59;
+    border-title-color: #a9b1bd;
+    padding: 0 1;
+}
+#work-page.wide #work-log-box {
+    width: 1fr;
+    height: 1fr;
+}
+#bottom-log-title {
+    height: 1;
+    color: #c4c9d4;
+    text-style: bold;
+}
+#preview-scroll {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
 #bottom-log-content {
-    color: #a9b1d6;
-    height: 6;
-    overflow: hidden;
+    height: auto;
+    color: #a9b1bd;
 }
-
-#arch-display {
+#key-bar {
+    height: 1;
+    background: #1b1e24;
+    color: #a9b1bd;
+    padding-left: 1;
+}
+#arch-display, #quota-display, #history-display {
     height: auto;
 }
-
-#quota-display {
+HelpScreen {
+    background: #101216;
+}
+#help-scroll {
+    border: solid #9ece6a;
+    border-title-color: #9ece6a;
+    padding: 1 2;
+}
+#help-content {
     height: auto;
 }
 """
@@ -2923,6 +3044,64 @@ class RunDataService:
         return True
 
 
+class NavTab(Static):
+    def __init__(self, label: str, tab_id: str):
+        super().__init__(label, classes="nav-tab", markup=False)
+        self.tab_id = tab_id
+
+    def on_click(self) -> None:
+        self.app.action_switch_tab(self.tab_id)
+
+
+class TaskRow(Static, can_focus=True):
+    class Selected(Message):
+        def __init__(self, key: str):
+            super().__init__()
+            self.key = key
+
+    def __init__(self, agent: AgentInfo, now: float):
+        super().__init__(classes="task-row")
+        self.agent = agent
+        self.now = now
+        self.selected = False
+
+    def render(self) -> Text:
+        return render_task_row(self.agent, self.content_size.width, self.now, self.selected)
+
+    def on_focus(self) -> None:
+        self.post_message(self.Selected(self.agent.key))
+
+    def on_click(self) -> None:
+        self.focus()
+        self.post_message(self.Selected(self.agent.key))
+
+
+class HelpScreen(ModalScreen):
+    BINDINGS = [("escape", "dismiss", "返回"), ("question_mark", "dismiss", "返回")]
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="help-scroll") as panel:
+            panel.border_title = "快捷鍵 · Esc / ? 返回"
+            yield Static(
+                "[bold #9ece6a]AGENT WATCH v10 · 快捷鍵[/]\n\n"
+                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構\n\n"
+                "[bold]工作頁[/]\n"
+                "  j / ↓        下一筆任務\n"
+                "  k / ↑        上一筆任務\n"
+                "  Tab / Shift+Tab  移動焦點\n"
+                "  滑鼠點選      選中任務並預覽\n"
+                "  e            展開／收起各專案的剛完成清單\n\n"
+                "[bold]架構頁[/]\n"
+                "  p            切換專案\n"
+                "  n / f        現在／未來架構\n\n"
+                "[bold]全域[/]\n"
+                "  ?            開啟／關閉此表\n"
+                "  Esc          關閉此表\n"
+                "  q            離開看板",
+                id="help-content",
+            )
+
+
 class AgentWatchApp(App):
     """Textual terminal dashboard for monitoring agents with tabs and flicker-free updates."""
 
@@ -2930,8 +3109,14 @@ class AgentWatchApp(App):
     BINDINGS = [
         ("q", "quit", "離開 (Quit)"),
         ("1", "switch_tab('tab-work')", "工作 (1)"),
-        ("2", "switch_tab('tab-arch')", "架構 (2)"),
+        ("2", "switch_tab('tab-history')", "歷史 (2)"),
         ("3", "switch_tab('tab-quota')", "額度 (3)"),
+        ("4", "switch_tab('tab-arch')", "架構 (4)"),
+        ("j", "next_task", "下一筆"),
+        ("down", "next_task", "下一筆"),
+        ("k", "previous_task", "上一筆"),
+        ("up", "previous_task", "上一筆"),
+        ("question_mark", "show_help", "快捷鍵"),
         ("e", "toggle_recent", "展開剛完成 (E)"),
         ("p", "cycle_project", "切換專案 (P)"),
         ("n", "show_architecture_now", "現在 (N)"),
@@ -2964,86 +3149,224 @@ class AgentWatchApp(App):
         self.architecture_project_id = next(iter(ARCHITECTURE_DATA["projects"]))
         self.current_active_agents: List[AgentInfo] = []
         self.expand_recent = False
-        self._board_active_widgets: Dict[str, Static] = {}
+        self.selected_key: Optional[str] = None
+        self._row_widgets: Dict[str, TaskRow] = {}
+        self._board_structure: Any = None
+        self.layout_mode = "stacked"
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
-            yield Label("⚡ AGENT WATCH v8", id="top-title")
-            yield Label("載入中...", id="top-stats")
+            yield Label(" AW v10", id="top-title")
+            for number, label, tab_id in (
+                (1, "工作", "tab-work"), (2, "歷史", "tab-history"),
+                (3, "額度", "tab-quota"), (4, "架構", "tab-arch"),
+            ):
+                yield NavTab(f"[{number}] {label}", tab_id)
+            yield Label("", id="clock")
         yield Static("額度：載入中...", id="compact-quota-line")
 
         with TabbedContent(initial="tab-work", id="main-tabs"):
-            with TabPane("工作 (1)", id="tab-work"):
+            with TabPane("[1] 工作", id="tab-work"):
                 with Vertical(id="work-page"):
                     with VerticalScroll(id="work-scroll"):
-                        yield Label("● 工作看板", classes="flow-title")
                         yield Static(id="data-errors")
+                        with Vertical(id="attention-box") as attention:
+                            attention.border_title = "需處理"
+                            yield Vertical(id="attention-list")
+                        with Vertical(id="pinned-box") as pinned:
+                            pinned.border_title = "釘選 · 0/5"
+                            yield Static("尚無釘選", classes="empty-row")
                         yield Vertical(id="work-board")
+                        yield Label("", id="top-stats")
                         yield Static(id="history-summary")
-                    with Vertical(id="work-log-box"):
-                        yield Label("最新 LOG：無", id="bottom-log-title")
-                        yield Static("尚無即時日誌", id="bottom-log-content")
+                    with Vertical(id="work-log-box") as preview:
+                        preview.border_title = "預覽 · 跟隨游標"
+                        yield Label("尚未選中任務", id="bottom-log-title", markup=False)
+                        with VerticalScroll(id="preview-scroll"):
+                            yield Static("尚無即時日誌", id="bottom-log-content", markup=False)
 
-            with TabPane("架構 (2)", id="tab-arch"):
+            with TabPane("[2] 歷史", id="tab-history"):
+                with VerticalScroll():
+                    yield Static(id="history-display")
+            with TabPane("[3] 額度", id="tab-quota"):
+                with VerticalScroll(id="quota-scroll"):
+                    yield Static(id="quota-display")
+            with TabPane("[4] 架構", id="tab-arch"):
                 with VerticalScroll(id="arch-scroll"):
                     yield Static(id="arch-display")
 
-            with TabPane("額度 (3)", id="tab-quota"):
-                with VerticalScroll(id="quota-scroll"):
-                    yield Static(id="quota-display")
-
-        yield Footer()
+        yield Static("1–4 分頁 │ j/k ↑↓ 選取 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
 
     def action_toggle_recent(self) -> None:
         self.expand_recent = not self.expand_recent
         self.last_snapshot = None
         self.update_data()
 
-    def on_resize(self) -> None:
+    def on_resize(self, event) -> None:
         if self._ui_ready:
-            self.last_snapshot = None
-            self.update_data()
+            self.update_layout(event.size.width)
+            self.call_after_refresh(self.refresh_after_resize)
+
+    def refresh_after_resize(self) -> None:
+        self.last_snapshot = None
+        self.update_data()
+
+    def update_layout(self, width: Optional[int] = None) -> None:
+        columns = self.size.width if width is None else width
+        self.layout_mode = "split" if columns >= WIDE_BOARD_COLUMNS else "stacked"
+        self.query_one("#work-page").set_class(self.layout_mode == "split", "wide")
 
     def update_board(self, agents: List[AgentInfo], now: float, width: int) -> None:
+        attention = [a for a in agents if board_bucket(a, now) == "attention"]
+        groups = work_board_groups(
+            [a for a in agents if board_bucket(a, now) in ("running", "recent")], now,
+        )
+        visible_groups = []
+        for project, tasks in groups.items():
+            running = [a for a in tasks if board_bucket(a, now) == "running"]
+            recent = [a for a in tasks if board_bucket(a, now) == "recent"]
+            visible = running + (recent if self.expand_recent else recent[:3])
+            visible_groups.append((project, visible, len(recent) - min(3, len(recent))))
+        structure = (
+            tuple(a.key for a in attention),
+            tuple((project, tuple(a.key for a in tasks), extra) for project, tasks, extra in visible_groups),
+            self.expand_recent,
+        )
+        if structure == self._board_structure:
+            self.update_board_timers(agents, now, width)
+            self.update_selection()
+            return
+        self._board_structure = structure
+        restore_focus = isinstance(self.focused, TaskRow) or self.selected_key is None
         board = self.query_one("#work-board", Vertical)
         board.remove_children()
-        self._board_active_widgets = {}
+        attention_list = self.query_one("#attention-list", Vertical)
+        attention_list.remove_children()
+        self._row_widgets = {}
+
+        def row(agent: AgentInfo) -> TaskRow:
+            widget = TaskRow(agent, now)
+            self._row_widgets[agent.key] = widget
+            return widget
+
+        attention_list.mount(*(
+            [row(a) for a in attention] if attention
+            else [Static("目前沒有需處理任務", classes="empty-row")]
+        ))
+        self.query_one("#attention-box").border_title = (
+            f"需處理 · {len(attention)} · 等回答／卡住／失敗／無報告"
+        )
         sections = []
-        for project, tasks in work_board_groups(agents, now).items():
-            active = [a for a in tasks if task_bucket(a, now) != "recent"]
-            recent = [a for a in tasks if task_bucket(a, now) == "recent"]
-            counts = count_buckets(tasks, now)
-            title = (
-                f"▌ {project_label(project)}  需處理 {counts['attention']} · "
-                f"進行中 {counts['running']} · 剛完成 {counts['recent']}"
-            )
-            active_widget = Static(render_board_active(active, width), classes="active-task-list")
-            self._board_active_widgets[project] = active_widget
-            sections.append(Vertical(
-                Static(escape(title), classes="flow-title"),
-                active_widget,
-                Static(render_board_recent(recent, width, self.expand_recent), classes="recent-task-list"),
-                classes="project-section",
-            ))
+        for project, tasks, extra in visible_groups:
+            children = [row(a) for a in tasks]
+            if extra and not self.expand_recent:
+                children.append(Static(
+                    f"  … 另 {extra} 筆  [e] 展開", markup=False, classes="more-recent",
+                ))
+            section = Vertical(*children, classes="project-section")
+            running_count = sum(board_bucket(a, now) == "running" for a in tasks)
+            section.border_title = f"{project_label(project)} · 進行中 {running_count} · 剛完成"
+            sections.append(section)
         if sections:
             board.mount(*sections)
-        self.query_one("#history-summary", Static).update(escape(render_history_summary(agents, now)))
+        else:
+            board.mount(Static("目前沒有進行中或剛完成的任務", classes="empty-row"))
+        if self.selected_key not in self._row_widgets:
+            self.selected_key = next(iter(self._row_widgets), None)
+        self.call_after_refresh(self.restore_selection, restore_focus)
+        history_count = sum(board_bucket(agent, now) == "history" for agent in agents)
+        self.query_one("#history-summary", Static).update(f"歷史 {history_count} 筆")
 
     def update_board_timers(self, agents: List[AgentInfo], now: float, width: int) -> None:
-        for project, tasks in work_board_groups(agents, now).items():
-            widget = self._board_active_widgets.get(project)
+        for agent in agents:
+            widget = self._row_widgets.get(agent.key)
             if widget is not None:
-                active = [a for a in tasks if task_bucket(a, now) != "recent"]
-                if active:
-                    widget.update(render_board_active(active, width))
+                widget.agent = agent
+                widget.now = now
+                widget.refresh(layout=True)
+
+    def restore_selection(self, restore_focus: bool) -> None:
+        self.update_selection()
+        if restore_focus and self.query_one("#main-tabs", TabbedContent).active == "tab-work":
+            row = self._row_widgets.get(self.selected_key)
+            if row is not None:
+                row.focus(scroll_visible=False)
+
+    def on_task_row_selected(self, event: TaskRow.Selected) -> None:
+        if event.key in self._row_widgets:
+            self.selected_key = event.key
+            self.update_selection()
+
+    def update_selection(self) -> None:
+        for widget in self.query(".project-section, #attention-box"):
+            widget.remove_class("selected")
+        for key, row in self._row_widgets.items():
+            row.selected = key == self.selected_key
+            row.set_class(row.selected, "selected")
+            row.refresh()
+            if row.selected and row.parent is not None:
+                panel = row.parent
+                if panel.id == "attention-list":
+                    panel = panel.parent
+                panel.add_class("selected")
+        self.update_preview()
+
+    def update_preview(self) -> None:
+        followed = next((a for a in self.current_agents if a.key == self.selected_key), None)
+        title = self.query_one("#bottom-log-title", Label)
+        content = self.query_one("#bottom-log-content", Static)
+        if followed is None:
+            title.update("尚未選中任務")
+            content.update("目前沒有可預覽的任務")
+            return
+        title.update(followed.name)
+        lines = []
+        for line in followed.log_lines:
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                event = None
+            summary = summarize_jsonl_step(event) if isinstance(event, dict) else clean_text(line)
+            if summary:
+                lines.extend(summary.splitlines())
+        limit = 24 if self.layout_mode == "split" else 3
+        content.update("\n".join(lines[-limit:]) if lines else followed.latest or "尚無即時日誌")
+        self.call_after_refresh(self.scroll_preview_to_end)
+
+    def scroll_preview_to_end(self) -> None:
+        self.query_one("#preview-scroll", VerticalScroll).scroll_end(animate=False)
+
+    def move_task(self, delta: int) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active != "tab-work":
+            return
+        keys = list(self._row_widgets)
+        if not keys:
+            return
+        index = keys.index(self.selected_key) if self.selected_key in keys else 0
+        key = keys[max(0, min(len(keys) - 1, index + delta))]
+        self.selected_key = key
+        self._row_widgets[key].focus()
+        self.update_selection()
+
+    def action_next_task(self) -> None:
+        self.move_task(1)
+
+    def action_previous_task(self) -> None:
+        self.move_task(-1)
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def action_switch_tab(self, tab_id: str) -> None:
-        """Switch active tab on keys 1/2/3."""
-        try:
-            tc = self.query_one("#main-tabs", TabbedContent)
-            tc.active = tab_id
-        except Exception:
-            pass
+        # Hiding a focused pane otherwise moves focus to its next task, whose
+        # TabPane.Focused event would immediately activate the work tab again.
+        if isinstance(self.focused, TaskRow):
+            self.set_focus(None)
+        self.query_one("#main-tabs", TabbedContent).active = tab_id
+        for tab in self.query(NavTab):
+            tab.set_class(tab.tab_id == tab_id, "current")
+        if tab_id == "tab-work":
+            self.call_after_refresh(self.restore_selection, True)
 
     def action_show_architecture_now(self) -> None:
         self.set_architecture_view("now")
@@ -3088,6 +3411,8 @@ class AgentWatchApp(App):
 
     def on_mount(self) -> None:
         self._ui_ready = True
+        self.update_layout()
+        self.action_switch_tab("tab-work")
         self.data_svc.on_ready = self._data_ready
         self.quota_svc.refresh_in_background()
         self.data_svc.refresh_in_background()
@@ -3102,7 +3427,7 @@ class AgentWatchApp(App):
     def _data_ready(self) -> None:
         try:
             self.call_from_thread(self.update_data)
-        except RuntimeError:
+        except (RuntimeError, CancelledError):
             # The reader can finish after the app has closed.
             pass
 
@@ -3117,6 +3442,7 @@ class AgentWatchApp(App):
         now: Optional[float] = None,
     ) -> tuple:
         """Snapshot displayed data without elapsed counters."""
+        current = time.time() if now is None else now
         agent_snaps = tuple(
             (
                 a.key,
@@ -3133,7 +3459,7 @@ class AgentWatchApp(App):
                 a.stage,
                 a.project,
                 a.start_time,
-                task_bucket(a, now),
+                board_bucket(a, current),
             )
             for a in agents
         )
@@ -3147,6 +3473,10 @@ class AgentWatchApp(App):
         """
         if now is None:
             now = time.time()
+        if self._ui_ready:
+            self.query_one("#clock", Label).update(
+                time.strftime("%H:%M:%S", time.localtime(now))
+            )
 
         try:
             if self._ui_ready:
@@ -3186,7 +3516,7 @@ class AgentWatchApp(App):
             self.is_first_load = False
 
         self.previous_status = {a.key: a.status for a in agents}
-        active = [a for a in agents if task_bucket(a, now) in ("attention", "running")]
+        active = [a for a in agents if board_bucket(a, now) in ("attention", "running")]
         self.current_agents = agents
         self.current_active_agents = active
         timer_snapshot = tuple((a.key, a.elapsed) for a in active)
@@ -3216,7 +3546,7 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        stats_str = format_bucket_counts(agents, now)
+        stats_str = format_bucket_counts(agents, now, board_bucket)
         width = self.size.width if self._ui_ready else 80
 
         if not self._ui_ready:
@@ -3225,28 +3555,26 @@ class AgentWatchApp(App):
         try:
             self.query_one("#top-stats", Label).update(stats_str)
             self.query_one("#compact-quota-line", Static).update(
-                escape(render_compact_quota(quota_summary, max(1, width - 2)))
+                render_home_quota(quota_raw, max(1, width - 2), quota_stale)
             )
-            self.query_one("#data-errors", Static).update(
-                render_data_errors(list(error_snapshot), agents, width)
-            )
+            data_errors = self.query_one("#data-errors", Static)
+            errors_markup = render_data_errors(list(error_snapshot), agents, width)
+            data_errors.update(errors_markup)
+            data_errors.display = bool(errors_markup)
             self.update_board(agents, now, width)
-
-            candidates = [a for a in agents if a.log_mtime > 0 and a.log_lines]
-            followed = max(candidates, key=lambda a: a.log_mtime) if candidates else None
-            log_title = self.query_one("#bottom-log-title", Label)
-            log_content = self.query_one("#bottom-log-content", Static)
-            log_width = max(20, width - 7)
-            if followed:
-                log_title.update(f"最新 LOG：{escape(truncate_display(followed.name, max(12, width - 20)))}")
-                recent_lines = [
-                    escape(truncate_display(line, log_width))
-                    for line in followed.log_lines[-6:]
-                ]
-                log_content.update("\n".join(recent_lines) if recent_lines else "尚無即時日誌")
-            else:
-                log_title.update("最新 LOG：無可讀日誌")
-                log_content.update("目前沒有可讀取的日誌內容")
+            self.update_preview()
+            history = [a for a in agents if board_bucket(a, now) == "history"]
+            history_text = Text("歷史\n\n", style=BOARD_COLORS["history"])
+            for agent in history:
+                history_text.append(
+                    format_completion_time(done_timestamp(agent)) + " │ "
+                    + project_label(agent.project) + " │ " + agent.name + " │ "
+                    + ("已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)) + " │ "
+                    + agent.latest + "\n"
+                )
+            if not history:
+                history_text.append("目前沒有歷史任務")
+            self.query_one("#history-display", Static).update(history_text)
 
             arch_markup = render_architecture_view(
                 agents,
