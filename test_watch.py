@@ -228,7 +228,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             )
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=False):
+            with patch("watch.running_pid_set", return_value=set()):
                 agents, errors = load_all_agents(runs, done, LogParser(), time.time())
 
         self.assertEqual(errors, [])
@@ -585,8 +585,10 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set_mtime(runs, registration)
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=True):
-                agents, _ = load_all_agents(runs, done, LogParser(), now)
+            with patch("watch.running_pid_set", return_value={os.getpid()}):
+                agents, _ = load_all_agents(
+                    runs, done, LogParser(process_start_reader=None), now,
+                )
 
             self.assertEqual(agents[0].status, "running")
 
@@ -602,7 +604,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             runs.write_text(f"Dead worker\t{log}\t{last}\t2147483647\n", encoding="utf-8")
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=False):
+            with patch("watch.running_pid_set", return_value=set()):
                 agents, _ = load_all_agents(runs, done, LogParser(), now)
 
             self.assertEqual(agents[0].status, "no_report")
@@ -819,8 +821,10 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set_mtime(runs, now - 30)
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=True):
-                agents, errors = load_all_agents(runs, done, LogParser(), now)
+            with patch("watch.running_pid_set", return_value={12345}):
+                agents, errors = load_all_agents(
+                    runs, done, LogParser(process_start_reader=None), now,
+                )
 
             self.assertEqual(errors, [])
             self.assertEqual(agents[0].status, "running")
@@ -842,7 +846,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set_mtime(runs, now - 30)
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=False):
+            with patch("watch.running_pid_set", return_value=set()):
                 agents, errors = load_all_agents(runs, done, LogParser(), now)
             agent = agents[0]
             markup = render_done_tasks(agents)
@@ -878,7 +882,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set_mtime(runs, start + 10)
             done.write_text("", encoding="utf-8")
 
-            with patch("watch.is_pid_alive", return_value=False):
+            with patch("watch.running_pid_set", return_value=set()):
                 agents, errors = load_all_agents(runs, done, LogParser(), now)
 
             self.assertEqual(errors, [])
@@ -1452,7 +1456,9 @@ class StageOneScreenTests(IsolatedState, unittest.TestCase):
             done.write_text(f"example-project review\t{log}\t{report}\n")
             payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
             output = io.StringIO()
-            with patch("watch.is_pid_alive", return_value=True), patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+            with patch("watch.running_pid_set", return_value={os.getpid()}), \
+                    patch("watch.read_process_start", return_value=None), \
+                    patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(watch.run_once_summary(runs, done), 0)
             text = output.getvalue()

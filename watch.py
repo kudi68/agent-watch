@@ -1284,19 +1284,34 @@ def last_status_from_content(content: str) -> Optional[str]:
     return None
 
 
-def is_pid_alive(pid: int) -> Optional[bool]:
-    """None means inspection failed, not that the process has ended."""
-    if pid <= 0:
-        return None
+_PID_CACHE_UNSET = object()
+
+
+def running_pid_set() -> Optional[Set[int]]:
+    """Read the process inventory once; None means inspection failed."""
     try:
         result = subprocess.run(
             ["pgrep", "-l", "."], capture_output=True, text=True, timeout=3, check=False,
         )
-        if result.returncode not in (0, 1):
-            return None
-        return any(line.split(maxsplit=1)[0] == str(pid) for line in result.stdout.splitlines() if line.strip())
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode not in (0, 1):
+        return None
+    pids = set()
+    for line in result.stdout.splitlines():
+        try:
+            pids.add(int(line.split(maxsplit=1)[0]))
+        except (IndexError, ValueError):
+            continue
+    return pids
+
+
+def is_pid_alive(pid: int) -> Optional[bool]:
+    """None means inspection failed, not that the process has ended."""
+    if pid <= 0:
+        return None
+    pids = running_pid_set()
+    return None if pids is None else pid in pids
 
 
 def parse_process_lstart(text: str) -> Optional[float]:
@@ -1437,6 +1452,7 @@ def build_agent(
     project: Optional[str] = None,
     started_at: Optional[float] = None,
     note: str = "",
+    pid_alive_override: Any = _PID_CACHE_UNSET,
 ) -> AgentInfo:
     log_path = Path(log_str).expanduser()
     if not log_path.is_absolute():
@@ -1455,7 +1471,12 @@ def build_agent(
     if not is_null_log and not log_path.exists():
         data_err = f"log 檔案不存在：{log_path}"
     last_status = last_status_from_content(last_content) if last_valid else None
-    pid_alive = is_pid_alive(pid) if pid is not None else None
+    if pid is None:
+        pid_alive = None
+    elif pid_alive_override is _PID_CACHE_UNSET:
+        pid_alive = is_pid_alive(pid)
+    else:
+        pid_alive = pid_alive_override
     resolved_harness, resolved_model = resolve_run_identity(
         log_path,
         pid,
@@ -1605,6 +1626,7 @@ def load_tsv_agents(
     is_done_file: bool,
     log_parser: LogParser,
     now: float,
+    process_pids: Any = _PID_CACHE_UNSET,
 ) -> Tuple[List[AgentInfo], List[str]]:
     agents = []
     errors = []
@@ -1656,6 +1678,11 @@ def load_tsv_agents(
             except (ValueError, OverflowError, OSError):
                 errors.append(f"{tsv_path.name} 第 {line_num} 行 started_at 格式錯誤（需 ISO 8601 含時區）")
 
+        pid_alive_override = _PID_CACHE_UNSET
+        if is_done_file:
+            pid_alive_override = False
+        elif pid is not None and process_pids is not _PID_CACHE_UNSET:
+            pid_alive_override = None if process_pids is None else pid in process_pids
         agents.append(
             build_agent(
                 name,
@@ -1672,6 +1699,7 @@ def load_tsv_agents(
                 project=project,
                 started_at=started_at,
                 note=note,
+                pid_alive_override=pid_alive_override,
             )
         )
 
@@ -1690,8 +1718,13 @@ def load_all_agents(
     if now is None:
         now = time.time()
 
-    running_agents, err1 = load_tsv_agents(runs_path, False, log_parser, now)
-    done_agents, err2 = load_tsv_agents(done_path, True, log_parser, now)
+    process_pids = running_pid_set()
+    running_agents, err1 = load_tsv_agents(
+        runs_path, False, log_parser, now, process_pids=process_pids,
+    )
+    done_agents, err2 = load_tsv_agents(
+        done_path, True, log_parser, now, process_pids=process_pids,
+    )
 
     active_keys = {a.key for a in running_agents}
     archived_only = [a for a in done_agents if a.key not in active_keys]

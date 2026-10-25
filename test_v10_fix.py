@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import watch
 
@@ -52,6 +52,42 @@ class TsvNoteTests(unittest.TestCase):
         self.assertEqual(agents, [])
         self.assertEqual(len(errors), 1)
         self.assertIn("需 3 至 9 欄", errors[0])
+
+
+class ProcessInventoryTests(unittest.TestCase):
+    def test_load_all_agents_reads_pgrep_once_for_100_rows_and_skips_done_pid(self):
+        with tempfile.TemporaryDirectory(prefix="aw-pid-cache-tests-") as tmp:
+            root = Path(tmp)
+            runs, done = root / "runs.tsv", root / "done.tsv"
+            pids = list(range(70000, 70099))
+            done_pid = 70099
+            runs.write_text(
+                "".join(f"run-{index}\t/dev/null\t/dev/null\t{pid}\n"
+                        for index, pid in enumerate(pids)),
+                encoding="utf-8",
+            )
+            report = root / "done.md"
+            report.write_text("DONE\n", encoding="utf-8")
+            done.write_text(f"done-run\t/dev/null\t{report}\t{done_pid}\n",
+                            encoding="utf-8")
+            output = "".join(f"{pid} worker\n" for pid in (*pids, done_pid))
+            with patch("watch.subprocess.run", return_value=Mock(
+                returncode=0, stdout=output,
+            )) as run:
+                agents, errors = watch.load_all_agents(
+                    runs, done, watch.LogParser(process_start_reader=None), 1_800_000_000,
+                )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(agents), 100)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], ["pgrep", "-l", "."])
+        active = next(agent for agent in agents if agent.name == "run-0")
+        archived = next(agent for agent in agents if agent.name == "done-run")
+        self.assertTrue(active.process_alive)
+        self.assertEqual(active.status, "running")
+        self.assertFalse(archived.process_alive)
+        self.assertEqual(archived.status, "complete")
 
 
 class AttentionStateTests(unittest.TestCase):
