@@ -385,8 +385,11 @@ class TestAgentWatch(unittest.TestCase):
             data_error="",
             now=now,
             last_status="failed",
+            init_time=now - 15,
         )
-        # Log activity after this report makes it stale for the current run.
+        # A new init after this report makes it stale for the current run.
+        # Later log writes alone do not: Claude's result event always follows
+        # the REPORT it describes (M1).
         self.assertEqual(st, "running")
 
         st = determine_status(

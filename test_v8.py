@@ -354,6 +354,111 @@ class V10DataRegressions(unittest.TestCase):
                                              pid=1234, started_at=self.start)
                 self.assertEqual(live.status, "running")
 
+    def test_claude_result_after_report_keeps_report_status(self):
+        """M1: the result event is written after REPORT.md and must not override it."""
+        for marker, expected in (("FAIL", "failed"), ("PARTIAL", "partial"), ("DONE", "complete")):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log, report = root / "run.log", root / "REPORT.md"
+                log.write_bytes((self.fixtures / "claude_stream.jsonl").read_bytes())
+                with log.open("a") as stream:
+                    stream.write(json.dumps({
+                        "type": "result", "subtype": "success", "is_error": False,
+                        "timestamp": "2026-10-25T10:06:00Z", "result": "fixture outcome",
+                    }) + "\n")
+                report.write_text(f"{marker}\n主要成果\n")
+                # Claude saves the report first; the result event lands later.
+                os.utime(report, (self.start + 300, self.start + 300))
+                os.utime(log, (self.start + 360, self.start + 360))
+                with patch("watch.is_pid_alive", return_value=False):
+                    agent = watch.build_agent("Task", str(log), str(report), False,
+                                              watch.LogParser(), self.now, pid=1234,
+                                              started_at=self.start)
+                self.assertEqual(agent.status, expected)
+                self.assertEqual(agent.latest, "主要成果")
+
+    def test_report_before_current_init_is_not_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_bytes((self.fixtures / "claude_stream.jsonl").read_bytes())
+            with log.open("a") as stream:
+                stream.write(json.dumps({
+                    "type": "result", "subtype": "success", "is_error": False,
+                    "timestamp": "2026-10-25T10:06:00Z", "result": "new Claude outcome",
+                }) + "\n")
+            # Older than the current run's init event, newer than started_at.
+            report.write_text("FAIL\n舊報告\n")
+            os.utime(report, (self.start - 120, self.start - 120))
+            os.utime(log, (self.start + 360, self.start + 360))
+            with patch("watch.is_pid_alive", return_value=False), patch(
+                "watch.find_new_branch_commit", return_value=(False, None)
+            ):
+                agent = watch.build_agent("Task", str(log), str(report), False,
+                                          watch.LogParser(), self.now, pid=1234,
+                                          started_at=self.start - 180)
+            self.assertEqual(agent.status, "complete")
+            self.assertIn("new Claude outcome", agent.latest)
+
+    def test_report_after_init_without_timestamp_keeps_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_text('{"type":"system","subtype":"init","model":"claude-fixture"}\n'
+                           '{"type":"result","subtype":"success","result":"fixture outcome"}\n')
+            report.write_text("FAIL\n建置失敗\n")
+            os.utime(report, (self.start + 300, self.start + 300))
+            os.utime(log, (self.start + 360, self.start + 360))
+            with patch("watch.is_pid_alive", return_value=False):
+                agent = watch.build_agent("Task", str(log), str(report), False,
+                                          watch.LogParser(), self.now, pid=1234,
+                                          started_at=self.start)
+            self.assertEqual(agent.status, "failed")
+
+    def test_result_event_still_used_without_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "run.log"
+            log.write_bytes((self.fixtures / "claude_stream.jsonl").read_bytes())
+            with log.open("a") as stream:
+                stream.write(json.dumps({
+                    "type": "result", "subtype": "success", "is_error": False,
+                    "timestamp": "2026-10-25T10:06:00Z", "result": "fixture outcome",
+                }) + "\n")
+            os.utime(log, (self.start + 360, self.start + 360))
+            with patch("watch.is_pid_alive", return_value=False):
+                agent = watch.build_agent("Task", str(log), str(root / "missing"), False,
+                                          watch.LogParser(), self.now, pid=1234,
+                                          started_at=self.start)
+            self.assertEqual(agent.status, "complete")
+            self.assertIn("fixture outcome", agent.latest)
+
+    def test_done_file_report_status_beats_result_event(self):
+        for marker, expected in (("FAIL", "failed"), ("PARTIAL", "partial"), ("DONE", "complete")):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log, report = root / "run.log", root / "REPORT.md"
+                log.write_bytes((self.fixtures / "claude_stream.jsonl").read_bytes())
+                with log.open("a") as stream:
+                    stream.write(json.dumps({
+                        "type": "result", "subtype": "success", "is_error": False,
+                        "timestamp": "2026-10-25T10:06:00Z", "result": "fixture outcome",
+                    }) + "\n")
+                report.write_text(f"{marker}\n主要成果\n")
+                os.utime(report, (self.start + 300, self.start + 300))
+                os.utime(log, (self.start + 360, self.start + 360))
+                runs, done = root / "runs.tsv", root / "done.tsv"
+                runs.write_text("")
+                done.write_text("\t".join([
+                    "Task", str(log), str(report), "", "", "", "", "2026-10-25T10:00:00Z",
+                ]) + "\n")
+                agents, errors = watch.load_all_agents(runs, done, watch.LogParser(), self.now)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(agents), 1)
+                self.assertEqual(agents[0].is_done_file, True)
+                self.assertEqual(agents[0].status, expected)
+                self.assertEqual(agents[0].latest, "主要成果")
+
     def test_claude_tool_and_partial_records_and_reused_init(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "run.log"

@@ -662,6 +662,10 @@ class LogParser:
         self.process_start_reader: Optional[Callable[[int], Optional[float]]] = process_start_reader
         self.pid_start_cache: Dict[int, Optional[float]] = {}
         self.result_events: Dict[str, Tuple[Optional[float], str]] = {}
+        # The latest init event bounds the CURRENT run. Claude writes its
+        # REPORT.md before the final log records, so this (not the log mtime)
+        # decides whether a report belongs to this invocation.
+        self.init_events: Dict[str, Optional[float]] = {}
 
     def pid_start_time(self, pid: Optional[int]) -> Optional[float]:
         """Return a live PID's start time; a successful lookup is cached per PID."""
@@ -716,14 +720,16 @@ class LogParser:
         if str(path) == "/dev/null":
             return None, UNKNOWN_IDENTITY, [], 0.0, ""
 
+        cache_key = str(path.resolve())
         try:
             st = path.stat()
             if not stat.S_ISREG(st.st_mode):
+                self.init_events.pop(cache_key, None)
                 return None, UNKNOWN_IDENTITY, [], 0.0, "不是一般檔案"
         except OSError as e:
+            self.init_events.pop(cache_key, None)
             return None, UNKNOWN_IDENTITY, [], 0.0, e.strerror or "無法讀取"
 
-        cache_key = str(path.resolve())
         identity = (st.st_dev, st.st_ino)
         mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
         cached = self.cache.get(cache_key)
@@ -753,6 +759,7 @@ class LogParser:
         pending = cached["pending"] if append_only else b""
         if not append_only:
             self.result_events.pop(cache_key, None)
+            self.init_events.pop(cache_key, None)
 
         try:
             with path.open("rb") as stream:
@@ -807,12 +814,16 @@ class LogParser:
                     self.result_events[cache_key] = (record_timestamp(record) or st.st_mtime, "failed" if failed else "complete")
                 elif summary:
                     self.result_events.pop(cache_key, None)
-                if ts is not None and (
-                    (isinstance(record, dict) and record.get("type") == "system" and record.get("subtype") == "init")
-                    or re.search(rb"\bsession start\b", raw_line, re.IGNORECASE)
-                ):
-                    start_time = ts
-                    self.result_events.pop(cache_key, None)
+                is_init_event = (
+                    isinstance(record, dict) and record.get("type") == "system" and record.get("subtype") == "init"
+                ) or re.search(rb"\bsession start\b", raw_line, re.IGNORECASE) is not None
+                if is_init_event:
+                    # A new init starts a new run. Without its timestamp the
+                    # boundary is unknown, so do not keep an older init time.
+                    self.init_events[cache_key] = ts
+                    if ts is not None:
+                        start_time = ts
+                        self.result_events.pop(cache_key, None)
                 if summary:
                     recent.append(summary)
 
@@ -1069,6 +1080,40 @@ def read_process_start(pid: int, now: Optional[float] = None) -> Optional[float]
     return started
 
 
+def report_is_fresh(
+    last_valid: bool,
+    last_mtime: float,
+    run_start: float,
+    init_time: Optional[float] = None,
+) -> bool:
+    """Return whether a result document was written by the current run.
+
+    Claude stream-json keeps writing after REPORT.md is saved (the final
+    assistant text and the ``result`` event), so the log's mtime cannot be the
+    upper boundary. The run start and the latest init event are the real
+    boundaries; a report older than either belongs to an earlier invocation.
+    """
+    if not last_valid or last_mtime <= run_start:
+        return False
+    return init_time is None or last_mtime >= init_time
+
+
+def explicit_report_status(
+    is_done_file: bool,
+    last_valid: bool,
+    last_mtime: float,
+    last_status: Optional[str],
+    run_start: float,
+    init_time: Optional[float] = None,
+) -> Optional[str]:
+    """Return the REPORT's explicit status when it belongs to this run."""
+    if not last_valid or last_status is None:
+        return None
+    if is_done_file or report_is_fresh(last_valid, last_mtime, run_start, init_time):
+        return last_status
+    return None
+
+
 def determine_status(
     is_done_file: bool,
     last_valid: bool,
@@ -1083,6 +1128,7 @@ def determine_status(
     has_new_commit: bool = False,
     process_alive: Optional[bool] = None,
     inspect_process: bool = True,
+    init_time: Optional[float] = None,
 ) -> str:
     if pid is not None:
         if process_alive is None and inspect_process:
@@ -1094,7 +1140,7 @@ def determine_status(
     if is_done_file:
         return (last_status or "reported") if last_valid else "no_report"
     run_start = start_time if start_time is not None else log_mtime
-    last_is_fresh = last_valid and last_mtime > run_start and last_mtime >= log_mtime
+    last_is_fresh = report_is_fresh(last_valid, last_mtime, run_start, init_time)
     if last_is_fresh:
         return last_status or "reported"
     if has_new_commit:
@@ -1168,7 +1214,12 @@ def build_agent(
             elapsed_start = None
             start_source = ""
     run_start = elapsed_start if elapsed_start is not None else log_mtime
-    last_is_fresh = last_valid and last_mtime > run_start and last_mtime >= log_mtime
+    log_key = str(log_path.resolve())
+    init_time = log_parser.init_events.get(log_key)
+    last_is_fresh = report_is_fresh(last_valid, last_mtime, run_start, init_time)
+    report_status = explicit_report_status(
+        is_done_file, last_valid, last_mtime, last_status, run_start, init_time
+    )
     run_started = run_start if run_start > 0 else None
     stage = read_progress_stage(log_path.parent, run_started)
     has_new_commit = False
@@ -1190,11 +1241,12 @@ def build_agent(
         has_new_commit=has_new_commit,
         process_alive=pid_alive,
         inspect_process=False,
+        init_time=init_time,
     )
-    event_status = log_parser.result_events.get(str(log_path.resolve()))
+    event_status = log_parser.result_events.get(log_key)
     if (
         pid_alive is not True and not (pid is not None and pid_alive is None)
-        and not last_is_fresh and event_status is not None
+        and report_status is None and event_status is not None
         and event_status[0] is not None and run_started is not None
         and event_status[0] >= run_started
     ):
@@ -1227,7 +1279,7 @@ def build_agent(
             line for line in clean_last_lines
             if not line.startswith("#") and not re.fullmatch(
                 r"(?:(?:STATUS|狀態|判定)\s*[:：]\s*)?"
-                r"(?:DONE|COMPLETE|COMPLETED|PARTIAL|FAILED|BLOCKED|REPORTED|完成|部分完成|失敗|受阻)",
+                r"(?:DONE|COMPLETE|COMPLETED|PARTIAL|FAIL|FAILED|BLOCKED|REPORTED|完成|部分完成|失敗|受阻)",
                 line.replace("**", "").strip(), re.IGNORECASE,
             )
         ]
