@@ -653,11 +653,12 @@ class BoardRegressions(unittest.TestCase):
     def test_snapshot_changes_at_two_hour_boundary(self):
         now = 1_800_000_000
         agents = [example_agent("edge", "complete", now, completion_time=now - 7200)]
-        app = watch.AgentWatchApp()
-        with patch("watch.time.time", return_value=now):
-            first = app.make_snapshot(agents, "", [])
-        with patch("watch.time.time", return_value=now + 1):
-            later = app.make_snapshot(agents, "", [])
+        with tempfile.TemporaryDirectory() as tmp:
+            app = watch.AgentWatchApp(state_path=Path(tmp) / "state.json")
+            with patch("watch.time.time", return_value=now):
+                first = app.make_snapshot(agents, "", [])
+            with patch("watch.time.time", return_value=now + 1):
+                later = app.make_snapshot(agents, "", [])
         self.assertNotEqual(first, later)
 
 

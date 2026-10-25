@@ -11,6 +11,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -30,7 +31,7 @@ try:
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.message import Message
     from textual.screen import ModalScreen
-    from textual.widgets import Label, Static, TabbedContent, TabPane
+    from textual.widgets import DataTable, Input, Label, Select, Static, TabbedContent, TabPane
 except ImportError:
     App = object  # type: ignore
 
@@ -2541,6 +2542,193 @@ def board_bucket(agent: AgentInfo, now: float) -> str:
     return task_bucket(agent, now)
 
 
+class WatchState:
+    """Dashboard-owned state. Registry files are never modified."""
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path) if path is not None else _env_path(
+            "AGENT_WATCH_STATE", Path.home() / "Projects/night/agent-watch-state.json",
+        )
+        self.data: Dict[str, Any] = dict(version=1, tasks={}, projects={})
+        self.warning = ""
+        self.revision = 0
+        self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._validate(data)
+            self.data = data
+        except FileNotFoundError:
+            self.warning = "state 檔不存在，使用空狀態"
+        except (OSError, ValueError, TypeError, UnicodeError):
+            self.warning = "state 檔損壞或無法讀取，使用空狀態"
+
+    @staticmethod
+    def _validate(data: Any) -> None:
+        if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+            raise ValueError("unsupported state")
+        for section in ("tasks", "projects"):
+            if not isinstance(data.get(section), dict):
+                raise ValueError("invalid section")
+            for entry in data[section].values():
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid entry")
+                for name in ("hidden", "done_manual", "read", "pinned", "restored", "collapsed"):
+                    if name in entry and type(entry[name]) is not bool:
+                        raise ValueError("invalid flag")
+                if "tags" in entry and (
+                    not isinstance(entry["tags"], list)
+                    or not all(isinstance(tag, str) for tag in entry["tags"])
+                ):
+                    raise ValueError("invalid tags")
+        if sum(bool(entry.get("pinned")) for entry in data["tasks"].values()) > 5:
+            raise ValueError("too many pins")
+
+    def task(self, key: str) -> Dict[str, Any]:
+        return self.data["tasks"].get(key, {})
+
+    def save(self, data: Dict[str, Any]) -> bool:
+        temporary = None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=str(self.path.parent),
+                prefix="." + self.path.name + "-", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = stream.name
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except (OSError, ValueError) as exc:
+            self.warning = "state 寫入失敗：" + str(exc)
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+        self.data = data
+        self.revision += 1
+        self.warning = ""
+        return True
+
+    @staticmethod
+    def stamp() -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def update_task(self, key: str, **values: Any) -> bool:
+        data = copy.deepcopy(self.data)
+        entry = data["tasks"].setdefault(key, {})
+        entry.update(values, updated_at=self.stamp())
+        return self.save(data)
+
+    def reconcile(self, agents: List[AgentInfo], now: float) -> None:
+        """A rerun keeps user tags/pins but drops the previous run's disposition."""
+        data = copy.deepcopy(self.data)
+        changed = False
+        observed = dict(self._observed)
+        for agent in agents:
+            previous = self._observed.get(agent.key)
+            observed[agent.key] = (agent.status, agent.start_time)
+            entry = data["tasks"].get(agent.key)
+            if entry is not None:
+                rerun = (
+                    agent.status == "running"
+                    and any(entry.get(flag) for flag in ("hidden", "done_manual", "restored", "read"))
+                ) or (
+                    previous is not None and (
+                        (previous[0] == "running" and agent.status != "running")
+                        or previous[1] != agent.start_time
+                    )
+                ) or (
+                    entry.get("run_start") is not None and agent.start_time is not None
+                    and entry["run_start"] != agent.start_time
+                )
+                if rerun:
+                    entry.update(hidden=False, done_manual=False, restored=False, read=False,
+                                 run_start=agent.start_time, updated_at=self.stamp())
+                    changed = True
+            project = data["projects"].get(agent.project, {})
+            if project.get("collapsed") and board_bucket(agent, now) in ("running", "attention"):
+                project.update(collapsed=False, collapsed_at=self.stamp())
+                changed = True
+        if not changed or self.save(data):
+            self._observed = observed
+
+    def bucket(self, agent: AgentInfo, now: float) -> str:
+        bucket = board_bucket(agent, now)
+        if bucket in ("attention", "running"):
+            return bucket
+        entry = self.task(agent.key)
+        if entry.get("hidden"):
+            return "hidden"
+        if entry.get("done_manual") or self.data["projects"].get(agent.project, {}).get("collapsed"):
+            return "history"
+        return "recent" if entry.get("restored") else bucket
+
+    def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
+              tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+        entry = self.task(agent.key)
+        if operation in ("hide", "done") and board_bucket(agent, now) in ("running", "attention"):
+            return False, "進行中或需處理的任務不能隱藏／歸到已完成"
+        if operation == "collapse":
+            if any(a.project == agent.project and board_bucket(a, now) in ("running", "attention") for a in agents):
+                return False, "專案仍有進行中或需處理的任務，不能收起"
+            data = copy.deepcopy(self.data)
+            data["projects"][agent.project] = dict(collapsed=True, collapsed_at=self.stamp())
+            ok = self.save(data)
+        else:
+            if operation == "pin" and not entry.get("pinned"):
+                if sum(bool(t.get("pinned")) for t in self.data["tasks"].values()) >= 5:
+                    return False, "最多只能釘選 5 個任務，請先取消一個"
+            changes: Dict[str, Any] = {
+                "hide": dict(hidden=True, restored=False),
+                "done": dict(done_manual=True, restored=False),
+                "restore": dict(hidden=False, done_manual=False, restored=True),
+                "read": dict(read=not entry.get("read", False)),
+                "pin": dict(pinned=not entry.get("pinned", False)),
+                "tags": dict(tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip()))),
+            }.get(operation, {})
+            if not changes:
+                return False, "未知操作"
+            if operation == "restore":
+                data = copy.deepcopy(self.data)
+                data["tasks"].setdefault(agent.key, {}).update(
+                    changes, updated_at=self.stamp(), run_start=agent.start_time,
+                )
+                data["projects"].setdefault(agent.project, {})["collapsed"] = False
+                ok = self.save(data)
+            else:
+                ok = self.update_task(agent.key, run_start=agent.start_time, **changes)
+        return ok, "已儲存" if ok else self.warning
+
+
+def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
+                  query: str = "", project: str = "", tag: str = "",
+                  read: str = "", hidden: str = "") -> List[AgentInfo]:
+    result = []
+    for agent in agents:
+        if state.bucket(agent, now) not in ("history", "hidden"):
+            continue
+        entry = state.task(agent.key)
+        if project and agent.project != project:
+            continue
+        if tag and tag not in entry.get("tags", []):
+            continue
+        if read and bool(entry.get("read")) != (read == "read"):
+            continue
+        if hidden and bool(entry.get("hidden")) != (hidden == "hidden"):
+            continue
+        searchable = " ".join((agent.name, agent.latest, agent.project, project_label(agent.project),
+                               " ".join(entry.get("tags", []))))
+        if query.casefold() not in searchable.casefold():
+            continue
+        result.append(agent)
+    return sorted(result, key=lambda a: (-(done_timestamp(a) or 0), a.key))
+
+
 def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False) -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
@@ -2977,6 +3165,40 @@ TabPane {
 #arch-display, #quota-display, #history-display {
     height: auto;
 }
+#state-message {
+    height: auto;
+    max-height: 2;
+    color: #e0af68;
+    padding: 0 1;
+}
+#history-page {
+    padding: 0 1;
+}
+#history-filters {
+    height: 3;
+}
+#history-filters Select {
+    width: 1fr;
+}
+#history-search {
+    height: 3;
+    display: none;
+}
+#history-table {
+    height: 1fr;
+    color: #a9b1bd;
+}
+TagScreen {
+    align: center middle;
+}
+#tag-panel {
+    width: 70;
+    max-width: 100%;
+    height: 7;
+    border: solid #9ece6a;
+    background: #101216;
+    padding: 0 1;
+}
 HelpScreen {
     background: #101216;
 }
@@ -3053,6 +3275,11 @@ class NavTab(Static):
         self.app.action_switch_tab(self.tab_id)
 
 
+class HistoryTable(DataTable):
+    # ScrollView otherwise consumes Space before it reaches the App binding.
+    BINDINGS = [("space", "app.toggle_history_group", "收合專案組")]
+
+
 class TaskRow(Static, can_focus=True):
     class Selected(Message):
         def __init__(self, key: str):
@@ -3066,7 +3293,13 @@ class TaskRow(Static, can_focus=True):
         self.selected = False
 
     def render(self) -> Text:
-        return render_task_row(self.agent, self.content_size.width, self.now, self.selected)
+        agent = copy.copy(self.agent)
+        entry = self.app.state.task(agent.key)
+        if board_bucket(agent, self.now) not in ("running", "attention") and not entry.get("read"):
+            agent.name = "● " + agent.name
+        if entry.get("tags"):
+            agent.name += " [" + ", ".join(entry["tags"]) + "]"
+        return render_task_row(agent, self.content_size.width, self.now, self.selected)
 
     def on_focus(self) -> None:
         self.post_message(self.Selected(self.agent.key))
@@ -3086,7 +3319,30 @@ HELP_BLOCKED_ACTIONS = frozenset({
     "cycle_project",            # p
     "show_architecture_now",    # n
     "show_architecture_future",  # f
+    "hide_task", "finish_task", "collapse_project", "toggle_pin", "toggle_read",
+    "edit_tags", "restore_task", "toggle_history_mode", "toggle_history_group",
+    "search_history", "next_task", "previous_task",
 })
+
+
+class TagScreen(ModalScreen):
+    BINDINGS = [("escape", "dismiss(None)", "取消")]
+
+    def __init__(self, tags: List[str]):
+        super().__init__()
+        self.tags = tags
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tag-panel") as panel:
+            panel.border_title = "自訂標籤"
+            yield Label("用逗號分隔；留空清除。Enter 儲存，Esc 取消。")
+            yield Input(value=", ".join(self.tags), id="tag-input")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss([tag.strip() for tag in re.split("[,，]", event.value) if tag.strip()])
 
 
 class HelpScreen(ModalScreen):
@@ -3109,6 +3365,19 @@ class HelpScreen(ModalScreen):
                 "  Tab / Shift+Tab  移動焦點\n"
                 "  滑鼠點選      選中任務並預覽\n"
                 "  e            展開／收起各專案的剛完成清單\n\n"
+                "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
+                "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
+                "  i            釘選／取消釘選（最多 5 個）\n"
+                "  t            編輯自訂標籤（逗號分隔）\n"
+                "  u            切換已讀／未讀\n\n"
+                "[bold]歷史頁[/]\n"
+                "  /            搜尋；Enter 回清單；Esc 清除搜尋\n"
+                "  Tab          移至專案／標籤／已讀／隱藏篩選\n"
+                "  g            切換表格／依專案分組\n"
+                "  Space / Enter  收合／展開選中的專案組\n"
+                "  j / k / ↑ / ↓  選取列\n"
+                "  r            撈回主頁（取消隱藏與手動完成）\n"
+                "  i / t / u    釘選／標籤／已讀切換\n\n"
                 "[bold]架構頁[/]\n"
                 "  p            切換專案\n"
                 "  n / f        現在／未來架構\n\n"
@@ -3139,16 +3408,30 @@ class AgentWatchApp(App):
         ("p", "cycle_project", "切換專案 (P)"),
         ("n", "show_architecture_now", "現在 (N)"),
         ("f", "show_architecture_future", "未來 (F)"),
+        ("h", "hide_task", "隱藏"),
+        ("d", "finish_task", "歸到已完成"),
+        ("c", "collapse_project", "收起專案"),
+        ("i", "toggle_pin", "釘選"),
+        ("t", "edit_tags", "標籤"),
+        ("u", "toggle_read", "已讀"),
+        ("r", "restore_task", "撈回主頁"),
+        ("g", "toggle_history_mode", "表格／分組"),
+        ("space", "toggle_history_group", "收合專案組"),
+        ("slash", "search_history", "搜尋"),
+        ("escape", "clear_history_search", "清除搜尋"),
     ]
 
     def __init__(
         self,
         runs_path: Path = DEFAULT_RUNS_TSV,
         done_path: Path = DEFAULT_DONE_TSV,
+        state_path: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
         self.done_path = done_path
+        self.state = WatchState(state_path)
+        self.state_message = self.state.warning
         self.log_parser = LogParser()
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
@@ -3171,6 +3454,16 @@ class AgentWatchApp(App):
         self._row_widgets: Dict[str, TaskRow] = {}
         self._board_structure: Any = None
         self.layout_mode = "stacked"
+        self.history_grouped = False
+        self.history_collapsed: Set[str] = set()
+        self.history_query = ""
+        self.history_filters = dict(project="", tag="", read="", hidden="")
+        self.history_rows: List[Tuple[str, str]] = []
+        self._history_snapshot: Any = None
+        self._history_options: Any = None
+        self._now = time.time()
+        self._preview_read_key: Optional[str] = None
+        self._last_preview_key: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
@@ -3182,6 +3475,7 @@ class AgentWatchApp(App):
                 yield NavTab(f"[{number}] {label}", tab_id)
             yield Label("", id="clock")
         yield Static("額度：載入中...", id="compact-quota-line")
+        yield Static(self.state_message, id="state-message", markup=False)
 
         with TabbedContent(initial="tab-work", id="main-tabs"):
             with TabPane("[1] 工作", id="tab-work"):
@@ -3204,8 +3498,17 @@ class AgentWatchApp(App):
                             yield Static("尚無即時日誌", id="bottom-log-content", markup=False)
 
             with TabPane("[2] 歷史", id="tab-history"):
-                with VerticalScroll():
-                    yield Static(id="history-display")
+                with Vertical(id="history-page"):
+                    yield Input(placeholder="/ 搜尋名稱、專案、標籤、結果摘要", id="history-search")
+                    with Horizontal(id="history-filters"):
+                        yield Select([("專案：全部", "")], value="", allow_blank=False, id="filter-project")
+                        yield Select([("標籤：全部", "")], value="", allow_blank=False, id="filter-tag")
+                        yield Select([("已讀：全部", ""), ("已讀", "read"), ("未讀", "unread")],
+                                     value="", allow_blank=False, id="filter-read")
+                        yield Select([("隱藏：全部", ""), ("已隱藏", "hidden"), ("未隱藏", "visible")],
+                                     value="", allow_blank=False, id="filter-hidden")
+                    yield Static(id="history-display", markup=False)
+                    yield HistoryTable(id="history-table", cursor_type="row", zebra_stripes=True)
             with TabPane("[3] 額度", id="tab-quota"):
                 with VerticalScroll(id="quota-scroll"):
                     yield Static(id="quota-display")
@@ -3235,20 +3538,38 @@ class AgentWatchApp(App):
         self.query_one("#work-page").set_class(self.layout_mode == "split", "wide")
 
     def update_board(self, agents: List[AgentInfo], now: float, width: int) -> None:
-        attention = [a for a in agents if board_bucket(a, now) == "attention"]
-        groups = work_board_groups(
-            [a for a in agents if board_bucket(a, now) in ("running", "recent")], now,
+        attention = [a for a in agents if self.state.bucket(a, now) == "attention"]
+        pinned = [a for a in agents if self.state.task(a.key).get("pinned")
+                  and self.state.bucket(a, now) not in ("attention", "hidden")
+                  and not self.state.task(a.key).get("done_manual")
+                  and not self.state.data["projects"].get(a.project, {}).get("collapsed")]
+        pinned_keys = {a.key for a in pinned}
+        groups = group_agents_by_project(
+            [a for a in agents if self.state.bucket(a, now) in ("running", "recent")
+             and a.key not in pinned_keys],
         )
+        for tasks in groups.values():
+            tasks.sort(key=lambda a: (
+                0 if self.state.bucket(a, now) == "running" else 1,
+                -(a.start_time or 0) if a.status == "running" else -(done_timestamp(a) or 0),
+                a.key,
+            ))
+        groups = dict(sorted(groups.items(), key=lambda item: (
+            min(0 if a.status == "running" else 1 for a in item[1]),
+            -max((done_timestamp(a) or 0 for a in item[1] if is_done_agent(a)), default=0),
+            project_sort_key(item[0]),
+        )))
         visible_groups = []
         for project, tasks in groups.items():
-            running = [a for a in tasks if board_bucket(a, now) == "running"]
-            recent = [a for a in tasks if board_bucket(a, now) == "recent"]
+            running = [a for a in tasks if self.state.bucket(a, now) == "running"]
+            recent = [a for a in tasks if self.state.bucket(a, now) == "recent"]
             visible = running + (recent if self.expand_recent else recent[:3])
             visible_groups.append(
                 (project, visible, len(recent) - min(3, len(recent)), len(recent))
             )
         structure = (
             tuple(a.key for a in attention),
+            tuple(a.key for a in pinned),
             tuple(
                 (project, tuple(a.key for a in tasks), extra, recent_count)
                 for project, tasks, extra, recent_count in visible_groups
@@ -3265,6 +3586,11 @@ class AgentWatchApp(App):
         board.remove_children()
         attention_list = self.query_one("#attention-list", Vertical)
         attention_list.remove_children()
+        pinned_box = self.query_one("#pinned-box", Vertical)
+        pinned_box.remove_children()
+        pinned_box.border_title = "釘選 · %d/5" % sum(
+            bool(entry.get("pinned")) for entry in self.state.data["tasks"].values()
+        )
         self._row_widgets = {}
 
         def row(agent: AgentInfo) -> TaskRow:
@@ -3279,6 +3605,9 @@ class AgentWatchApp(App):
         self.query_one("#attention-box").border_title = (
             f"需處理 · {len(attention)} · 等回答／卡住／失敗／無報告"
         )
+        pinned_box.mount(*([row(a) for a in pinned] if pinned else [
+            Static("尚無可顯示的釘選", classes="empty-row"),
+        ]))
         sections = []
         for project, tasks, extra, recent_count in visible_groups:
             children = [row(a) for a in tasks]
@@ -3299,7 +3628,7 @@ class AgentWatchApp(App):
         if self.selected_key not in self._row_widgets:
             self.selected_key = next(iter(self._row_widgets), None)
         self.call_after_refresh(self.restore_selection, restore_focus)
-        history_count = sum(board_bucket(agent, now) == "history" for agent in agents)
+        history_count = sum(self.state.bucket(agent, now) in ("history", "hidden") for agent in agents)
         self.query_one("#history-summary", Static).update(f"歷史 {history_count} 筆")
 
     def update_board_timers(self, agents: List[AgentInfo], now: float, width: int) -> None:
@@ -3323,7 +3652,7 @@ class AgentWatchApp(App):
             self.update_selection()
 
     def update_selection(self) -> None:
-        for widget in self.query(".project-section, #attention-box"):
+        for widget in self.query(".project-section, #attention-box, #pinned-box"):
             widget.remove_class("selected")
         for key, row in self._row_widgets.items():
             row.selected = key == self.selected_key
@@ -3344,6 +3673,9 @@ class AgentWatchApp(App):
             title.update("尚未選中任務")
             content.update("目前沒有可預覽的任務")
             return
+        if followed.key != self._last_preview_key:
+            self._preview_read_key = None
+            self._last_preview_key = followed.key
         title.update(followed.name)
         lines = []
         for line in followed.log_lines:
@@ -3356,13 +3688,221 @@ class AgentWatchApp(App):
                 lines.extend(summary.splitlines())
         limit = 24 if self.layout_mode == "split" else 3
         content.update("\n".join(lines[-limit:]) if lines else followed.latest or "尚無即時日誌")
+        if (
+            self.query_one("#main-tabs", TabbedContent).active == "tab-work"
+            and board_bucket(followed, self._now) not in ("running", "attention")
+            and self._preview_read_key != followed.key
+            and not self.state.task(followed.key).get("read")
+        ):
+            # Reading is tied to a visible preview, not to history highlighting.
+            if self.state.update_task(followed.key, read=True, run_start=followed.start_time):
+                self._preview_read_key = followed.key
+                if followed.key in self._row_widgets:
+                    self._row_widgets[followed.key].refresh()
+            self.show_state_message(self.state.warning)
         self.call_after_refresh(self.scroll_preview_to_end)
+
+    def show_state_message(self, message: str) -> None:
+        self.state_message = message
+        if self._ui_ready:
+            self.query_one("#state-message", Static).update(message)
+
+    def selected_task(self) -> Optional[AgentInfo]:
+        tab = self.query_one("#main-tabs", TabbedContent).active
+        key = self.selected_key
+        if tab == "tab-history":
+            table = self.query_one("#history-table", DataTable)
+            if table.cursor_row >= len(self.history_rows):
+                return None
+            kind, key = self.history_rows[table.cursor_row]
+            if kind != "task":
+                return None
+        elif tab != "tab-work":
+            return None
+        return next((a for a in self.current_agents if a.key == key), None)
+
+    def operate(self, operation: str, tags: Optional[List[str]] = None,
+                task: Optional[AgentInfo] = None) -> None:
+        agent = task or self.selected_task()
+        if agent is None:
+            self.show_state_message("請先選擇一筆任務")
+            return
+        ok, message = self.state.apply(operation, agent, self.current_agents, self._now, tags)
+        self.show_state_message(message)
+        if ok:
+            if operation == "read":
+                self._preview_read_key = agent.key
+            self.last_snapshot = None
+            self.update_data()
+            if operation == "restore":
+                self.selected_key = agent.key
+                self.action_switch_tab("tab-work")
+
+    def action_hide_task(self) -> None:
+        self.operate("hide")
+
+    def action_finish_task(self) -> None:
+        self.operate("done")
+
+    def action_collapse_project(self) -> None:
+        self.operate("collapse")
+
+    def action_toggle_pin(self) -> None:
+        self.operate("pin")
+
+    def action_toggle_read(self) -> None:
+        self.operate("read")
+
+    def action_restore_task(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            self.operate("restore")
+
+    def action_edit_tags(self) -> None:
+        agent = self.selected_task()
+        if agent is None:
+            return
+
+        def saved(tags: Optional[List[str]]) -> None:
+            if tags is not None:
+                self.operate("tags", tags, agent)
+
+        self.push_screen(TagScreen(self.state.task(agent.key).get("tags", [])), saved)
+
+    def update_history(self) -> None:
+        table = self.query_one("#history-table", DataTable)
+        options = (
+            tuple(sorted({a.project for a in self.current_agents}, key=project_sort_key)),
+            tuple(sorted({tag for a in self.current_agents for tag in self.state.task(a.key).get("tags", [])})),
+        )
+        if options != self._history_options:
+            self._history_options = options
+            for field, values, label in (("project", options[0], "專案"), ("tag", options[1], "標籤")):
+                selector = self.query_one("#filter-" + field, Select)
+                selected = self.history_filters[field]
+                selector.set_options([(label + "：全部", "")] + [
+                    (project_label(value) if field == "project" else value, value) for value in values
+                ])
+                self.history_filters[field] = selected if selected in values else ""
+                selector.value = self.history_filters[field]
+        tasks = history_tasks(self.current_agents, self.state, self._now,
+                              self.history_query, **self.history_filters)
+        snapshot = (
+            self.history_grouped, tuple(sorted(self.history_collapsed)), self.size.width,
+            self.history_query, tuple(self.history_filters.items()),
+            tuple((a.key, a.completion_time, a.latest, a.status, a.project,
+                   json.dumps(self.state.task(a.key), sort_keys=True)) for a in tasks),
+        )
+        if snapshot == self._history_snapshot:
+            return
+        self._history_snapshot = snapshot
+        old_index = table.cursor_row
+        selected = self.history_rows[old_index] if old_index < len(self.history_rows) else None
+        table.clear(columns=True)
+        widths = [11, 10, 7, 15, max(17, self.size.width - 63), 5]
+        for name, width in zip(("時間", "專案", "標籤", "名稱", "結果摘要", "已讀"), widths):
+            table.add_column(name, width=width)
+        self.history_rows = []
+
+        def add_task(agent: AgentInfo) -> None:
+            entry = self.state.task(agent.key)
+            timestamp = done_timestamp(agent)
+            stamp = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M") if timestamp else "時間未知"
+            status = "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
+            disposition = "隱藏 · " if entry.get("hidden") else ""
+            cells = (stamp, project_label(agent.project), ", ".join(entry.get("tags", [])),
+                     agent.name, disposition + status + " · " + agent.latest,
+                     "已讀" if entry.get("read") else "●未讀")
+            table.add_row(*(Text(truncate_display(value, width),
+                                style="#737b91" if entry.get("read") else "bold #c4c9d4")
+                            for value, width in zip(cells, widths)))
+            self.history_rows.append(("task", agent.key))
+
+        if self.history_grouped:
+            for project, members in group_agents_by_project(tasks).items():
+                closed = project in self.history_collapsed
+                cells = ("▸ 專案" if closed else "▾ 專案", project_label(project), "",
+                         "%d 筆" % len(members), "Space / Enter 展開" if closed else "Space / Enter 收合", "")
+                table.add_row(*(Text(truncate_display(value, width), style="bold #9ece6a")
+                                for value, width in zip(cells, widths)))
+                self.history_rows.append(("project", project))
+                for agent in ([] if closed else members):
+                    add_task(agent)
+        else:
+            for agent in tasks:
+                add_task(agent)
+        index = self.history_rows.index(selected) if selected in self.history_rows else min(
+            old_index, max(0, len(self.history_rows) - 1),
+        )
+        table.move_cursor(row=index)
+        mode = "依專案分組" if self.history_grouped else "表格"
+        summary = "歷史 · %s · %d 筆" % (mode, len(tasks))
+        if not tasks:
+            summary += " · " + ("搜尋／篩選無符合任務" if self.history_query or any(
+                self.history_filters.values()) else "目前沒有歷史任務")
+        self.query_one("#history-display", Static).update(summary)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id and event.select.id.startswith("filter-") and event.value is not Select.BLANK:
+            field = event.select.id[len("filter-"):]
+            if self.history_filters[field] != event.value:
+                self.history_filters[field] = str(event.value)
+                self.update_history()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "history-search":
+            self.history_query = event.value
+            self.update_history()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "history-search":
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_search_history(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            search = self.query_one("#history-search", Input)
+            search.display = True
+            search.focus()
+
+    def action_clear_history_search(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            search = self.query_one("#history-search", Input)
+            search.value = ""
+            search.display = False
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_toggle_history_mode(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active == "tab-history":
+            self.history_grouped = not self.history_grouped
+            self.update_history()
+            self.query_one("#history-table", DataTable).focus()
+
+    def action_toggle_history_group(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active != "tab-history":
+            return
+        table = self.query_one("#history-table", DataTable)
+        if table.cursor_row < len(self.history_rows):
+            kind, project = self.history_rows[table.cursor_row]
+            if kind == "project":
+                if project in self.history_collapsed:
+                    self.history_collapsed.remove(project)
+                else:
+                    self.history_collapsed.add(project)
+                self.update_history()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id == "history-table":
+            self.action_toggle_history_group()
 
     def scroll_preview_to_end(self) -> None:
         self.query_one("#preview-scroll", VerticalScroll).scroll_end(animate=False)
 
     def move_task(self, delta: int) -> None:
-        if self.query_one("#main-tabs", TabbedContent).active != "tab-work":
+        tab = self.query_one("#main-tabs", TabbedContent).active
+        if tab == "tab-history":
+            table = self.query_one("#history-table", DataTable)
+            table.move_cursor(row=max(0, min(table.row_count - 1, table.cursor_row + delta)))
+            return
+        if tab != "tab-work":
             return
         keys = list(self._row_widgets)
         if not keys:
@@ -3388,20 +3928,33 @@ class AgentWatchApp(App):
         `q` intentionally stays enabled: the table itself advertises it, and
         leaving the dashboard is not a change to the hidden screen.
         """
-        if action in HELP_BLOCKED_ACTIONS and isinstance(self.screen, HelpScreen):
+        if action in HELP_BLOCKED_ACTIONS and isinstance(self.screen, ModalScreen):
+            return False
+        if isinstance(self.focused, Input) and action not in ("clear_history_search",):
             return False
         return True
 
     def action_switch_tab(self, tab_id: str) -> None:
         # Hiding a focused pane otherwise moves focus to its next task, whose
         # TabPane.Focused event would immediately activate the work tab again.
-        if isinstance(self.focused, TaskRow):
+        if isinstance(self.focused, (TaskRow, DataTable, Input, Select)):
             self.set_focus(None)
         self.query_one("#main-tabs", TabbedContent).active = tab_id
         for tab in self.query(NavTab):
             tab.set_class(tab.tab_id == tab_id, "current")
         if tab_id == "tab-work":
             self.call_after_refresh(self.restore_selection, True)
+            self.query_one("#key-bar", Static).update(
+                "h 隱藏 d 完成 c 收專案 i 釘 t 標籤 u 已讀 │ e 展開 │ 1–4 ? q"
+            )
+        elif tab_id == "tab-history":
+            self.update_history()
+            self.query_one("#history-table", DataTable).focus()
+            self.query_one("#key-bar", Static).update(
+                "/ 搜尋 Tab 篩選 g 表格/分組 Space 收合 r 撈回 │ i t u │ 1–4 ? q"
+            )
+        else:
+            self.query_one("#key-bar", Static).update("1–4 分頁 │ p 專案 n 現在 f 未來 │ ? 快捷鍵 q 離開")
 
     def action_show_architecture_now(self) -> None:
         self.set_architecture_view("now")
@@ -3499,7 +4052,8 @@ class AgentWatchApp(App):
             for a in agents
         )
         quota_data = json.dumps(quota_raw, ensure_ascii=False, sort_keys=True, default=str)
-        return (agent_snaps, quota_summary, quota_data, quota_stale, quota_error, errors)
+        return (agent_snaps, quota_summary, quota_data, quota_stale, quota_error, errors,
+                self.state.revision)
 
     def update_data(self, now: Optional[float] = None) -> bool:
         """
@@ -3508,6 +4062,7 @@ class AgentWatchApp(App):
         """
         if now is None:
             now = time.time()
+        self._now = now
         if self._ui_ready:
             self.query_one("#clock", Label).update(
                 time.strftime("%H:%M:%S", time.localtime(now))
@@ -3531,6 +4086,9 @@ class AgentWatchApp(App):
         error_snapshot = tuple(errors) + ((quota_error,) if quota_stale and quota_error else ())
         if self.ui_error:
             error_snapshot += (self.ui_error,)
+        self.state.reconcile(agents, now)
+        if self.state.warning and self.state.warning != self.state_message:
+            self.show_state_message(self.state.warning)
 
         # Handle completion notifications
         if not self.is_first_load:
@@ -3581,7 +4139,14 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        stats_str = format_bucket_counts(agents, now, board_bucket)
+        counts = {key: 0 for key in ("attention", "running", "recent", "history", "hidden")}
+        for agent in agents:
+            counts[self.state.bucket(agent, now)] += 1
+        stats_str = (
+            f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
+            f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
+            f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
+        )
         width = self.size.width if self._ui_ready else 80
 
         if not self._ui_ready:
@@ -3598,18 +4163,7 @@ class AgentWatchApp(App):
             data_errors.display = bool(errors_markup)
             self.update_board(agents, now, width)
             self.update_preview()
-            history = [a for a in agents if board_bucket(a, now) == "history"]
-            history_text = Text("歷史\n\n", style=BOARD_COLORS["history"])
-            for agent in history:
-                history_text.append(
-                    format_completion_time(done_timestamp(agent)) + " │ "
-                    + project_label(agent.project) + " │ " + agent.name + " │ "
-                    + ("已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)) + " │ "
-                    + agent.latest + "\n"
-                )
-            if not history:
-                history_text.append("目前沒有歷史任務")
-            self.query_one("#history-display", Static).update(history_text)
+            self.update_history()
 
             arch_markup = render_architecture_view(
                 agents,

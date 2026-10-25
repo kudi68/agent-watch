@@ -58,6 +58,7 @@ The dashboard is empty until at least one runs registry exists. The defaults are
 | runs root | `~/Projects/night` |
 | active registry | `~/Projects/night/agent-runs.tsv` |
 | archive registry | `~/Projects/night/agent-runs-done.tsv` |
+| dashboard state | `~/Projects/night/agent-watch-state.json` |
 
 `~/Projects/night` is **only a default**, not a hardcoded location: set
 `AGENT_WATCH_RUNS_ROOT` (or `AGENT_WATCH_RUNS` / `AGENT_WATCH_DONE`) to point
@@ -93,12 +94,53 @@ Start the full-screen dashboard in an interactive terminal:
 | Key | Action |
 | --- | --- |
 | `1` | Work tab (running / recent runs) |
-| `2` | Architecture tab |
+| `2` | History tab |
 | `3` | Quota tab |
-| `P` | Cycle the architecture tab's project |
-| `N` | Architecture tab: "now" view |
-| `F` | Architecture tab: "future" view |
-| `Q` | Quit |
+| `4` | Architecture tab |
+| `j` / `k`, arrows | Select next / previous task |
+| `e` | Work: expand / collapse recent completions |
+| `h` / `d` | Hide / move to completed history (ended tasks without attention only) |
+| `c` | Collapse the selected task's project; a new running task reopens it |
+| `i` | Pin / unpin selected task (maximum 5; the sixth is rejected) |
+| `t` | Edit free-form tags; commas separate tags; empty input clears them |
+| `u` | Toggle read / unread |
+| `/` | History: search name, project, tags and result summary |
+| `Tab` | History: focus project / tag / read / hidden filters |
+| `g` | History: switch table / project groups |
+| `Space` / `Enter` | History: collapse / expand selected project group |
+| `r` | History: bring selected task back to Work |
+| `p` / `n` / `f` | Architecture: cycle project / "now" / "future" view |
+| `?` | Full shortcut table; `Esc` / `?` returns |
+| `q` | Quit |
+
+### 歷史頁與看板狀態（v10 第③段）
+
+`2` 開啟歷史頁。欄位是時間、專案、標籤、名稱、結果摘要、已讀。主頁超過兩小時的
+完成任務、手動歸到已完成、隱藏及整個專案收起的任務都會出現在這裡。
+`/` 搜尋，不分英文大小寫；Enter 回清單，Esc 清除搜尋。上方四個下拉選單可以同時
+篩選專案、自由標籤、已讀／未讀、已隱藏／未隱藏。Tab 移動焦點，方向鍵與 Enter 選擇。
+
+`g` 在表格與依專案分組之間切換。每組內按完成時間由新到舊排序；選中綠色專案列，
+按 Space 或 Enter 收合／展開。分組模式沿用相同搜尋與篩選，收合狀態在本次開啟期間保留。
+選中任務按 `r` 取消隱藏與手動完成，展開所屬專案並回到工作頁。超過兩小時的任務也會
+留在工作頁，直到手動隱藏、歸到已完成或收起專案。
+
+工作頁選中已結束且無需處理的任務，`h` 隱藏，`d` 歸到已完成；進行中及需處理任務會拒絕。
+`c` 收起整個專案，專案有進行中／需處理任務時會拒絕；新任務開跑時自動重新出現。
+隱藏或手動完成的任務重跑時也會自動回主頁。`i` 釘選最多五個任務；隱藏／收起的釘選
+及手動完成的釘選不顯示在工作頁，但仍佔名額，可從歷史頁取消。
+需處理任務維持在紅框，不會因釘選重複顯示。
+`t` 設自由標籤，不會改 TSV 的專案欄。未讀任務顯示 `●`；完成後預設未讀，
+工作頁預覽實際顯示時自動已讀。歷史頁只選中列不會已讀，`u` 可手動切換。
+
+看板只將操作狀態寫入 `~/Projects/night/agent-watch-state.json`，可用 `AGENT_WATCH_STATE`
+另指定檔案。格式為 version 1，`tasks` 以既有的 `name::log::result` 為 key，保存
+hidden、done_manual、read、pinned、tags、updated_at；`projects` 保存 collapsed／collapsed_at。
+額外的 `restored` 與 `run_start` 用於撈回主頁與辨認重跑。寫入先建立同目錄暫存檔、flush／fsync，
+再 atomic rename；寫入失敗時保留原檔與記憶體狀態。不存在或格式損壞時使用空狀態，
+畫面只保留一則提示，不會反覆跳通知。第一次成功操作才建立／替換 state 檔。
+本版不處理多個看板同時寫入的鎖定，最後寫入者覆蓋較早的狀態。
+看板不寫入派工 TSV，`--once` 維持原本的唯讀摘要，不讀寫操作狀態。
 
 Run once and print a plain-text summary instead of the full-screen UI (works
 without a TTY, useful for logs and CI):
@@ -122,6 +164,7 @@ Everything machine-specific is read from the environment. CLI flags `--runs` and
 | `AGENT_WATCH_RUNS_ROOT` | `~/Projects/night` (default only) | Base directory for relative paths inside the TSVs |
 | `AGENT_WATCH_RUNS` | `$AGENT_WATCH_RUNS_ROOT/agent-runs.tsv` | Active-runs registry |
 | `AGENT_WATCH_DONE` | `$AGENT_WATCH_RUNS_ROOT/agent-runs-done.tsv` | Archive registry |
+| `AGENT_WATCH_STATE` | `~/Projects/night/agent-watch-state.json` | Dashboard-owned state; independent of runs root |
 | `AGENT_WATCH_CODEX_SESSIONS` | `~/.codex/sessions` | Codex session logs used for quota |
 | `AGENT_WATCH_ARCH` | `arch.json` next to `watch.py` | Architecture graph definition |
 | `AGENT_WATCH_MAGPIE` | `magpie` | Executable used for `quota --json` |
