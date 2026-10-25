@@ -170,14 +170,16 @@ Optional `match_patterns` contain regular expressions for names and paths.
 Missing, invalid, or unreadable architecture JSON falls back to an internal graph
 with one warning. Edges must still join adjacent layers.
 
-Elapsed time prefers column 8, then trusted PID start evidence supplied through
-`LogParser(process_start_reader=...)`, then log timestamps or file birthtime.
-This checkout's process policy permits only `pgrep -l`, which cannot provide
-`lstart`; the default reader therefore skips the PID start source rather than
-executing `ps`. Tests inject this source. Log/birthtime estimates display `~12m`;
-missing evidence displays `時間未知`. Reused log prefixes do not establish a new
-invocation's start after an older report. A new Claude init event resets the start.
-Lines without timestamps have no fabricated clock prefix.
+Elapsed time prefers column 8, then a live PID's start time from
+`ps -o lstart= -p <pid>` (queried once per PID, with `LC_ALL=C` so the output parses),
+then log timestamps or file birthtime. The PID source is only consulted while
+`pgrep -l` reports the process as alive, and a failed or unparsable `ps` lookup
+falls through to the estimate instead of guessing a start. Tests can still inject
+`LogParser(process_start_reader=...)` or pass `None` to disable the source.
+Log/birthtime estimates display `~12m`; missing evidence displays `時間未知`.
+Reused log prefixes do not establish a new invocation's start after an older
+report. A new Claude init event resets the start. Lines without timestamps have
+no fabricated clock prefix.
 
 Claude `--print --output-format stream-json --verbose` logs support `system`,
 `assistant`, `user`, and `result`: text becomes the preview, tool calls show a

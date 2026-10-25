@@ -638,18 +638,52 @@ class AgentInfo:
     elapsed_estimated: bool = False
 
 
+# Sentinel so an injected reader and the built-in `ps` reader stay distinct:
+# passing None still disables the PID source explicitly.
+DEFAULT_PROCESS_START_READER = object()
+
+
 class LogParser:
     """Parse changed log bytes only; log text never determines the final status."""
 
     MAX_INITIAL_READ = 2 * 1024 * 1024
     START_SCAN_BYTES = 64 * 1024
+    PID_START_CACHE_LIMIT = 512
 
-    def __init__(self, process_start_reader: Optional[Callable[[int], Optional[float]]] = None):
+    def __init__(
+        self,
+        process_start_reader: Any = DEFAULT_PROCESS_START_READER,
+    ):
         self.cache: Dict[str, dict] = {}
-        # The operator policy permits pgrep only. A caller may supply trusted
-        # PID start evidence, but the dashboard never invokes ps.
-        self.process_start_reader = process_start_reader
+        # SPEC §4.1 layer 2: a live PID's `ps -o lstart=` start time sits
+        # between the TSV's started_at and the log/birthtime estimate.
+        if process_start_reader is DEFAULT_PROCESS_START_READER:
+            process_start_reader = read_process_start
+        self.process_start_reader: Optional[Callable[[int], Optional[float]]] = process_start_reader
+        self.pid_start_cache: Dict[int, Optional[float]] = {}
         self.result_events: Dict[str, Tuple[Optional[float], str]] = {}
+
+    def pid_start_time(self, pid: Optional[int]) -> Optional[float]:
+        """Return a live PID's start time; a successful lookup is cached per PID."""
+        if pid is None or self.process_start_reader is None:
+            return None
+        if pid in self.pid_start_cache:
+            return self.pid_start_cache[pid]
+        try:
+            value = self.process_start_reader(pid)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            value = None
+        # A start after `now` cannot describe an already-running process;
+        # treat it as unusable rather than showing a negative elapsed time.
+        if value is not None and (not isinstance(value, (int, float)) or value > time.time() + 60):
+            value = None
+        if value is not None:
+            # A process's start time never changes, so cache the hit; a miss is
+            # retried on the next poll in case `ps` was only briefly unavailable.
+            if len(self.pid_start_cache) >= self.PID_START_CACHE_LIMIT:
+                self.pid_start_cache.clear()
+            self.pid_start_cache[pid] = value
+        return value
 
     @staticmethod
     def _summarize(raw_line: bytes, mtime: float) -> Tuple[Optional[float], Optional[str], Optional[str]]:
@@ -990,6 +1024,51 @@ def is_pid_alive(pid: int) -> Optional[bool]:
         return None
 
 
+def parse_process_lstart(text: str) -> Optional[float]:
+    """Parse `ps -o lstart=` output ("Sun Oct 25 10:00:00 2026") as epoch seconds."""
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return None
+    try:
+        parsed = time.strptime(normalized, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    try:
+        return time.mktime(parsed)
+    except (OverflowError, ValueError):
+        return None
+
+
+def read_process_start(pid: int, now: Optional[float] = None) -> Optional[float]:
+    """SPEC §4.1 layer 2: read a live PID's start time from `ps -o lstart=`.
+
+    Returns None whenever the process is gone, `ps` fails, or the output cannot
+    be parsed, so the caller can fall back to the log/birthtime estimate.
+    """
+    if pid <= 0:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            # `lstart` is locale dependent; pin C so %a/%b stay parseable.
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    started = parse_process_lstart(result.stdout or "")
+    if started is None:
+        return None
+    if now is not None and started > now + 60:
+        return None
+    return started
+
+
 def determine_status(
     is_done_file: bool,
     last_valid: bool,
@@ -1076,11 +1155,8 @@ def build_agent(
 
     elapsed_start = started_at
     start_source = "tsv" if started_at is not None else ""
-    if elapsed_start is None and pid_alive is True and log_parser.process_start_reader is not None:
-        try:
-            elapsed_start = log_parser.process_start_reader(pid)
-        except (OSError, ValueError):
-            elapsed_start = None
+    if elapsed_start is None and pid_alive is True:
+        elapsed_start = log_parser.pid_start_time(pid)
         if elapsed_start is not None:
             start_source = "pid"
     if elapsed_start is None:

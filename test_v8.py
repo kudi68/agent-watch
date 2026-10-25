@@ -1,6 +1,7 @@
 """v8 regressions at TSV, quota and rendered-output boundaries."""
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -103,6 +104,14 @@ class StatusRegressions(unittest.TestCase):
             self.assertTrue(watch.is_pid_alive(1234))
         self.assertIsNone(watch.is_pid_alive(0))
 
+    def test_real_ps_lstart_matches_this_process(self):
+        started = watch.read_process_start(os.getpid())
+        self.assertIsNotNone(started)
+        self.assertEqual(started, int(started))
+        self.assertLessEqual(started, time.time() + 1)
+        self.assertGreater(started, time.time() - 3600)
+        self.assertEqual(started, watch.read_process_start(os.getpid()))
+
 
 class V10DataRegressions(unittest.TestCase):
     fixtures = Path(__file__).parent / "tests" / "fixtures"
@@ -163,12 +172,121 @@ class V10DataRegressions(unittest.TestCase):
                                           pid=1234, started_at=self.start)
                 reader.assert_not_called()
                 pid = watch.build_agent("Task", str(log), str(report), False, parser, self.now, pid=1234)
-                unknown = watch.build_agent("Task", str(log), str(report), False, watch.LogParser(), self.now, pid=1234)
+                unknown = watch.build_agent("Task", str(log), str(report), False,
+                                             watch.LogParser(process_start_reader=None), self.now, pid=1234)
             self.assertEqual(exact.elapsed, "00:12:00")
             self.assertEqual(pid.elapsed, "00:11:00")
             self.assertEqual(pid.start_source, "pid")
             self.assertEqual(unknown.elapsed, "時間未知")
             self.assertEqual(exact.status, "running")
+
+    def test_process_lstart_parsing_and_ps_invocation(self):
+        expected = time.mktime(time.strptime("2026-10-25 10:00:00", "%Y-%m-%d %H:%M:%S"))
+        with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout="Sun Oct 25 10:00:00 2026\n")) as run:
+            self.assertEqual(watch.read_process_start(4321), expected)
+        self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "4321"])
+        self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+        self.assertEqual(
+            watch.parse_process_lstart("Sun Oct  5 09:08:07 2026"),
+            time.mktime(time.strptime("2026-10-05 09:08:07", "%Y-%m-%d %H:%M:%S")),
+        )
+        self.assertIsNone(watch.parse_process_lstart(""))
+        self.assertIsNone(watch.parse_process_lstart("not a start time"))
+
+    def test_process_start_reader_failure_modes_return_none(self):
+        for result in (
+            Mock(returncode=1, stdout=""),
+            Mock(returncode=0, stdout=""),
+            Mock(returncode=0, stdout="garbage output"),
+        ):
+            with self.subTest(stdout=result.stdout, returncode=result.returncode), \
+                    patch("watch.subprocess.run", return_value=result):
+                self.assertIsNone(watch.read_process_start(4321))
+        with patch("watch.subprocess.run", side_effect=OSError("ps unavailable")):
+            self.assertIsNone(watch.read_process_start(4321))
+        with patch("watch.subprocess.run", side_effect=subprocess.TimeoutExpired("ps", 3)):
+            self.assertIsNone(watch.read_process_start(4321))
+        with patch("watch.subprocess.run") as run:
+            self.assertIsNone(watch.read_process_start(0))
+            run.assert_not_called()
+
+    def test_default_priority_is_tsv_then_live_pid_then_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_text("2026-10-25T10:00:00Z session start\nworking\n")
+            report.write_text("DONE\n")
+            ps_reader = Mock(return_value=self.start + 120)
+            # Default wiring, no injection: the parser itself must reach `ps`.
+            with patch("watch.read_process_start", ps_reader), \
+                    patch("watch.is_pid_alive", return_value=True):
+                parser = watch.LogParser()
+                via_tsv = watch.build_agent("Task", str(log), str(report), False, parser,
+                                            self.now, pid=1234, started_at=self.start)
+                ps_reader.assert_not_called()
+                via_pid = watch.build_agent("Task", str(log), str(report), False, parser,
+                                            self.now, pid=1234)
+            self.assertEqual(via_tsv.start_source, "tsv")
+            self.assertEqual(via_tsv.elapsed, "00:12:00")
+            self.assertEqual(via_pid.start_source, "pid")
+            self.assertFalse(via_pid.elapsed_estimated)
+            self.assertEqual(via_pid.elapsed, "00:10:00")
+
+    def test_pid_start_source_is_skipped_unless_pid_is_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_text("2026-10-25T10:00:00Z session start\nworking\n")
+            report.write_text("DONE\n")
+            reader = Mock(return_value=self.start + 120)
+            parser = watch.LogParser(process_start_reader=reader)
+            for alive in (False, None):
+                with self.subTest(alive=alive), patch("watch.is_pid_alive", return_value=alive):
+                    agent = watch.build_agent("Task", str(log), str(report), False, parser,
+                                              self.now, pid=1234)
+                self.assertNotEqual(agent.start_source, "pid")
+                reader.assert_not_called()
+
+    def test_pid_start_time_is_read_once_and_bad_values_are_dropped(self):
+        reader = Mock(return_value=self.start)
+        parser = watch.LogParser(process_start_reader=reader)
+        self.assertEqual(parser.pid_start_time(1234), self.start)
+        self.assertEqual(parser.pid_start_time(1234), self.start)
+        reader.assert_called_once_with(1234)
+        self.assertIsNone(parser.pid_start_time(None))
+        # A failed lookup is retried on the next poll instead of being cached.
+        retry = Mock(side_effect=[None, self.start])
+        recovering = watch.LogParser(process_start_reader=retry)
+        self.assertIsNone(recovering.pid_start_time(4321))
+        self.assertEqual(recovering.pid_start_time(4321), self.start)
+        future = watch.LogParser(process_start_reader=Mock(return_value=time.time() + 3600))
+        self.assertIsNone(future.pid_start_time(4321))
+        broken = watch.LogParser(process_start_reader=Mock(side_effect=OSError("denied")))
+        self.assertIsNone(broken.pid_start_time(4321))
+        disabled = watch.LogParser(process_start_reader=None)
+        self.assertIsNone(disabled.pid_start_time(4321))
+
+    def test_live_process_uses_ps_lstart_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            # A stale log start proves the live PID wins over the estimate.
+            log.write_text("2026-10-20T10:00:00Z stale session start\nworking\n")
+            runs, done = root / "runs.tsv", root / "done.tsv"
+            proc = subprocess.Popen(["sleep", "60"])
+            try:
+                runs.write_text(f"Live pid\t{log}\t{report}\t{proc.pid}\n")
+                done.write_text("")
+                expected = watch.read_process_start(proc.pid)
+                agents, errors = watch.load_all_agents(runs, done)
+            finally:
+                proc.terminate()
+                proc.wait()
+        self.assertEqual(errors, [])
+        self.assertEqual(agents[0].start_source, "pid")
+        self.assertFalse(agents[0].elapsed_estimated)
+        self.assertEqual(agents[0].start_time, expected)
+        self.assertNotIn("~", agents[0].elapsed)
 
     def test_estimate_and_all_sources_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
