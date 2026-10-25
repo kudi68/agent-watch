@@ -131,12 +131,12 @@ test accepts `NIGHT_WATCH_SCRIPT` to point at a different copy of that helper.
 
 ## TSV format
 
-One run per line, tab-separated, 3 to 6 columns. Blank lines and lines starting with
+One run per line, tab-separated, 3 to 8 columns. Blank lines and lines starting with
 `#` are ignored. Relative log/report paths are resolved against
 `AGENT_WATCH_RUNS_ROOT`.
 
 ```text
-name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model
+name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model<TAB>project<TAB>started_at
 ```
 
 | Column | Required | Notes |
@@ -147,6 +147,8 @@ name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model
 | `pid` | no | Process id; a live PID means "running" |
 | `harness` | no | Display label, for example `agent-a` |
 | `model` | no | Display label, for example `model-x` |
+| `project` | no | Configured project ID or case-insensitive alias; explicit values override inference |
+| `started_at` | no | ISO 8601 timestamp with timezone, for example `2026-10-25T18:00:00+08:00` |
 
 Example:
 
@@ -159,6 +161,39 @@ Project grouping and the architecture tab are configured in `arch.json`. Point
 `AGENT_WATCH_ARCH` at your own file to describe your projects and workers; the bundled
 file is an example and is validated at startup.
 
+The bundled project table includes `personal-ai-os` (`pai`), `agent-watch` (`aw`),
+`ios-shortcuts` (`ios`), and `K1`, plus the original example projects. Unknown explicit
+projects go to `other` with one data warning. Inferred keywords use alphanumeric
+boundaries (`misc-task` does not match `sc-`, and `desk1` does not match `K1`);
+a keyword ending in punctuation such as `sc-` is a delimited prefix.
+Optional `match_patterns` contain regular expressions for names and paths.
+Missing, invalid, or unreadable architecture JSON falls back to an internal graph
+with one warning. Edges must still join adjacent layers.
+
+Elapsed time prefers column 8, then trusted PID start evidence supplied through
+`LogParser(process_start_reader=...)`, then log timestamps or file birthtime.
+This checkout's process policy permits only `pgrep -l`, which cannot provide
+`lstart`; the default reader therefore skips the PID start source rather than
+executing `ps`. Tests inject this source. Log/birthtime estimates display `~12m`;
+missing evidence displays `時間未知`. Reused log prefixes do not establish a new
+invocation's start after an older report. A new Claude init event resets the start.
+Lines without timestamps have no fabricated clock prefix.
+
+Claude `--print --output-format stream-json --verbose` logs support `system`,
+`assistant`, `user`, and `result`: text becomes the preview, tool calls show a
+short name/argument summary, and init supplies the model. Result events classify
+completion or failure after the PID ends; a live PID always wins. Timestamp-free
+result events use the log's modification time for completion freshness, without
+adding that time to individual lines. No Claude session directory is scanned.
+Result reports require an explicit status line; prose mentioning completion is
+only `reported`. New log activity invalidates an older report, branch commits
+must postdate this invocation, and `PROGRESS.md` beside the log must be newer
+than its start. Terminal and waiting transitions notify once per run/status.
+
+The Textual timer schedules one background data reader for TSV/log/report/git
+I/O. Rendering and elapsed counters consume snapshots, so a slow disk or git
+command does not block tab changes.
+
 ## Tests
 
 ```bash
@@ -170,6 +205,19 @@ The Python suite covers status inference, TSV parsing, project grouping, quota
 parsing, rendering, and Textual screenshots. The bash suite exercises
 `scripts/night-watch.sh`, the small helper that decides whether a detached run has
 finished.
+
+v10 fixtures are `tests/fixtures/runs_v10.tsv`, `claude_stream.jsonl`, and
+`opencode_stream.jsonl`; they do not depend on the dispatcher's concurrent work.
+To persist v10's Textual 80x40 / 120x40 work and architecture text snapshots:
+
+```bash
+AGENT_WATCH_UPDATE_SHOTS=1 .venv/bin/python -m unittest \
+  test_watch.V10ScreenAndWorkerTests.test_v10_fixture_snapshots_and_registry_mtimes
+```
+
+The fixture tests compare registry bytes and nanosecond mtimes before/after reads.
+The worker test blocks simulated file I/O while measuring `poll_data < 200ms`
+and switching tabs. It proves headless responsiveness, not a live ten-minute run.
 
 ## Layout
 

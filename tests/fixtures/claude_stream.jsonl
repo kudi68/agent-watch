@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","timestamp":"2026-10-25T10:00:00Z","model":"claude-sonnet-fixture","session_id":"fixture-only"}
+{"type":"user","timestamp":"2026-10-25T10:00:01Z","message":{"content":[{"type":"text","text":"檢查 fixture 資料"}]}}
+{"type":"assistant","timestamp":"2026-10-25T10:00:05Z","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"fixture.py"}}]}}
+{"type":"assistant","timestamp":"2026-10-25T10:00:10Z","message":{"content":[{"type":"text","text":"Claude fixture 最新一句"}]}}

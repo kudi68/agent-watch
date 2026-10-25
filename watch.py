@@ -2,6 +2,7 @@
 """agent-watch v8: Textual dashboard for reliable run status and quota monitoring."""
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -16,7 +17,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from rich.markup import escape
@@ -56,6 +57,8 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     """Load and validate the editable architecture graph from JSON."""
     source = Path(path) if path is not None else ARCHITECTURE_PATH
     data = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("arch.json must be an object")
     projects = data.get("projects")
     architectures = data.get("architectures")
     if not isinstance(projects, dict) or not projects:
@@ -66,6 +69,13 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     for project_id, project in projects.items():
         if not isinstance(project, dict) or not project.get("label"):
             raise ValueError(f"project {project_id!r} has no label")
+        for key in ("aliases", "match_keywords", "path_keywords", "match_patterns"):
+            values = project.get(key, [])
+            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                raise ValueError(f"project {project_id!r} has invalid {key}")
+            if key == "match_patterns":
+                for pattern in values:
+                    re.compile(pattern)
         default_view = project.get("default_view", "now")
         if default_view not in architectures:
             raise ValueError(f"project {project_id!r} uses unknown architecture {default_view!r}")
@@ -78,6 +88,10 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
         edges = view.get("edges")
         if not isinstance(nodes, dict) or not isinstance(layers, list) or not layers:
             raise ValueError(f"architecture {view_id!r} has invalid nodes or layers")
+        if not all(isinstance(node, dict) for node in nodes.values()):
+            raise ValueError(f"architecture {view_id!r} has invalid node definitions")
+        if edges is not None and not isinstance(edges, list):
+            raise ValueError(f"architecture {view_id!r} has invalid edges")
         layer_by_node = {}
         for layer_index, layer in enumerate(layers):
             if not isinstance(layer, list) or not layer:
@@ -98,7 +112,29 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     return data
 
 
-ARCHITECTURE_DATA = load_architecture_data()
+FALLBACK_ARCHITECTURE = {
+    "projects": {"other": {"label": "其他", "default_view": "now"}},
+    "architectures": {
+        "now": {
+            "label": "現在", "caption": "架構資料無法讀取", "layers": [["operator"]],
+            "nodes": {"operator": {"label": "Operator", "kind": "actor"}}, "edges": [],
+        }
+    },
+}
+ARCHITECTURE_DATA: Dict[str, Any] = {}
+ARCHITECTURE_ERRORS: List[str] = []
+
+
+def ensure_architecture_data() -> None:
+    """Load at runtime, keeping a usable graph and one warning on bad input."""
+    if ARCHITECTURE_DATA:
+        return
+    try:
+        data = load_architecture_data()
+    except (OSError, ValueError, TypeError, KeyError, re.error) as exc:
+        data = copy.deepcopy(FALLBACK_ARCHITECTURE)
+        ARCHITECTURE_ERRORS[:] = [f"arch.json 無法讀取，使用預設架構：{exc}"]
+    ARCHITECTURE_DATA.update(data)
 PROJECT_OTHER = "other"
 RECENT_DONE_SECONDS = 2 * 60 * 60
 # Tolerate small clock skew so a just-finished task is not aged into history.
@@ -115,9 +151,20 @@ QUOTA_PROVIDER_NAMES = {
 
 def keyword_matches(keyword: str, text: str) -> bool:
     token = keyword.casefold()
-    if re.fullmatch(r"[a-z0-9]{1,3}", token):
-        return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text) is not None
-    return token in text
+    return bool(token) and re.search(
+        rf"(?<![a-z0-9]){re.escape(token)}" + (r"(?![a-z0-9])" if token[-1:].isalnum() else ""),
+        text.casefold(),
+    ) is not None
+
+
+def resolve_project(value: str) -> Tuple[str, str]:
+    ensure_architecture_data()
+    for project_id, config in ARCHITECTURE_DATA["projects"].items():
+        if value.casefold() in [project_id.casefold()] + [
+            alias.casefold() for alias in config.get("aliases", [])
+        ]:
+            return project_id, ""
+    return PROJECT_OTHER, f"未知專案：{value}"
 
 
 def infer_project(
@@ -126,6 +173,7 @@ def infer_project(
     last_path: Optional[Path] = None,
 ) -> str:
     """Map a task to the configured project table; unknown tasks use other."""
+    ensure_architecture_data()
     name_text = name.casefold()
     path_text = " ".join(
         str(path) for path in (log_path, last_path) if path is not None
@@ -140,6 +188,8 @@ def infer_project(
             for keyword in name_keywords
         ):
             return project_id
+        if any(re.search(pattern, name_text + " " + path_text, re.IGNORECASE) for pattern in config.get("match_patterns", [])):
+            return project_id
         if any(
             isinstance(keyword, str) and keyword_matches(keyword, path_text)
             for keyword in path_keywords
@@ -149,6 +199,7 @@ def infer_project(
 
 
 def project_label(project_id: str) -> str:
+    ensure_architecture_data()
     config = ARCHITECTURE_DATA.get("projects", {}).get(project_id)
     if isinstance(config, dict) and config.get("label"):
         return str(config["label"])
@@ -156,6 +207,7 @@ def project_label(project_id: str) -> str:
 
 
 def project_sort_key(project_id: str) -> Tuple[int, str]:
+    ensure_architecture_data()
     configured = list(ARCHITECTURE_DATA.get("projects", {}).keys())
     if project_id in configured:
         return configured.index(project_id), project_label(project_id)
@@ -318,6 +370,8 @@ def _identity_from_metadata_record(data: Dict[str, Any]) -> Tuple[str, str]:
             harness = _harness_value(item.get("harness"))
         if model == UNKNOWN_IDENTITY and item.get("model") is not None:
             model = _model_value(item.get("model"))
+    if event == "system" and data.get("subtype") == "init":
+        harness = "Claude Code"
     return harness, model
 
 
@@ -490,6 +544,39 @@ def format_elapsed(start_time: Optional[float], now: float) -> str:
 
 def summarize_jsonl_step(data: dict) -> str:
     """Produce a concise human-readable summary for an agy jsonl event."""
+    kind = data.get("type")
+    if kind == "system":
+        model = data.get("model", "")
+        return f"初始化 Claude ({model})" if model else "Claude 系統事件"
+    if kind in ("assistant", "user"):
+        message = data.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        if isinstance(content, str):
+            return clean_text(content)
+        summaries = []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                summaries.append(clean_text(block["text"]))
+            elif block.get("type") == "tool_use":
+                params = json.dumps(block.get("input", {}), ensure_ascii=False, separators=(",", ":"))
+                summaries.append(f"工具：{block.get('name', '未知')} {params[:100]}")
+        return " · ".join(summaries) or ("接收使用者指令" if kind == "user" else "")
+    if kind == "result":
+        result = clean_text(str(data.get("result") or ""))
+        failed = data.get("is_error") is True or str(data.get("subtype", "")).startswith("error")
+        return f"{'失敗' if failed else '完成'}：{result or data.get('subtype', '')}"
+    part = data.get("part")
+    if isinstance(part, dict):
+        if isinstance(part.get("text"), str):
+            return clean_text(part["text"])
+        if part.get("tool"):
+            return f"工具：{part['tool']}"
+    if kind in ("item.completed", "item.updated"):
+        item = data.get("item", {})
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            return clean_text(item["text"])
     event = data.get("event", "")
     if event == "init":
         model = data.get("init", {}).get("model", "")
@@ -514,7 +601,16 @@ def summarize_jsonl_step(data: dict) -> str:
         elif stype == "user_input":
             return "接收使用者指令"
         return f"步驟更新 ({stype} {state})"
-    return clean_text(str(data))[:60]
+    return clean_text(str(data.get("text") or data.get("message") or data.get("type") or event or "日誌事件"))[:120]
+
+
+def record_timestamp(data: Dict[str, Any]) -> Optional[float]:
+    value = data.get("timestamp")
+    if isinstance(value, (float, int)):
+        return float(value) / 1000 if value > 10**11 else float(value)
+    if value:
+        return parse_timestamp(str(value))
+    return None
 
 
 @dataclass
@@ -538,6 +634,8 @@ class AgentInfo:
     stage: str = ""
     harness: str = UNKNOWN_IDENTITY
     project: str = PROJECT_OTHER
+    start_source: str = ""
+    elapsed_estimated: bool = False
 
 
 class LogParser:
@@ -546,8 +644,12 @@ class LogParser:
     MAX_INITIAL_READ = 2 * 1024 * 1024
     START_SCAN_BYTES = 64 * 1024
 
-    def __init__(self):
+    def __init__(self, process_start_reader: Optional[Callable[[int], Optional[float]]] = None):
         self.cache: Dict[str, dict] = {}
+        # The operator policy permits pgrep only. A caller may supply trusted
+        # PID start evidence, but the dashboard never invokes ps.
+        self.process_start_reader = process_start_reader
+        self.result_events: Dict[str, Tuple[Optional[float], str]] = {}
 
     @staticmethod
     def _summarize(raw_line: bytes, mtime: float) -> Tuple[Optional[float], Optional[str], Optional[str]]:
@@ -555,7 +657,7 @@ class LogParser:
         if not line:
             return None, None, None
 
-        timestamp = parse_timestamp(line)
+        timestamp = parse_timestamp(line) if re.match(r"^20\d{2}[-/]", line) else None
         model = None
         if is_noise(line):
             return timestamp, model, None
@@ -564,14 +666,17 @@ class LogParser:
             try:
                 data = json.loads(line)
                 summary = summarize_jsonl_step(data) if isinstance(data, dict) else line
+                if isinstance(data, dict):
+                    timestamp = record_timestamp(data)
             except (json.JSONDecodeError, ValueError):
                 summary = line
         else:
             summary = line
 
-        match_clock = CLOCK_RE.search(line)
-        clock = match_clock.group(1) if match_clock else time.strftime("%H:%M:%S", time.localtime(mtime))
-        return timestamp, model, f"{clock}  {summary}"
+        if not summary:
+            return timestamp, model, None
+        clock = time.strftime("%H:%M:%S", time.localtime(timestamp)) if timestamp is not None else ""
+        return timestamp, model, f"{clock}  {summary}" if clock else summary
 
     def parse(self, path: Path) -> Tuple[Optional[float], str, List[str], float, str]:
         if str(path) == "/dev/null":
@@ -612,6 +717,8 @@ class LogParser:
         model = cached["model"] if append_only else UNKNOWN_IDENTITY
         recent = list(cached["recent"]) if append_only else []
         pending = cached["pending"] if append_only else b""
+        if not append_only:
+            self.result_events.pop(cache_key, None)
 
         try:
             with path.open("rb") as stream:
@@ -632,8 +739,8 @@ class LogParser:
                                 record = json.loads(text_line)
                             except ValueError:
                                 continue
-                            if isinstance(record, dict) and record.get("timestamp"):
-                                start_time = parse_timestamp(str(record["timestamp"]))
+                            if isinstance(record, dict) and record_timestamp(record) is not None:
+                                start_time = record_timestamp(record)
                                 break
                         if start_time is None:
                             start_time = getattr(st, "st_birthtime", None)
@@ -657,6 +764,21 @@ class LogParser:
                 ts, _, summary = self._summarize(raw_line.rstrip(b"\r"), st.st_mtime)
                 if start_time is None and ts is not None:
                     start_time = ts
+                try:
+                    record = json.loads(raw_line)
+                except ValueError:
+                    record = None
+                if isinstance(record, dict) and record.get("type") == "result":
+                    failed = record.get("is_error") is True or str(record.get("subtype", "")).startswith("error")
+                    self.result_events[cache_key] = (record_timestamp(record) or st.st_mtime, "failed" if failed else "complete")
+                elif summary:
+                    self.result_events.pop(cache_key, None)
+                if ts is not None and (
+                    (isinstance(record, dict) and record.get("type") == "system" and record.get("subtype") == "init")
+                    or re.search(rb"\bsession start\b", raw_line, re.IGNORECASE)
+                ):
+                    start_time = ts
+                    self.result_events.pop(cache_key, None)
                 if summary:
                     recent.append(summary)
 
@@ -709,10 +831,13 @@ def resolve_result_path(path: Path) -> Path:
     return max(existing, key=lambda candidate: candidate.stat().st_mtime)
 
 
-def read_progress_stage(directory: Path) -> str:
+def read_progress_stage(directory: Path, run_start: Optional[float] = None) -> str:
     """Return the last non-empty line in a sibling PROGRESS.md, if present."""
     try:
-        content = (directory / "PROGRESS.md").read_text(encoding="utf-8", errors="replace")
+        path = directory / "PROGRESS.md"
+        if run_start is None or path.stat().st_mtime <= run_start:
+            return ""
+        content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     return next((line.strip() for line in reversed(content.splitlines()) if line.strip()), "")
@@ -781,9 +906,10 @@ def find_new_branch_commit(path: Path, run_start: Optional[float]) -> Tuple[bool
             if not commit_time:
                 return False, None
             try:
-                return True, float(commit_time)
+                timestamp = float(commit_time)
+                return (True, timestamp) if run_start is not None and timestamp > run_start else (False, None)
             except ValueError:
-                return True, None
+                return False, None
 
         if has_base or run_start is None:
             return False, None
@@ -815,12 +941,12 @@ def last_status_from_content(content: str) -> Optional[str]:
 
     def status_value(word: str) -> str:
         upper = word.upper()
-        return "complete" if upper in ("DONE", "COMPLETE") else upper.lower()
+        return "complete" if upper in ("DONE", "COMPLETE") else "failed" if upper == "FAIL" else upper.lower()
 
     if normalized_lines:
         first_status = re.match(
             r"^(?:(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*)?"
-            r"(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+            r"(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             normalized_lines[0],
             re.IGNORECASE,
         )
@@ -828,9 +954,9 @@ def last_status_from_content(content: str) -> Optional[str]:
             return status_value(first_status.group(1))
 
     for line in normalized_lines:
-        status_field = re.search(
-            r"(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*"
-            r"(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+        status_field = re.match(
+            r"^(?:status|狀態|結論|判定|result|結果)\s*[:：]\s*"
+            r"(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             line,
             re.IGNORECASE,
         )
@@ -839,29 +965,13 @@ def last_status_from_content(content: str) -> Optional[str]:
 
     for line in normalized_lines:
         status_line = re.match(
-            r"^(DONE|COMPLETE|FAILED|BLOCKED|PARTIAL)\b",
+            r"^(DONE|COMPLETE|FAIL|FAILED|BLOCKED|PARTIAL)\b",
             line,
             re.IGNORECASE,
         )
         if status_line:
             return status_value(status_line.group(1))
 
-    for line in normalized_lines:
-        done_marker = re.search(r"\b(DONE|COMPLETE)\b", line)
-        if done_marker:
-            prefix = line[: done_marker.start()]
-            english_negation = re.search(
-                r"\b(?:not|never|no|isn't|wasn't)\b[^.!?]*$",
-                prefix,
-                re.IGNORECASE,
-            )
-            chinese_negation = re.search(r"(?:不是|並非|未|沒有)\s*$", prefix)
-            if not english_negation and not chinese_negation:
-                return "complete"
-
-    for line in lines[:20]:
-        if re.search(r"(?<!未)(?<!沒)(?<!有)(?<!法)(?<!能)(?:已完成|完成)", line):
-            return "complete"
     return None
 
 
@@ -870,13 +980,13 @@ def is_pid_alive(pid: int) -> Optional[bool]:
     if pid <= 0:
         return None
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
+        result = subprocess.run(
+            ["pgrep", "-l", "."], capture_output=True, text=True, timeout=3, check=False,
+        )
+        if result.returncode not in (0, 1):
+            return None
+        return any(line.split(maxsplit=1)[0] == str(pid) for line in result.stdout.splitlines() if line.strip())
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -893,9 +1003,10 @@ def determine_status(
     last_status: Optional[str] = None,
     has_new_commit: bool = False,
     process_alive: Optional[bool] = None,
+    inspect_process: bool = True,
 ) -> str:
     if pid is not None:
-        if process_alive is None:
+        if process_alive is None and inspect_process:
             process_alive = is_pid_alive(pid)
         if process_alive:
             return "running"
@@ -904,7 +1015,7 @@ def determine_status(
     if is_done_file:
         return (last_status or "reported") if last_valid else "no_report"
     run_start = start_time if start_time is not None else log_mtime
-    last_is_fresh = last_valid and last_mtime > run_start
+    last_is_fresh = last_valid and last_mtime > run_start and last_mtime >= log_mtime
     if last_is_fresh:
         return last_status or "reported"
     if has_new_commit:
@@ -934,6 +1045,8 @@ def build_agent(
     registration_time: Optional[float] = None,
     harness: Optional[str] = None,
     model: Optional[str] = None,
+    project: Optional[str] = None,
+    started_at: Optional[float] = None,
 ) -> AgentInfo:
     log_path = Path(log_str).expanduser()
     if not log_path.is_absolute():
@@ -947,7 +1060,6 @@ def build_agent(
     start_time, _, log_lines, log_mtime, log_err = log_parser.parse(log_path)
     result_path = resolve_result_path(last_path)
     last_content, last_mtime, last_valid, last_err = read_last_file(result_path)
-    stage = read_progress_stage(result_path.parent)
 
     data_err = row_error or log_err or last_err
     if not is_null_log and not log_path.exists():
@@ -962,11 +1074,27 @@ def build_agent(
         pid_alive,
     )
 
-    run_start_candidates = [value for value in (start_time, registration_time) if value is not None]
-    run_start = max(run_start_candidates) if run_start_candidates else log_mtime
-    elapsed_start = start_time if start_time is not None else registration_time
-    last_is_fresh = last_valid and last_mtime > run_start
+    elapsed_start = started_at
+    start_source = "tsv" if started_at is not None else ""
+    if elapsed_start is None and pid_alive is True and log_parser.process_start_reader is not None:
+        try:
+            elapsed_start = log_parser.process_start_reader(pid)
+        except (OSError, ValueError):
+            elapsed_start = None
+        if elapsed_start is not None:
+            start_source = "pid"
+    if elapsed_start is None:
+        elapsed_start = start_time
+        start_source = "log" if elapsed_start is not None else ""
+        # A result followed by new log activity proves reuse, but the old
+        # prefix cannot prove when this invocation began.
+        if last_valid and log_mtime > last_mtime and (elapsed_start or 0) <= last_mtime:
+            elapsed_start = None
+            start_source = ""
+    run_start = elapsed_start if elapsed_start is not None else log_mtime
+    last_is_fresh = last_valid and last_mtime > run_start and last_mtime >= log_mtime
     run_started = run_start if run_start > 0 else None
+    stage = read_progress_stage(log_path.parent, run_started)
     has_new_commit = False
     commit_time = None
     if pid_alive is not True and not is_done_file and not last_is_fresh:
@@ -985,7 +1113,16 @@ def build_agent(
         last_status=last_status,
         has_new_commit=has_new_commit,
         process_alive=pid_alive,
+        inspect_process=False,
     )
+    event_status = log_parser.result_events.get(str(log_path.resolve()))
+    if (
+        pid_alive is not True and not (pid is not None and pid_alive is None)
+        and not last_is_fresh and event_status is not None
+        and event_status[0] is not None and run_started is not None
+        and event_status[0] >= run_started
+    ):
+        status = event_status[1]
 
     is_terminal = status in {"complete", "failed", "blocked", "partial", "reported"}
     completion_time = None
@@ -996,12 +1133,17 @@ def build_agent(
             completion_time = last_mtime
         elif status == "complete" and has_new_commit:
             completion_time = commit_time or (last_mtime if last_valid else 0) or log_mtime or now
+        elif event_status and event_status[0] is not None:
+            completion_time = event_status[0]
     if completion_time is not None and elapsed_start is not None and elapsed_start > completion_time:
         elapsed_start = None
     elapsed = format_elapsed(elapsed_start, completion_time if completion_time is not None else now)
+    estimated = start_source == "log" and elapsed_start is not None
+    if estimated:
+        elapsed = "~" + elapsed
     key = f"{name}::{log_path}::{result_path}"
 
-    if is_terminal and last_content:
+    if is_terminal and last_content and (last_is_fresh or is_done_file):
         clean_last_lines = [
             clean_text(l) for l in last_content.splitlines() if clean_text(l) and not is_noise(clean_text(l))
         ]
@@ -1019,6 +1161,10 @@ def build_agent(
     else:
         latest = data_err or "尚無訊息"
 
+    resolved_project, project_error = resolve_project(project) if project else (
+        infer_project(name, log_path, result_path), ""
+    )
+    data_err = "；".join(value for value in (data_err, project_error) if value)
     return AgentInfo(
         name=name,
         log_path=log_path,
@@ -1038,7 +1184,9 @@ def build_agent(
         pid=pid,
         completion_time=completion_time,
         stage=stage,
-        project=infer_project(name, log_path, result_path),
+        project=resolved_project,
+        start_source=start_source,
+        elapsed_estimated=estimated,
     )
 
 
@@ -1064,8 +1212,8 @@ def load_tsv_agents(
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) not in (3, 4, 5, 6):
-            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 6 欄）")
+        if not 3 <= len(parts) <= 8:
+            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 8 欄）")
             continue
         name, log_p, last_p = parts[0].strip(), parts[1].strip(), parts[2].strip()
         if not name or not log_p or not last_p:
@@ -1085,6 +1233,17 @@ def load_tsv_agents(
                 pid = None
         harness = parts[4].strip() or None if len(parts) >= 5 else None
         model = parts[5].strip() or None if len(parts) >= 6 else None
+        project = parts[6].strip() or None if len(parts) >= 7 else None
+        started_at = None
+        if len(parts) >= 8 and parts[7].strip():
+            raw_start = parts[7].strip()
+            try:
+                parsed = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("timezone required")
+                started_at = parsed.timestamp()
+            except (ValueError, OverflowError, OSError):
+                errors.append(f"{tsv_path.name} 第 {line_num} 行 started_at 格式錯誤（需 ISO 8601 含時區）")
 
         agents.append(
             build_agent(
@@ -1099,6 +1258,8 @@ def load_tsv_agents(
                 registration_time=registration_time,
                 harness=harness,
                 model=model,
+                project=project,
+                started_at=started_at,
             )
         )
 
@@ -1111,6 +1272,7 @@ def load_all_agents(
     log_parser: Optional[LogParser] = None,
     now: Optional[float] = None,
 ) -> Tuple[List[AgentInfo], List[str]]:
+    ensure_architecture_data()
     if log_parser is None:
         log_parser = LogParser()
     if now is None:
@@ -1129,7 +1291,7 @@ def load_all_agents(
         ),
         reverse=True,
     )
-    return all_agents, err1 + err2
+    return all_agents, list(ARCHITECTURE_ERRORS) + err1 + err2
 
 
 def is_active_agent(agent: AgentInfo) -> bool:
@@ -1985,6 +2147,7 @@ def get_worker_status(
     active_agents: List[AgentInfo],
 ) -> Tuple[bool, int, str]:
     """Compatibility helper for checking a node in the current architecture."""
+    ensure_architecture_data()
     view = ARCHITECTURE_DATA["architectures"]["now"]
     node = view["nodes"].get(worker_id)
     if not isinstance(node, dict):
@@ -2011,6 +2174,7 @@ def render_architecture_view(
     project_id: Optional[str] = None,
 ) -> str:
     """Render one project's configurable coordinator/worker graph."""
+    ensure_architecture_data()
     projects = ARCHITECTURE_DATA["projects"]
     project_ids = list(projects)
     selected = project_id or project_ids[0]
@@ -2023,6 +2187,7 @@ def render_architecture_view(
     project_agents = [
         agent for agent in agents
         if (agent.project or PROJECT_OTHER) == selected
+        and (agent.status == "running" or task_bucket(agent) != "history")
     ]
     assignments = _assign_agents_to_nodes(project_agents, view)
     available_width = max(20, width - 4)
@@ -2168,11 +2333,12 @@ def format_completion_time(timestamp: Optional[float]) -> str:
 
 
 def compact_elapsed(agent: AgentInfo) -> str:
-    if agent.start_time is None or not re.fullmatch(r"\d+:\d{2}:\d{2}", agent.elapsed):
+    elapsed = agent.elapsed.lstrip("~")
+    if agent.start_time is None or not re.fullmatch(r"\d+:\d{2}:\d{2}", elapsed):
         return agent.elapsed
-    hours, minutes, seconds = (int(part) for part in agent.elapsed.split(":"))
+    hours, minutes, seconds = (int(part) for part in elapsed.split(":"))
     total = hours * 60 + minutes
-    return f"{total}m" if total else f"{seconds}s"
+    return ("~" if agent.elapsed.startswith("~") else "") + (f"{total}m" if total else f"{seconds}s")
 
 
 def render_board_active(agents: List[AgentInfo], width: int) -> str:
@@ -2181,8 +2347,9 @@ def render_board_active(agents: List[AgentInfo], width: int) -> str:
         badge = STATUS_BADGE_MARKUP.get(agent.status, "")
         available = max(16, width - 4)
         badge_width = display_width(Text.from_markup(badge).plain) + 1 if badge else 0
-        identity = f"{agent.harness} · {agent.model} · 已跑 {compact_elapsed(agent)}"
-        identity = truncate_display(identity, max(8, available - badge_width - 12))
+        timer = f" · 已跑 {compact_elapsed(agent)}"
+        identity_width = max(8, available - badge_width - 12)
+        identity = truncate_display(f"{agent.harness} · {agent.model}", max(1, identity_width - display_width(timer))) + timer
         name_width = max(1, available - badge_width - display_width(identity) - 4)
         name = truncate_display(agent.name, name_width)
         title = f"▶ {name}  {identity}"
@@ -2362,9 +2529,11 @@ def render_done_tasks(done_agents: List[AgentInfo], width: int = 80) -> str:
 
 
 def notify_completion(agent: AgentInfo):
-    """Trigger macOS notification and sound when an agent completes."""
+    """Notify on a terminal result or a stalled run."""
     name_escaped = agent.name.replace('"', '\\"')
-    script = f'display notification "{name_escaped} 已完成" with title "Agent Watch"'
+    labels = {"complete": "已完成", "partial": "部分完成", "failed": "失敗", "blocked": "受阻", "waiting": "等待中"}
+    label = labels.get(agent.status, agent.status)
+    script = f'display notification "{name_escaped} {label}" with title "Agent Watch"'
     try:
         subprocess.Popen(
             ["osascript", "-e", script],
@@ -2376,7 +2545,7 @@ def notify_completion(agent: AgentInfo):
         pass
     try:
         subprocess.Popen(
-            ["afplay", "/System/Library/Sounds/Glass.aiff"],
+            ["afplay", f"/System/Library/Sounds/{'Glass' if agent.status == 'complete' else 'Basso' if agent.status == 'failed' else 'Ping'}.aiff"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
@@ -2588,6 +2757,44 @@ def render_data_errors(errors: List[str], agents: List[AgentInfo], width: int) -
     return "\n".join(lines)
 
 
+class RunDataService:
+    """One background reader owns the parser; UI reads complete snapshots."""
+
+    def __init__(self, runs_path: Path, done_path: Path, parser: LogParser):
+        self.runs_path = runs_path
+        self.done_path = done_path
+        self.parser = parser
+        self._lock = threading.Lock()
+        self._fetching = False
+        self._snapshot: Tuple[List[AgentInfo], List[str]] = ([], [])
+        self.on_ready: Optional[Callable[[], None]] = None
+
+    def snapshot(self) -> Tuple[List[AgentInfo], List[str]]:
+        with self._lock:
+            agents, errors = self._snapshot
+            return [copy.copy(agent) for agent in agents], list(errors)
+
+    def refresh_in_background(self) -> bool:
+        with self._lock:
+            if self._fetching:
+                return False
+            self._fetching = True
+
+        def read() -> None:
+            try:
+                result = load_all_agents(self.runs_path, self.done_path, self.parser)
+            except Exception as exc:
+                result = ([], [f"讀取工作資料失敗：{exc}"])
+            with self._lock:
+                self._snapshot = result
+                self._fetching = False
+            if self.on_ready is not None:
+                self.on_ready()
+
+        threading.Thread(target=read, daemon=True, name="agent-watch-data").start()
+        return True
+
+
 class AgentWatchApp(App):
     """Textual terminal dashboard for monitoring agents with tabs and flicker-free updates."""
 
@@ -2612,6 +2819,7 @@ class AgentWatchApp(App):
         self.runs_path = runs_path
         self.done_path = done_path
         self.log_parser = LogParser()
+        self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.notified_keys: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
@@ -2624,6 +2832,7 @@ class AgentWatchApp(App):
         self.ui_error = ""
         self.current_agents: List[AgentInfo] = []
         self.architecture_view_id = "now"
+        ensure_architecture_data()
         self.architecture_project_id = next(iter(ARCHITECTURE_DATA["projects"]))
         self.current_active_agents: List[AgentInfo] = []
         self.expand_recent = False
@@ -2751,13 +2960,23 @@ class AgentWatchApp(App):
 
     def on_mount(self) -> None:
         self._ui_ready = True
+        self.data_svc.on_ready = self._data_ready
         self.quota_svc.refresh_in_background()
+        self.data_svc.refresh_in_background()
         self.update_data()
         self.set_interval(2.0, self.poll_data)
 
     def poll_data(self) -> None:
         self.quota_svc.refresh_in_background()
+        self.data_svc.refresh_in_background()
         self.update_data()
+
+    def _data_ready(self) -> None:
+        try:
+            self.call_from_thread(self.update_data)
+        except RuntimeError:
+            # The reader can finish after the app has closed.
+            pass
 
     def make_snapshot(
         self,
@@ -2802,7 +3021,15 @@ class AgentWatchApp(App):
             now = time.time()
 
         try:
-            agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
+            if self._ui_ready:
+                agents, errors = self.data_svc.snapshot()
+                for agent in agents:
+                    if agent.completion_time is None:
+                        agent.elapsed = format_elapsed(agent.start_time, now)
+                        if agent.elapsed_estimated:
+                            agent.elapsed = "~" + agent.elapsed
+            else:
+                agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
         except Exception as e:
             agents, errors = [], [f"讀取工作資料失敗：{e}"]
         quota_summary, quota_raw, quota_stale, quota_error = self.quota_svc.snapshot()
@@ -2816,9 +3043,14 @@ class AgentWatchApp(App):
         if not self.is_first_load:
             for a in agents:
                 prev = self.previous_status.get(a.key)
-                if prev in ("running", "waiting") and a.status == "complete" and a.key not in self.notified_keys:
+                notice_key = f"{a.key}::{a.start_time}::{a.status}"
+                if (
+                    prev is not None and prev != a.status
+                    and a.status in {"complete", "partial", "failed", "blocked", "waiting"}
+                    and notice_key not in self.notified_keys
+                ):
                     notify_completion(a)
-                    self.notified_keys.add(a.key)
+                    self.notified_keys.add(notice_key)
         else:
             for a in agents:
                 if a.status == "complete":

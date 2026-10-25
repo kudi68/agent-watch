@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -58,11 +59,14 @@ from watch import (
     task_bucket,
 )
 
+watch.ensure_architecture_data()
+
 
 def write_log(path: Path, start_time: float, *messages: str) -> None:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time))
     lines = [f"{stamp} session start", *messages]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(path, (start_time, start_time))
 
 
 def set_mtime(path: Path, timestamp: float) -> None:
@@ -382,7 +386,8 @@ class TestAgentWatch(unittest.TestCase):
             now=now,
             last_status="failed",
         )
-        self.assertEqual(st, "failed")
+        # Log activity after this report makes it stale for the current run.
+        self.assertEqual(st, "running")
 
         st = determine_status(
             is_done_file=False,
@@ -406,8 +411,8 @@ class TestAgentWatch(unittest.TestCase):
             last_status_from_content("# 工作摘要\n狀態：DONE\n- FAILED 是較早的重試"),
             "complete",
         )
-        self.assertEqual(last_status_from_content("# 工作摘要\n目前結果是 DONE。"), "complete")
-        self.assertEqual(last_status_from_content("# 工作摘要\n工作已完成。"), "complete")
+        self.assertIsNone(last_status_from_content("# 工作摘要\n目前結果是 DONE。"))
+        self.assertIsNone(last_status_from_content("# 工作摘要\n工作已完成。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n目前結果不是 DONE。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n工作尚未完成。"))
         self.assertIsNone(last_status_from_content("# 工作摘要\n工作沒有完成。"))
@@ -458,7 +463,7 @@ class TestAgentWatch(unittest.TestCase):
             self.assertEqual(len(agents), 2)
 
             a1 = next(a for a in agents if a.name == "Agent One")
-            self.assertEqual(a1.status, "complete")
+            self.assertEqual(a1.status, "reported")
             self.assertEqual(a1.harness, "未知")
             self.assertEqual(a1.model, "未知")
             self.assertIn("任務圓滿完成", a1.latest)
@@ -622,8 +627,8 @@ class TestAgentWatch(unittest.TestCase):
             )[0][0]
 
             self.assertEqual(first.status, "complete")
-            self.assertEqual(first.elapsed, "00:02:30")
-            self.assertEqual(later.elapsed, "00:02:30")
+            self.assertEqual(first.elapsed, "~00:02:30")
+            self.assertEqual(later.elapsed, "~00:02:30")
             self.assertEqual(first.completion_time, finished)
             self.assertEqual(format_completion_time(0), "08:00")
 
@@ -647,7 +652,7 @@ class TestAgentWatch(unittest.TestCase):
 
             self.assertEqual(first.status, "complete")
             self.assertEqual(first.completion_time, finished)
-            self.assertEqual(first.elapsed, "00:04:00")
+            self.assertEqual(first.elapsed, "~00:04:00")
             self.assertEqual(later.elapsed, first.elapsed)
             self.assertRegex(render_done_tasks([later]), r"完成：\d{2}:\d{2}")
 
@@ -833,7 +838,7 @@ class TestAgentWatch(unittest.TestCase):
             markup = render_done_tasks(agents)
 
             self.assertEqual(errors, [])
-            self.assertEqual(agent.status, "complete")
+            self.assertEqual(agent.status, "reported")
             self.assertEqual(agent.last_path, report)
             self.assertEqual(agent.stage, "P2 回歸驗證中")
             self.assertIn("目前階段：P2 回歸驗證中", markup)
@@ -1231,7 +1236,7 @@ class TestAgentWatch(unittest.TestCase):
                 elapsed="00:08:00",
                 latest="主要實作完成",
                 stage="P3 實作",
-                completion_time=200.0,
+                completion_time=time.time() - 120,
                 project="example-project",
             ),
             AgentInfo(
@@ -1257,7 +1262,7 @@ class TestAgentWatch(unittest.TestCase):
                 start_time=100.0,
                 elapsed="00:03:00",
                 latest="done",
-                completion_time=300.0,
+                completion_time=time.time() - 60,
                 project="example-project",
             ),
         ]
@@ -1315,7 +1320,8 @@ class TestAgentWatch(unittest.TestCase):
         self.assertEqual(set(data["architectures"]), {"now", "future"})
         self.assertEqual(
             set(data["projects"]),
-            {"example-project", "project-a", "project-b", "project-c", "project-d", "other"},
+            {"example-project", "project-a", "project-b", "project-c", "project-d",
+             "personal-ai-os", "agent-watch", "ios-shortcuts", "K1", "other"},
         )
         self.assertEqual(
             data["architectures"]["now"]["layers"][-1],
@@ -1425,7 +1431,7 @@ class StageOneScreenTests(unittest.TestCase):
                         self.assertFalse(app.update_data(now=now + 60))
                         await pilot.pause()
                         timer_text = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
-                        self.assertIn("已跑 3m", timer_text)
+                        self.assertIn("已跑 ~3m", timer_text)
                         self.assertEqual(app.redraw_count, redraws)
                         await pilot.press("e")
                         await pilot.pause()
@@ -1459,7 +1465,7 @@ class StageOneScreenTests(unittest.TestCase):
             done.write_text(f"example-project review\t{log}\t{report}\n")
             payload = (Path(__file__).parent / "tests/fixtures/magpie_quota.json").read_text()
             output = io.StringIO()
-            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+            with patch("watch.is_pid_alive", return_value=True), patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(watch.run_once_summary(runs, done), 0)
             text = output.getvalue()
@@ -1469,6 +1475,110 @@ class StageOneScreenTests(unittest.TestCase):
             self.assertIn("已回報", text)
             self.assertIn("帳戶餘額 $19.58", text)
             self.assertNotIn("Harness", text)
+
+
+class V10ScreenAndWorkerTests(unittest.TestCase):
+    def test_poll_data_stays_under_200ms_with_blocked_io_and_tabs_work(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+                runs.write_text("")
+                done.write_text("")
+                entered, release = threading.Event(), threading.Event()
+                reader_threads = []
+
+                def slow_reader(*args, **kwargs):
+                    reader_threads.append(threading.get_ident())
+                    entered.set()
+                    release.wait(timeout=3)
+                    return [], []
+
+                app = AgentWatchApp(runs_path=runs, done_path=done)
+                app.quota_svc.refresh_in_background = lambda force=False: False
+                with patch("watch.load_all_agents", side_effect=slow_reader):
+                    try:
+                        async with app.run_test(size=(80, 40)) as pilot:
+                            await pilot.pause()
+                            self.assertTrue(entered.is_set())
+                            measured = []
+                            for _ in range(5):
+                                started = time.perf_counter()
+                                app.poll_data()
+                                measured.append((time.perf_counter() - started) * 1000)
+                            for key, expected in (("2", "tab-arch"), ("3", "tab-quota"), ("1", "tab-work")):
+                                await pilot.press(key)
+                                self.assertEqual(app.query_one("#main-tabs", TabbedContent).active, expected)
+                            self.assertLess(max(measured), 200)
+                            self.assertNotIn(threading.get_ident(), reader_threads)
+                            self.assertEqual(len(reader_threads), 1)
+                            print("v10 poll_data max_ms=%.3f (blocked fixture I/O)" % max(measured))
+                            release.set()
+                            await pilot.pause()
+                    finally:
+                        release.set()
+        asyncio.run(run())
+
+    def test_v10_fixture_snapshots_and_registry_mtimes(self):
+        async def run():
+            fixtures = Path(__file__).parent / "tests" / "fixtures"
+            now = watch.parse_timestamp("2026-10-25T10:12:00Z")
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for name in ("claude_stream.jsonl", "opencode_stream.jsonl"):
+                    (root / name).write_bytes((fixtures / name).read_bytes())
+                runs, done = root / "agent-runs.tsv", root / "agent-runs-done.tsv"
+                rows = (fixtures / "runs_v10.tsv").read_text()
+                rows = rows.replace("opencode_stream.jsonl", str(root / "opencode_stream.jsonl"))
+                rows = rows.replace("claude_stream.jsonl", str(root / "claude_stream.jsonl"))
+                rows = rows.replace("opencode-result.txt", str(root / "opencode-result.txt"))
+                rows = rows.replace("claude-result.txt", str(root / "claude-result.txt"))
+                runs.write_text(rows)
+                done.write_text("")
+                before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+                snapshots = snapshot_dir(root / "shots")
+                for width in (80, 120):
+                    app = AgentWatchApp(runs_path=runs, done_path=done)
+                    app.quota_svc.refresh_in_background = lambda force=False: False
+                    with patch("watch.time.time", return_value=now), patch("watch.notify_completion"):
+                        async with app.run_test(size=(width, 40)) as pilot:
+                            await pilot.pause()
+                            text = "\n".join(strip.text.rstrip() for strip in app.screen._compositor.render_strips()) + "\n"
+                            self.assertIn("已跑 12m", text)
+                            self.assertIn("Claude fixture", text)
+                            self.assertIn("OpenCode fixture", text)
+                            self.assertIn("Claude fixture 最新一句", text)
+                            self.assertIn("OpenCode fixture 最新一句", text)
+                            self.assertNotIn("'type'", text)
+                            self.assertFalse(app.ui_error)
+                            (snapshots / ("v10-s1-%dx40.txt" % width)).write_text(text)
+                            await pilot.press("2")
+                            await pilot.pause()
+                            arch = "\n".join(strip.text.rstrip() for strip in app.screen._compositor.render_strips()) + "\n"
+                            (snapshots / ("v10-s1-arch-%dx40.txt" % width)).write_text(arch)
+                self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+                print("v10 fixture agent-runs*.tsv mtime_ns and bytes UNCHANGED at 80x40 and 120x40")
+        asyncio.run(run())
+
+    def test_terminal_and_waiting_transitions_each_notify_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = AgentWatchApp(root / "unused-runs", root / "unused-done")
+            agent = AgentInfo("fixture", root / "run.log", root / "REPORT.md", "running",
+                              "fixture", time.time() - 60, "00:01:00", "fixture", key="fixture")
+            with patch("watch.load_all_agents", return_value=([agent], [])), patch("watch.notify_completion") as notify:
+                app.update_data()
+                for status in ("waiting", "partial", "failed", "blocked", "complete"):
+                    agent.status = status
+                    app.update_data()
+                    app.update_data()
+                self.assertEqual(notify.call_count, 5)
+
+    def test_architecture_ignores_ended_history(self):
+        old = AgentInfo("example-project Worker A", Path("/dev/null"), Path("/dev/null"),
+                        "complete", "fixture", 100, "00:01:00", "old task must disappear",
+                        project="example-project", completion_time=time.time() - 8000)
+        self.assertNotIn("old task must disappear", render_architecture_view([old], 120))
 
 
 if __name__ == "__main__":

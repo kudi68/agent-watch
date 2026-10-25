@@ -89,16 +89,250 @@ class StatusRegressions(unittest.TestCase):
             self.assertEqual(watch.load_all_agents(root / "runs.tsv", root / "done.tsv")[0][0].status, "complete")
 
     def test_process_inventory_failure_never_means_dead(self):
-        with patch("watch.os.kill", side_effect=OSError("inspection unavailable")):
+        with patch("watch.subprocess.run", side_effect=OSError("inspection unavailable")):
             self.assertIsNone(watch.is_pid_alive(1234))
 
     def test_parent_pid_is_alive(self):
-        self.assertTrue(watch.is_pid_alive(os.getppid()))
-        with patch("watch.os.kill", side_effect=ProcessLookupError):
+        parent = os.getppid()
+        with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=f"{parent} parent\n")):
+            self.assertTrue(watch.is_pid_alive(parent))
+        with patch("watch.subprocess.run", return_value=Mock(returncode=1, stdout="")) as run:
             self.assertFalse(watch.is_pid_alive(1234))
-        with patch("watch.os.kill", side_effect=PermissionError):
+            self.assertEqual(run.call_args.args[0], ["pgrep", "-l", "."])
+        with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout="1234 worker\n")):
             self.assertTrue(watch.is_pid_alive(1234))
         self.assertIsNone(watch.is_pid_alive(0))
+
+
+class V10DataRegressions(unittest.TestCase):
+    fixtures = Path(__file__).parent / "tests" / "fixtures"
+    now = watch.parse_timestamp("2026-10-25T10:12:00Z")
+    start = watch.parse_timestamp("2026-10-25T10:00:00Z")
+
+    def load_fixture(self, root, parser=None):
+        for name in ("claude_stream.jsonl", "opencode_stream.jsonl", "runs_v10.tsv"):
+            (root / name).write_bytes((self.fixtures / name).read_bytes())
+        runs, done = root / "runs_v10.tsv", root / "agent-runs-done.tsv"
+        done.write_text("")
+        before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
+        with patch("watch.ROOT_DIR", root):
+            agents, errors = watch.load_all_agents(runs, done, parser, self.now)
+        self.assertEqual(errors, [])
+        self.assertEqual(before, [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)])
+        return {a.name: a for a in agents}
+
+    def test_fixture_open_code_and_claude_have_elapsed_and_plain_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = self.load_fixture(Path(tmp))
+        for name in ("OpenCode", "Claude"):
+            agent = agents[name + " fixture"]
+            self.assertEqual(agent.elapsed, "00:12:00")
+            self.assertIn(name + " fixture 最新一句", agent.latest)
+            self.assertNotIn("'type'", agent.latest)
+        self.assertEqual(agents["Claude fixture"].model, "claude-sonnet-fixture")
+        self.assertEqual(agents["Claude fixture"].harness, "Claude Code")
+        self.assertEqual(agents["OpenCode fixture"].project, "agent-watch")
+        self.assertEqual(agents["Claude fixture"].project, "personal-ai-os")
+
+    def test_strict_status_does_not_accept_completion_in_prose(self):
+        for body in ("工作已完成", "the earlier run was DONE", "完成測試，仍需實作", "example: Status: DONE"):
+            with self.subTest(body=body):
+                self.assertIsNone(watch.last_status_from_content("# Notes\n" + body))
+
+    def test_keyword_boundaries_reject_embedded_long_keywords(self):
+        self.assertFalse(watch.keyword_matches("shortcut", "myshortcutting"))
+        self.assertFalse(watch.keyword_matches("sc-", "misc-task"))
+        self.assertFalse(watch.keyword_matches("k1", "desk1-task"))
+        self.assertTrue(watch.keyword_matches("sc-", "sc-pkg6"))
+
+    def test_no_timestamp_line_does_not_invent_mtime_clock(self):
+        self.assertEqual(watch.LogParser._summarize(b"plain progress", self.start)[2], "plain progress")
+
+    def test_elapsed_sources_precedence_and_reused_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_text("2026-10-20T10:00:00Z session start\nold log\n")
+            report.write_text("DONE\nold result\n")
+            os.utime(report, (self.start - 60, self.start - 60))
+            os.utime(log, (self.start + 5, self.start + 5))
+            reader = Mock(return_value=self.start + 60)
+            parser = watch.LogParser(process_start_reader=reader)
+            with patch("watch.is_pid_alive", return_value=True):
+                exact = watch.build_agent("Task", str(log), str(report), False, parser, self.now,
+                                          pid=1234, started_at=self.start)
+                reader.assert_not_called()
+                pid = watch.build_agent("Task", str(log), str(report), False, parser, self.now, pid=1234)
+                unknown = watch.build_agent("Task", str(log), str(report), False, watch.LogParser(), self.now, pid=1234)
+            self.assertEqual(exact.elapsed, "00:12:00")
+            self.assertEqual(pid.elapsed, "00:11:00")
+            self.assertEqual(pid.start_source, "pid")
+            self.assertEqual(unknown.elapsed, "時間未知")
+            self.assertEqual(exact.status, "running")
+
+    def test_estimate_and_all_sources_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "run.log"
+            log.write_text("2026-10-25T10:00:00Z session start\nworking\n")
+            agent = watch.build_agent("Task", str(log), str(root / "missing"), False, watch.LogParser(), self.now)
+            self.assertEqual(agent.elapsed, "~00:12:00")
+            self.assertEqual(watch.compact_elapsed(agent), "~12m")
+            unknown = watch.build_agent("Task", "/dev/null", str(root / "missing"), False, watch.LogParser(), self.now)
+            self.assertEqual(unknown.elapsed, "時間未知")
+
+    def test_old_report_with_new_log_activity_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            log.write_text("2026-10-20T10:00:00Z session start\nnew activity\n")
+            report.write_text("DONE\nold result\n")
+            os.utime(log, (self.now - 10, self.now - 10))
+            os.utime(report, (self.start - 1, self.start - 1))
+            with patch("watch.find_new_branch_commit", return_value=(False, None)):
+                agent = watch.build_agent("Task", str(log), str(report), False, watch.LogParser(), self.now)
+            self.assertEqual(agent.status, "running")
+            self.assertEqual(agent.elapsed, "時間未知")
+
+    def test_progress_requires_newer_mtime_in_log_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            progress = root / "PROGRESS.md"
+            progress.write_text("P1 previous invocation\n")
+            os.utime(progress, (self.start - 1, self.start - 1))
+            self.assertEqual(watch.read_progress_stage(root, self.start), "")
+            self.assertEqual(watch.read_progress_stage(root, None), "")
+            os.utime(progress, (self.start + 1, self.start + 1))
+            self.assertEqual(watch.read_progress_stage(root, self.start), "P1 previous invocation")
+
+    def test_old_ahead_commit_needs_to_be_newer_than_current_run(self):
+        answers = [
+            Mock(returncode=0, stdout="task\n"),
+            Mock(returncode=0, stdout="origin/main\n"),
+            Mock(returncode=0, stdout=str(self.start - 100)),
+        ]
+        with patch("watch.find_git_root", return_value=Path("/fixture/repo")), patch("watch.subprocess.run", side_effect=answers):
+            self.assertEqual(watch.find_new_branch_commit(Path("/fixture/repo"), self.start), (False, None))
+
+    def test_claude_result_success_error_and_pid_priority(self):
+        for failed, expected in ((False, "complete"), (True, "failed")):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                log = root / "run.log"
+                log.write_bytes((self.fixtures / "claude_stream.jsonl").read_bytes())
+                with log.open("a") as stream:
+                    stream.write(json.dumps({
+                        "type": "result", "subtype": "error_during_execution" if failed else "success",
+                        "is_error": failed, "timestamp": "2026-10-25T10:02:00Z", "result": "fixture outcome",
+                    }) + "\n")
+                with patch("watch.is_pid_alive", return_value=False):
+                    agent = watch.build_agent("Task", str(log), str(root / "missing"), False, watch.LogParser(), self.now,
+                                              pid=1234, started_at=self.start)
+                self.assertEqual(agent.status, expected)
+                self.assertIn("fixture outcome", agent.latest)
+                self.assertEqual(agent.elapsed, "00:02:00")
+                with patch("watch.is_pid_alive", return_value=True):
+                    live = watch.build_agent("Task", str(log), str(root / "missing"), False, watch.LogParser(), self.now,
+                                             pid=1234, started_at=self.start)
+                self.assertEqual(live.status, "running")
+
+    def test_claude_tool_and_partial_records_and_reused_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.log"
+            parser = watch.LogParser()
+            log.write_text('{"type":"system","subtype":"init","timestamp":"2026-10-20T10:00:00Z"}\n')
+            parser.parse(log)
+            tool = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"a.py"}}]}}'
+            with log.open("a") as stream:
+                stream.write(tool[:35])
+            self.assertNotIn("工具：Read", "\n".join(parser.parse(log)[2]))
+            with log.open("a") as stream:
+                stream.write(tool[35:] + "\n")
+            self.assertIn("工具：Read", parser.parse(log)[2][-1])
+            with log.open("a") as stream:
+                stream.write('{"type":"system","subtype":"init","timestamp":"2026-10-25T10:00:00Z"}\n')
+            self.assertEqual(parser.parse(log)[0], self.start)
+
+    def test_claude_result_without_timestamp_and_new_activity_clear_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log = root / "run.log"
+            log.write_text('{"type":"system","subtype":"init","model":"claude-fixture"}\n'
+                           '{"type":"result","subtype":"success","result":"fixture result"}\n')
+            os.utime(log, (self.start + 120, self.start + 120))
+            parser = watch.LogParser()
+            with patch("watch.is_pid_alive", return_value=False):
+                result = watch.build_agent("Task", str(log), str(root / "missing"), False, parser, self.now,
+                                           pid=1234, started_at=self.start)
+                self.assertEqual(result.status, "complete")
+                self.assertEqual(result.elapsed, "00:02:00")
+                self.assertEqual(result.log_lines[-1], "完成：fixture result")
+                with log.open("a") as stream:
+                    stream.write('{"type":"assistant","message":{"content":[{"type":"text","text":"new run"}]}}\n')
+                os.utime(log, (self.now - 1, self.now - 1))
+                rerun = watch.build_agent("Task", str(log), str(root / "missing"), False, parser, self.now,
+                                          pid=1234, started_at=self.start + 180)
+            self.assertEqual(rerun.status, "no_report")
+
+    def test_claude_new_result_summary_does_not_reuse_old_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log, report = root / "run.log", root / "REPORT.md"
+            report.write_text("DONE\nold report from previous invocation\n")
+            os.utime(report, (self.start - 1, self.start - 1))
+            log.write_text('{"type":"result","subtype":"success","timestamp":"2026-10-25T10:02:00Z","result":"new Claude outcome"}\n')
+            os.utime(log, (self.start + 120, self.start + 120))
+            with patch("watch.is_pid_alive", return_value=False), patch("watch.find_new_branch_commit", return_value=(False, None)):
+                agent = watch.build_agent("Task", str(log), str(report), False, watch.LogParser(), self.now,
+                                          pid=1234, started_at=self.start)
+            self.assertEqual(agent.status, "complete")
+            self.assertIn("new Claude outcome", agent.latest)
+            self.assertNotIn("old report", agent.latest)
+
+    def test_project_alias_override_unknown_and_legacy_widths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = [
+                "personal-ai-os check\t/dev/null\tmissing\t\t\t\tK1",
+                "explicit\t/dev/null\tmissing\t\t\t\tpai",
+                "unknown\t/dev/null\tmissing\t\t\t\tno-such-project",
+                "invalid-time\t/dev/null\tmissing\t\t\t\taw\t2026-10-25T10:00:00",
+            ] + ["legacy-%d\t/dev/null\tmissing%s" % (width, "\t" * (width - 3)) for width in range(3, 7)]
+            runs = root / "runs.tsv"
+            runs.write_text("\n".join(rows) + "\n")
+            with patch("watch.ROOT_DIR", root):
+                agents, errors = watch.load_tsv_agents(runs, False, watch.LogParser(), self.now)
+            self.assertEqual(len(agents), 8)
+            self.assertEqual([a.project for a in agents[:3]], ["K1", "personal-ai-os", "other"])
+            self.assertIn("未知專案", agents[2].error)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("started_at", errors[0])
+
+    def test_architecture_fallback_and_adjacent_layers_validation(self):
+        saved = dict(watch.ARCHITECTURE_DATA)
+        warnings = list(watch.ARCHITECTURE_ERRORS)
+        try:
+            for body in ("{invalid", "[]", '{"projects": {}, "architectures": {}}'):
+                with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "broken.json"
+                    path.write_text(body)
+                    watch.ARCHITECTURE_DATA.clear()
+                    with patch("watch.ARCHITECTURE_PATH", path):
+                        watch.ensure_architecture_data()
+                        watch.ensure_architecture_data()
+                        self.assertIn("Operator", watch.render_architecture_view([], 80))
+                    self.assertEqual(len(watch.ARCHITECTURE_ERRORS), 1)
+            graph = json.loads((Path(__file__).parent / "arch.json").read_text())
+            graph["architectures"]["future"]["edges"].append(["user", "reviewer"])
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "broken.json"
+                path.write_text(json.dumps(graph))
+                with self.assertRaises(ValueError):
+                    watch.load_architecture_data(path)
+        finally:
+            watch.ARCHITECTURE_DATA.clear()
+            watch.ARCHITECTURE_DATA.update(saved)
+            watch.ARCHITECTURE_ERRORS[:] = warnings
 
 
 def example_agent(name, status, now, project="example-project", **kwargs):
