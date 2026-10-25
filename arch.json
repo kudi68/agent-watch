@@ -1,0 +1,109 @@
+{
+  "title": "Agent 協作架構",
+  "projects": {
+    "agent-watch": {
+      "label": "agent-watch",
+      "match_keywords": ["agent-watch", "agent watch"],
+      "path_keywords": ["agent-watch-ui"],
+      "default_view": "now"
+    },
+    "personal-ai-os": {
+      "label": "personal-ai-os",
+      "match_keywords": ["personal-ai-os", "personal ai os", "pai", "c1", "c2", "pr #4"],
+      "path_keywords": ["personal-ai-os", "c1-", "c2-", "pr-4"],
+      "default_view": "now"
+    },
+    "ios-shortcuts": {
+      "label": "iOS 捷徑",
+      "match_keywords": ["捷徑", "shortcut", "cherri", "sc-", "sc-pkg", "sc-linepay", "mac-intake"],
+      "path_keywords": ["ios-shortcut", "shortcuts", "mac-intake", "sc-"],
+      "default_view": "now"
+    },
+    "k1": {
+      "label": "K1",
+      "match_keywords": ["k1", "kanban"],
+      "path_keywords": ["/k1", "k1-"],
+      "default_view": "now"
+    },
+    "magpie": {
+      "label": "magpie",
+      "match_keywords": ["magpie"],
+      "path_keywords": ["magpie"],
+      "default_view": "now"
+    },
+    "other": {
+      "label": "其他",
+      "match_keywords": [],
+      "path_keywords": [],
+      "default_view": "now"
+    }
+  },
+  "architectures": {
+    "now": {
+      "label": "現在",
+      "caption": "Grok Bot 統籌；Codex、OpenCode、Claude 執行與審查；run-watcher 回報喚醒。",
+      "event_limit": 4,
+      "layers": [
+        ["boyuan", "hermes", "watcher"],
+        ["coach"],
+        ["codex-sol", "codex-main", "opencode", "claude"]
+      ],
+      "nodes": {
+        "boyuan": {"label": "博元", "abbr": "博元", "model": "Human", "role": "需求與驗收", "kind": "actor"},
+        "hermes": {"label": "Hermes chief", "abbr": "Hermes", "model": "Telegram", "role": "手機入口", "kind": "support", "match_keywords": ["hermes"]},
+        "watcher": {"label": "run-watcher.sh", "abbr": "watcher", "model": "macOS", "role": "任務結束叫醒教練", "kind": "support", "match_keywords": ["run-watcher", "watcher"]},
+        "coach": {"label": "Grok Bot", "abbr": "Grok", "model": "專案教練", "role": "規劃、派工、驗收", "kind": "coordinator", "match_keywords": ["grok"]},
+        "codex-sol": {"label": "Codex sol", "abbr": "Codex sol", "model": "group/codex-sol-flash", "role": "便宜實作與修正", "kind": "worker", "match_keywords": ["codex-sol-flash", "sol-flash"]},
+        "codex-main": {"label": "Codex main", "abbr": "Codex main", "model": "group/codex-main", "role": "主要實作與整合", "kind": "worker", "match_keywords": ["codex"]},
+        "opencode": {"label": "OpenCode", "abbr": "OpenCode", "model": "opencode-go/deepseek-v4.1-flash", "role": "調查與修正", "kind": "worker", "match_keywords": ["opencode"]},
+        "claude": {"label": "Claude Code", "abbr": "Claude", "model": "sonnet", "role": "獨立審查", "kind": "worker", "match_keywords": ["claude", "sonnet"]}
+      },
+      "edges": [
+        ["boyuan", "coach", "需求"],
+        ["hermes", "coach", "手機派工"],
+        ["watcher", "coach", "完成喚醒"],
+        ["coach", "codex-sol", "派工"],
+        ["coach", "codex-main", "派工"],
+        ["coach", "opencode", "派工"],
+        ["coach", "claude", "派工"],
+        ["codex-sol", "coach", "回報"],
+        ["codex-main", "coach", "回報"],
+        ["opencode", "coach", "回報"],
+        ["claude", "coach", "回報"]
+      ]
+    },
+    "future": {
+      "label": "未來",
+      "caption": "Claude Planner 規劃與派工，worker 回報後由 Reviewer 審查，再回報博元。",
+      "event_limit": 4,
+      "layers": [
+        ["boyuan", "hermes"],
+        ["planner"],
+        ["codex-sol", "opencode", "pi"],
+        ["reviewer"],
+        ["report"]
+      ],
+      "nodes": {
+        "boyuan": {"label": "博元", "abbr": "博元", "model": "Human", "role": "需求與驗收", "kind": "actor"},
+        "hermes": {"label": "Hermes chief", "abbr": "Hermes", "model": "Telegram", "role": "手機入口", "kind": "support", "match_keywords": ["hermes"]},
+        "planner": {"label": "Claude Code · Planner", "abbr": "Planner", "model": "sonnet", "role": "規劃與派工", "kind": "coordinator", "match_keywords": ["planner"]},
+        "codex-sol": {"label": "Codex sol", "abbr": "Codex sol", "model": "group/codex-sol-flash", "role": "實作與修正", "kind": "worker", "match_keywords": ["codex-sol-flash", "sol-flash"]},
+        "opencode": {"label": "OpenCode", "abbr": "OpenCode", "model": "opencode-go/deepseek-v4.1-flash", "role": "調查與修正", "kind": "worker", "match_keywords": ["opencode"]},
+        "pi": {"label": "Pi Agent", "abbr": "Pi", "model": "qwen3-coder", "role": "獨立實作", "kind": "worker", "match_keywords": ["pi agent", "pi-agent"]},
+        "reviewer": {"label": "Claude Code · Reviewer", "abbr": "Reviewer", "model": "sonnet", "role": "獨立審查", "kind": "coordinator", "match_keywords": ["reviewer", "claude"]},
+        "report": {"label": "回報博元", "abbr": "回報", "model": "Human", "role": "驗收與決策", "kind": "actor"}
+      },
+      "edges": [
+        ["boyuan", "planner", "需求"],
+        ["hermes", "planner", "手機入口"],
+        ["planner", "codex-sol", "派工"],
+        ["planner", "opencode", "派工"],
+        ["planner", "pi", "派工"],
+        ["codex-sol", "reviewer", "回報"],
+        ["opencode", "reviewer", "回報"],
+        ["pi", "reviewer", "回報"],
+        ["reviewer", "report", "結果"]
+      ]
+    }
+  }
+}
