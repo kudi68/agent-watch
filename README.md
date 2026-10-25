@@ -101,6 +101,8 @@ Start the full-screen dashboard in an interactive terminal:
 | `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup |
 | `e` | Work: expand / collapse recent completions |
 | `h` / `d` | Hide / move to completed history (ended tasks without attention only) |
+| `x` | Work: clear the selected needs-attention item; question files stay unchanged |
+| `X` | Work: confirm, then clear expired or superseded items only |
 | `c` | Collapse the selected task's project; a new running task reopens it |
 | `i` | Pin / unpin selected task (maximum 5; the sixth is rejected) |
 | `t` | Edit free-form tags; commas separate tags; empty input clears them |
@@ -124,10 +126,13 @@ Start the full-screen dashboard in an interactive terminal:
 `g` 在表格與依專案分組之間切換。每組內按完成時間由新到舊排序；選中綠色專案列，
 按 Space 或 Enter 收合／展開。分組模式沿用相同搜尋與篩選，收合狀態在本次開啟期間保留。
 在分組模式下，選中任務列按 Space 也會收合它所屬的專案，游標會跳到該專案列。
-選中任務按 `r` 取消隱藏與手動完成，展開所屬專案並回到工作頁。超過兩小時的任務也會
-留在工作頁，直到手動隱藏、歸到已完成或收起專案。
+選中任務按 `r` 取消隱藏、手動完成或清除狀態，展開所屬專案並回到工作頁。超過兩小時的
+任務也會留在工作頁，直到手動隱藏、歸到已完成或收起專案。
 
 工作頁選中已結束且無需處理的任務，`h` 隱藏，`d` 歸到已完成；進行中及需處理任務會拒絕。
+`x` 清除所選需處理項目，只寫入看板 state，不會刪除或修改 `QUESTION.md`／`ANSWER.md`。
+`X` 會先顯示筆數並要求確認，只清除已過期或已被取代的項目；未滿 24 小時的失敗任務保留。
+失敗類項目預設超過 24 小時後移入歷史，可用 `AGENT_WATCH_STALE_HOURS` 調整期限。
 `c` 收起整個專案，專案有進行中／需處理任務時會拒絕；新任務開跑時自動重新出現。
 隱藏或手動完成的任務重跑時也會自動回主頁。`i` 釘選最多五個任務；隱藏／收起的釘選
 及手動完成的釘選不顯示在工作頁，但仍佔名額，可從歷史頁取消。
@@ -138,7 +143,8 @@ Start the full-screen dashboard in an interactive terminal:
 看板只將操作狀態寫入 `~/Projects/night/agent-watch-state.json`，可用 `AGENT_WATCH_STATE`
 另指定檔案。格式為 version 1，`tasks` 以既有的 `name::log::result` 為 key，保存
 hidden、done_manual、read、pinned、tags、updated_at；`projects` 保存 collapsed／collapsed_at。
-額外的 `restored` 與 `run_start` 用於撈回主頁與辨認重跑。寫入先建立同目錄暫存檔、flush／fsync，
+額外的 `restored`、`dismissed`、`dismissed_at`、`dismissed_sig` 與 `run_start` 用於撈回主頁、
+清除需處理項目與辨認重跑。清除簽章會隨狀態、問題 id 或完成時間改變而失效。寫入先建立同目錄暫存檔、flush／fsync，
 再 atomic rename；寫入失敗時保留原檔與記憶體狀態。不存在或格式損壞時使用空狀態，
 畫面只保留一則提示，不會反覆跳通知。第一次成功操作才建立／替換 state 檔。
 本版不處理多個看板同時寫入的鎖定，最後寫入者覆蓋較早的狀態。
@@ -198,12 +204,12 @@ test accepts `NIGHT_WATCH_SCRIPT` to point at a different copy of that helper.
 
 ## TSV format
 
-One run per line, tab-separated, 3 to 8 columns. Blank lines and lines starting with
+One run per line, tab-separated, 3 to 9 columns. Blank lines and lines starting with
 `#` are ignored. Relative log/report paths are resolved against
 `AGENT_WATCH_RUNS_ROOT`.
 
 ```text
-name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model<TAB>project<TAB>started_at
+name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model<TAB>project<TAB>started_at<TAB>note
 ```
 
 | Column | Required | Notes |
@@ -216,6 +222,7 @@ name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model<TAB>project
 | `model` | no | Display label, for example `model-x` |
 | `project` | no | Configured project ID or case-insensitive alias; explicit values override inference |
 | `started_at` | no | ISO 8601 timestamp with timezone, for example `2026-10-25T18:00:00+08:00` |
+| `note` | no | Free-form note; `SUPERSEDED(by name; ...)` identifies a replacement run. |
 
 Example:
 

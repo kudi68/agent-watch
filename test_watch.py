@@ -2458,7 +2458,10 @@ class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.selected_key, agent.key)
             self.assertEqual(app.focused.agent.key, agent.key)
             self.assertEqual(app.current_agents[0].pid, os.getpid())
-            os.kill(os.getpid(), 0)  # the dashboard never signals the run
+            with patch("watch.subprocess.run", return_value=Mock(
+                returncode=0, stdout=f"{os.getpid()} python\n",
+            )):
+                self.assertTrue(watch.is_pid_alive(os.getpid()))
         self.assertEqual(before, (log.stat().st_mtime_ns, log.read_bytes()))
 
     async def test_terminal_search_scroll_and_live_tail(self):
