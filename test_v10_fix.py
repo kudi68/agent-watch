@@ -1,6 +1,9 @@
+import json
 import os
+import stat
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -98,6 +101,85 @@ class AttentionStateTests(unittest.TestCase):
         self.state_path = self.root / "state.json"
         self.state = watch.WatchState(self.state_path)
         self.now = 1_800_000_000
+
+    def test_orphan_state_cleanup_waits_for_registry_and_backs_up_before_pruning(self):
+        old = datetime.fromtimestamp(self.now - 31 * 86400).astimezone().isoformat()
+        recent = datetime.fromtimestamp(self.now - 29 * 86400).astimezone().isoformat()
+        initial = {
+            "version": 1,
+            "tasks": {
+                "orphan-old": {"read": True, "updated_at": old},
+                "present-old": {"hidden": True, "updated_at": old},
+                "orphan-recent": {"updated_at": recent},
+                "orphan-invalid": {"updated_at": "not-a-date"},
+            },
+            "projects": {},
+        }
+        original = (json.dumps(initial, ensure_ascii=False) + "\n").encode()
+        self.state_path.write_bytes(original)
+        os.chmod(self.state_path, 0o600)
+        original_mode = stat.S_IMODE(self.state_path.stat().st_mode)
+        state = watch.WatchState(self.state_path)
+        present = self.agent("present-old", "still-listed", "complete",
+                             completion=self.now - 60)
+
+        state.reconcile([present], self.now)
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(list(self.root.glob("state.json.bak-*")), [])
+
+        state.reconcile([present], self.now, registry_complete=True)
+        backup = self.state_path.with_name(
+            self.state_path.name + ".bak-" + datetime.fromtimestamp(self.now).astimezone().strftime("%Y%m%d")
+        )
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), original_mode)
+        saved = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("orphan-old", saved["tasks"])
+        self.assertIn("present-old", saved["tasks"])
+        self.assertIn("orphan-recent", saved["tasks"])
+        self.assertIn("orphan-invalid", saved["tasks"])
+
+    def test_cleanup_does_not_overwrite_existing_backup_or_delete_entries(self):
+        old = datetime.fromtimestamp(self.now - 31 * 86400).astimezone().isoformat()
+        initial = {"version": 1, "tasks": {"orphan": {"updated_at": old}}, "projects": {}}
+        original = (json.dumps(initial) + "\n").encode()
+        self.state_path.write_bytes(original)
+        backup = self.state_path.with_name(
+            self.state_path.name + ".bak-" + datetime.fromtimestamp(self.now).astimezone().strftime("%Y%m%d")
+        )
+        backup.write_bytes(b"existing backup\n")
+        state = watch.WatchState(self.state_path)
+
+        state.reconcile([], self.now, registry_complete=True)
+
+        self.assertEqual(self.state_path.read_bytes(), original)
+        self.assertEqual(backup.read_bytes(), b"existing backup\n")
+        self.assertIn("當日備份已存在", state.warning)
+        self.assertIn("orphan", state.data["tasks"])
+
+    def test_cleanup_leaves_corrupt_or_changed_state_file_untouched(self):
+        old = datetime.fromtimestamp(self.now - 31 * 86400).astimezone().isoformat()
+        corrupt = b"{broken\n"
+        self.state_path.write_bytes(corrupt)
+        state = watch.WatchState(self.state_path)
+        state.data["tasks"]["orphan"] = {"updated_at": old}
+        state.reconcile([], self.now, registry_complete=True)
+        self.assertEqual(self.state_path.read_bytes(), corrupt)
+        self.assertEqual(list(self.root.glob("state.json.bak-*")), [])
+        self.assertIn("不可讀", state.warning)
+
+        state_path = self.root / "changed.json"
+        original = {"version": 1, "tasks": {"orphan": {"updated_at": old}}, "projects": {}}
+        state_path.write_text(json.dumps(original), encoding="utf-8")
+        changed_state = watch.WatchState(state_path)
+        external = {"version": 1, "tasks": {"newer": {"updated_at": "2026-10-26T00:00:00+08:00"}},
+                    "projects": {}}
+        external_bytes = (json.dumps(external) + "\n").encode()
+        state_path.write_bytes(external_bytes)
+        changed_state.reconcile([], self.now, registry_complete=True)
+        self.assertEqual(state_path.read_bytes(), external_bytes)
+        self.assertEqual(list(self.root.glob("changed.json.bak-*")), [])
+        self.assertIn("已變更", changed_state.warning)
 
     def test_stale_hours_override_and_invalid_values_use_default(self):
         cases = {"12.5": 45_000, "0.5": 1_800, "bad": 86_400,

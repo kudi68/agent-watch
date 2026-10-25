@@ -164,6 +164,7 @@ def _stale_attention_seconds_from_env() -> int:
     return max(1, int(seconds))
 
 STALE_ATTENTION_SECONDS = _stale_attention_seconds_from_env()
+STATE_TASK_RETENTION_SECONDS = 30 * 24 * 60 * 60
 QUESTION_FILENAME = "QUESTION.md"
 ANSWER_FILENAME = "ANSWER.md"
 TERMINAL_TAIL_LINES = 400
@@ -3094,11 +3095,76 @@ class WatchState:
         entry.update(values, updated_at=self.stamp())
         return self.save(data)
 
-    def reconcile(self, agents: List[AgentInfo], now: float) -> None:
-        """A rerun clears dispositions; replacement data is recomputed per poll."""
+    def _prune_old_tasks(
+        self, data: Dict[str, Any], current_keys: Set[str], now: float,
+    ) -> Tuple[bool, str]:
+        expired = []
+        for key, entry in data["tasks"].items():
+            if key in current_keys:
+                continue
+            updated_at = entry.get("updated_at")
+            if not isinstance(updated_at, str):
+                continue
+            try:
+                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    continue
+                updated_ts = updated.timestamp()
+            except (ValueError, OverflowError, OSError):
+                continue
+            if now - updated_ts > STATE_TASK_RETENTION_SECONDS:
+                expired.append(key)
+        if not expired:
+            return False, ""
+
+        try:
+            source_mode = stat.S_IMODE(self.path.stat().st_mode)
+            original = self.path.read_bytes()
+            on_disk = json.loads(original)
+            self._validate(on_disk)
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            return False, "state 清理略過，原檔不可讀：" + str(exc)
+        if on_disk != self.data:
+            return False, "state 清理略過：檔案在本次載入後已變更"
+
+        backup_path = self.path.with_name(
+            self.path.name + ".bak-" + datetime.fromtimestamp(now).astimezone().strftime("%Y%m%d")
+        )
+        fd = -1
+        try:
+            fd = os.open(
+                str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode,
+            )
+            os.fchmod(fd, source_mode)
+            with os.fdopen(fd, "wb") as backup:
+                fd = -1
+                backup.write(original)
+                backup.flush()
+                os.fsync(backup.fileno())
+        except FileExistsError:
+            return False, "state 清理略過：當日備份已存在"
+        except OSError as exc:
+            return False, "state 清理略過，無法建立備份：" + str(exc)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+        for key in expired:
+            data["tasks"].pop(key, None)
+        return True, ""
+
+    def reconcile(
+        self, agents: List[AgentInfo], now: float, *, registry_complete: bool = False,
+    ) -> None:
+        """Reconcile run state after a complete registry snapshot."""
         self._superseded = compute_superseded(agents)
         data = copy.deepcopy(self.data)
         changed = False
+        cleanup_warning = ""
+        if registry_complete:
+            changed, cleanup_warning = self._prune_old_tasks(
+                data, {agent.key for agent in agents}, now,
+            )
         observed = dict(self._observed)
         for agent in agents:
             previous = self._observed.get(agent.key)
@@ -3127,8 +3193,11 @@ class WatchState:
             if project.get("collapsed") and self.bucket(agent, now) in ("running", "attention"):
                 project.update(collapsed=False, collapsed_at=self.stamp())
                 changed = True
-        if not changed or self.save(data):
+        saved = not changed or self.save(data)
+        if saved:
             self._observed = observed
+            if cleanup_warning:
+                self.warning = cleanup_warning
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
         if agent.status == "running":
@@ -3901,6 +3970,7 @@ class RunDataService:
         self.parser = parser
         self._lock = threading.Lock()
         self._fetching = False
+        self._has_snapshot = False
         self._snapshot: Tuple[List[AgentInfo], List[str]] = ([], [])
         self.on_ready: Optional[Callable[[], None]] = None
 
@@ -3908,6 +3978,11 @@ class RunDataService:
         with self._lock:
             agents, errors = self._snapshot
             return [copy.copy(agent) for agent in agents], list(errors)
+
+    @property
+    def has_snapshot(self) -> bool:
+        with self._lock:
+            return self._has_snapshot
 
     def refresh_in_background(self) -> bool:
         with self._lock:
@@ -3922,6 +3997,7 @@ class RunDataService:
                 result = ([], [f"讀取工作資料失敗：{exc}"])
             with self._lock:
                 self._snapshot = result
+                self._has_snapshot = True
                 self._fetching = False
             if self.on_ready is not None:
                 self.on_ready()
@@ -5056,8 +5132,10 @@ class AgentWatchApp(App):
                 time.strftime("%H:%M:%S", time.localtime(now))
             )
 
+        registry_complete = False
         try:
             if self._ui_ready:
+                registry_complete = self.data_svc.has_snapshot
                 agents, errors = self.data_svc.snapshot()
                 for agent in agents:
                     if agent.completion_time is None:
@@ -5066,15 +5144,17 @@ class AgentWatchApp(App):
                             agent.elapsed = "~" + agent.elapsed
             else:
                 agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
+                registry_complete = True
         except Exception as e:
             agents, errors = [], [f"讀取工作資料失敗：{e}"]
+            registry_complete = False
         quota_summary, quota_raw, quota_stale, quota_error = self.quota_svc.snapshot()
         if quota_stale and not quota_raw:
             quota_summary = "額度：讀取失敗"
         error_snapshot = tuple(errors) + ((quota_error,) if quota_stale and quota_error else ())
         if self.ui_error:
             error_snapshot += (self.ui_error,)
-        self.state.reconcile(agents, now)
+        self.state.reconcile(agents, now, registry_complete=registry_complete and not errors)
         if self.state.warning and self.state.warning != self.state_message:
             self.show_state_message(self.state.warning)
 
