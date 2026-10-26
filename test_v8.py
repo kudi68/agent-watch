@@ -1238,15 +1238,6 @@ class ProjectEvidenceOrderTests(unittest.TestCase):
         project, source, _ = self.infer(folder, "wp34-install")
         self.assertEqual((project, source), ("other", "未判斷"))
 
-    def test_forbidden_path_on_a_shared_line_does_not_drop_the_normal_one(self):
-        folder = self.task_dir("wp3-allowlist")
-        (folder / "REPORT.md").write_text(
-            "不改 ~/Projects/c1-runtime，只改 ~/Projects/agent-watch/watch.py\n" * 3,
-            encoding="utf-8",
-        )
-        project, source, _ = self.infer(folder, "wp3-allowlist")
-        self.assertEqual((project, source), ("agent-watch", "路徑"))
-
     def test_run_log_corroborates_a_path_the_report_names(self):
         folder = self.task_dir("wp5-install")
         (folder / "REPORT.md").write_text(

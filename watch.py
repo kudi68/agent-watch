@@ -179,15 +179,6 @@ PROJECT_PATH_MENTION_RE = re.compile(r"Projects/([A-Za-z0-9._-]+)/")
 PROJECT_PATH_FORBIDDEN_RE = re.compile(
     r"不[要]?改|不[要]?動|禁止|不[要]?碰|沒有碰|未碰|forbidden", re.IGNORECASE
 )
-# "不改 X，只改 Y" negates X only, so a new clause that names what *was* touched
-# ends the negation; a bare list separator ("沒有碰 A、B、C") does not.
-PROJECT_PATH_CLAUSE_RE = re.compile(r"[，,、；;。！？!?\n]|—")
-PROJECT_PATH_AFFIRM_RE = re.compile(
-    r"只[改動讀碰]|改|修改|動|讀|審查|檢視|測試|跑|執行|寫|看"
-    r"|change|edit|modify|review|read|test|touch",
-    re.IGNORECASE,
-)
-PROJECT_PATH_NEGATION_GAP = 40
 PROJECT_PATH_MENTION_MIN = 3
 PROJECT_SIGNAL_READ_BYTES = 128 * 1024
 PROJECT_SIGNAL_CACHE_LIMIT = 800
@@ -470,38 +461,6 @@ def task_git_project(task_dir: Path) -> str:
     return project_id
 
 
-def _negation_covers_path(line: str, term: "re.Match[str]", start: int) -> bool:
-    """Whether a forbidden verb before `start` covers the path that starts there."""
-    gap = line[term.end():start]
-    if len(gap) > PROJECT_PATH_NEGATION_GAP * 4:
-        return False
-    breaks = list(PROJECT_PATH_CLAUSE_RE.finditer(gap))
-    if not breaks:
-        return len(gap) <= PROJECT_PATH_NEGATION_GAP
-    tail = gap[breaks[-1].end():]
-    # A new clause that names what the task did touch ends the negation.
-    if PROJECT_PATH_AFFIRM_RE.search(tail):
-        return False
-    return len(tail) <= PROJECT_PATH_NEGATION_GAP
-
-
-def _mentioned_project_paths(line: str) -> List[str]:
-    """`Projects/<name>/` mentions on one line, minus the ones a negation excludes."""
-    forbidden = list(PROJECT_PATH_FORBIDDEN_RE.finditer(line))
-    if not forbidden:
-        return PROJECT_PATH_MENTION_RE.findall(line)
-    names: List[str] = []
-    for mention in PROJECT_PATH_MENTION_RE.finditer(line):
-        if any(
-            term.end() <= mention.start()
-            and _negation_covers_path(line, term, mention.start())
-            for term in forbidden
-        ):
-            continue
-        names.append(mention.group(1))
-    return names
-
-
 def task_path_project(task_dir: Path) -> str:
     """Project whose ~/Projects/<name>/ path a task mentions most often."""
 
@@ -509,7 +468,9 @@ def task_path_project(task_dir: Path) -> str:
         counts: Dict[str, int] = {}
         for line in _read_signal_text(task_dir / filename, tail=tail).splitlines():
             # "do not touch ~/Projects/c1-runtime" names a path the task did not change.
-            for name in _mentioned_project_paths(line):
+            if PROJECT_PATH_FORBIDDEN_RE.search(line):
+                continue
+            for name in PROJECT_PATH_MENTION_RE.findall(line):
                 counts[name] = counts.get(name, 0) + 1
         return counts
 
