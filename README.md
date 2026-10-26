@@ -97,6 +97,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `2` | History tab |
 | `3` | Quota tab |
 | `4` | Architecture tab |
+| `5` | Decision-tree tab (架構樹) |
 | `j` / `k`, arrows | Select next / previous task |
 | `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup |
 | `e` | Work: expand / collapse recent completions |
@@ -113,6 +114,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `Space` / `Enter` | History: collapse / expand selected project group (Space on a task row collapses its project) |
 | `r` | History: bring selected task back to Work |
 | `p` / `n` / `f` | Architecture: cycle project / "now" / "future" view |
+| `R` | Decision tree: reread `decisions/*.md` now (also every 60 seconds) |
 | `?` | Full shortcut table; `Esc` / `?` returns |
 | `q` | Quit |
 
@@ -172,6 +174,24 @@ Esc 先清除搜尋，再按一次 Esc 回工作頁）。
 若舊的 `QUESTION.md` 比已完成的報告還舊，視為上一輪留下的檔案，不會讓完成的任務
 卡在需處理。
 
+### 架構樹頁（decisions 決策節點）
+
+`5` 開啟架構樹頁。每個 `~/Projects/status/decisions/<line>.md` 是一條線，一棵以
+`parent` 連成的樹，`trunk` 放在最上面，越往下是越新的節點。每列顯示日期、狀態
+（`✓ done`／`● running`／`○ waiting`）、節點 id、負責 agent 與摘要；`merge-back`
+另外顯示合流目標。
+
+每條線的標題列會寫出「目前」節點：最新一個 `status` 不是 `done` 的節點；如果整條線
+都 `done`，取日期最新的節點。該列用綠底「目前」標記、摘要加粗，方便一眼看出走到哪。
+
+載入時讀一次，之後每 60 秒重讀整個資料夾，`R` 可立刻重讀。新增的 `<line>.md`
+不必改任何設定就會自動出現；`FORMAT.md` 與 `*.bak-*` 會跳過。欄數不對、`parent`
+找不到、parent 迴圈、id／日期／狀態格式異常的列不會讓整頁掛掉：它們被排除在樹外，
+列在該線底下的「無法解析」小區，正常節點照常顯示。同一 id 有多列時依格式說明取
+最後一列當目前狀態，前面的列只用來保留開啟日期。
+
+這一頁只讀檔，不查程序、不寫任何東西，也不修改 `decisions/*.md`。
+
 Run once and print a plain-text summary instead of the full-screen UI (works
 without a TTY, useful for logs and CI):
 
@@ -197,6 +217,7 @@ Everything machine-specific is read from the environment. CLI flags `--runs` and
 | `AGENT_WATCH_STATE` | `~/Projects/night/agent-watch-state.json` | Dashboard-owned state; independent of runs root |
 | `AGENT_WATCH_CODEX_SESSIONS` | `~/.codex/sessions` | Codex session logs used for quota |
 | `AGENT_WATCH_ARCH` | `arch.json` next to `watch.py` | Architecture graph definition |
+| `AGENT_WATCH_DECISIONS` | `~/Projects/status/decisions` | Decision-node folder shown in the 架構樹 tab |
 | `AGENT_WATCH_MAGPIE` | `magpie` | Executable used for `quota --json` |
 
 `scripts/night-watch.sh` uses `AGENT_WATCH_RUNS_ROOT` in its `main_example`; the bash
@@ -273,7 +294,7 @@ command does not block tab changes.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest test_watch test_v8
+.venv/bin/python -m unittest test_watch test_v8 test_tree
 bash tests/test_night_watch.sh
 ```
 
@@ -310,6 +331,7 @@ arch.json                 example architecture/project configuration
 agent-watch-v8            launcher using .venv/bin/python
 test_watch.py             UI and behaviour tests
 test_v8.py                status and quota regression tests
+test_tree.py              decisions parsing, trees, current node, 架構樹 tab
 tests/test_night_watch.sh bash tests for scripts/night-watch.sh
 tests/fixtures/           quota JSON fixtures
 scripts/night-watch.sh    PID/result-report helper
@@ -324,7 +346,7 @@ agent-watch 是一個純終端機的 AI agent 監控看板。它讀取 TSV 清�
 所有路徑與外部指令都可用環境變數覆寫，預設值指向 `~/Projects/night`（只是預設，可用
 `AGENT_WATCH_RUNS_ROOT` 改）。第一次使用先建好 `.venv`（`./agent-watch-v8` 需要它），
 再建立空的 `agent-runs.tsv`（或指定自己的目錄），否則只會看到「TSV 不存在」提示。
-安裝後執行 `./agent-watch-v8`；按鍵 `1`/`2`/`3`/`4` 切換工作、歷史、額度、架構分頁，`E`
+安裝後執行 `./agent-watch-v8`；按鍵 `1`/`2`/`3`/`4`/`5` 切換工作、歷史、額度、架構、架構樹分頁，`E`
 展開／收起剛完成清單，`P` 切換專案，`N`/`F` 切換架構頁的現在／未來視圖，`?` 開關
 快捷鍵表，`Q` 離開。或加 `--once` 印出單次摘要。
 沒安裝 magpie 或沒有 Codex sessions 時，額度列顯示「無資料」屬正常。測試指令見上。

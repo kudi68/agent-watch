@@ -2782,6 +2782,474 @@ def render_architecture_view(
 
 
 # ==============================================================================
+# 架構樹頁：~/Projects/status/decisions/*.md 的決策節點森林
+# ==============================================================================
+
+DECISIONS_REFRESH_SECONDS = 60
+DECISION_COLUMNS = (
+    "date", "id", "parent", "kind", "spec", "summary",
+    "decision", "evidence", "status", "agent", "merge_target",
+)
+DECISION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DECISION_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+DECISION_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
+DECISION_SKIP_FILES = frozenset({"FORMAT.md"})
+DECISION_STATUS_MARKUP = {
+    "done": ("#9ece6a", "✓"),
+    "running": ("#e0af68", "●"),
+    "waiting": ("#7aa2f7", "○"),
+}
+DECISION_KIND_MARKUP = {
+    "trunk": ("#9ece6a", "trunk"),
+    "branch": ("", ""),
+    "merge-back": ("#bb9af7", "merge-back"),
+    "abandoned": ("#f7768e", "abandoned"),
+}
+DECISION_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9@_./:#=\-+%]+")
+DECISION_NO_LINE_START = "）)」』】》〉，、。；：！？%,.;:!?"
+
+
+def wrap_decision_text(text: str, width: int) -> List[str]:
+    """Wrap CJK text without splitting ASCII words or starting lines with punctuation."""
+    if width <= 0:
+        return [""]
+    source = str(text)
+    tokens: List[str] = []
+    index = 0
+    while index < len(source):
+        match = DECISION_ASCII_TOKEN_RE.match(source, index)
+        if match:
+            tokens.append(match.group(0))
+            index = match.end()
+        else:
+            tokens.append(source[index])
+            index += 1
+    lines: List[str] = []
+    current = ""
+    used = 0
+    for token in tokens:
+        token_width = display_width(token)
+        if token_width > width:
+            if current:
+                lines.append(current)
+                current, used = "", 0
+            for char in token:
+                char_width = display_width(char)
+                if current and used + char_width > width:
+                    lines.append(current)
+                    current, used = "", 0
+                current += char
+                used += char_width
+            continue
+        if used + token_width > width and current:
+            lines.append(current)
+            current, used = "", 0
+            if token in DECISION_NO_LINE_START and lines and display_width(lines[-1]) > 1:
+                moved = lines[-1][-1]
+                lines[-1] = lines[-1][:-1]
+                current = moved
+                used = display_width(moved)
+        current += token
+        used += token_width
+    if current or not lines:
+        lines.append(current)
+    return lines
+
+
+def decisions_directory() -> Path:
+    """Resolve the decisions folder at call time so tests can redirect it."""
+    return _env_path(
+        "AGENT_WATCH_DECISIONS", Path.home() / "Projects" / "status" / "decisions"
+    )
+
+
+@dataclass
+class DecisionNode:
+    """One row of a decisions.md table; append-status rows replace the earlier row."""
+
+    line: str
+    row: int
+    date: str
+    id: str
+    parent: str
+    kind: str
+    spec: str
+    summary: str
+    decision: str
+    evidence: str
+    status: str
+    agent: str
+    merge_target: str
+    children: List["DecisionNode"] = field(default_factory=list)
+    current: bool = False
+
+    @property
+    def is_done(self) -> bool:
+        return self.status == "done"
+
+
+@dataclass
+class DecisionLine:
+    """One decisions file: its roots, its current node, and its unparsable rows."""
+
+    name: str
+    title: str
+    nodes: List[DecisionNode] = field(default_factory=list)
+    roots: List[DecisionNode] = field(default_factory=list)
+    current: Optional[DecisionNode] = None
+    problems: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DecisionBoard:
+    """Every parsed line plus the directory-level errors of the last read."""
+
+    directory: Path
+    lines: List[DecisionLine] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    refreshed_at: float = 0.0
+
+
+def parse_decision_table(
+    text: str,
+    name: str = "",
+) -> Tuple[List[DecisionNode], List[str], str]:
+    """Parse one decisions file. Bad rows become problem strings, never exceptions."""
+    nodes: List[DecisionNode] = []
+    problems: List[str] = []
+    by_id: Dict[str, DecisionNode] = {}
+    order: List[str] = []
+    title = ""
+    header_seen = False
+    for row_number, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if not title and stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            continue
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if cells and all(DECISION_SEPARATOR_RE.match(cell) for cell in cells):
+            continue
+        if not header_seen:
+            header_seen = True
+            if any(cell.casefold() in DECISION_COLUMNS for cell in cells):
+                continue
+            problems.append(f"L{row_number} 第一列不是標準表頭，直接當資料列解讀")
+        if len(cells) != len(DECISION_COLUMNS):
+            problems.append(
+                f"L{row_number} 欄數 {len(cells)}，需 {len(DECISION_COLUMNS)}："
+                f"{truncate_display(stripped, 72)}"
+            )
+            continue
+        values = dict(zip(DECISION_COLUMNS, cells))
+        node_id = values["id"]
+        if not node_id:
+            problems.append(f"L{row_number} 缺少 id：{truncate_display(stripped, 72)}")
+            continue
+        if not DECISION_ID_RE.match(node_id):
+            problems.append(
+                f"L{row_number} id「{truncate_display(node_id, 24)}」格式不對"
+                "（小寫英數字與 -）"
+            )
+            continue
+        status = values["status"].casefold()
+        if not DECISION_DATE_RE.match(values["date"]):
+            problems.append(
+                f"L{row_number} id {node_id} 日期格式異常：{values['date'] or '-'}"
+            )
+        if status not in DECISION_STATUS_MARKUP:
+            problems.append(
+                f"L{row_number} id {node_id} 未知狀態「{values['status'] or '-'}」"
+                "（當成未完成）"
+            )
+        kind = values["kind"].casefold()
+        if kind not in DECISION_KIND_MARKUP:
+            problems.append(
+                f"L{row_number} id {node_id} 未知種類「{values['kind'] or '-'}」"
+            )
+        node = DecisionNode(
+            line=name,
+            row=row_number,
+            date=values["date"],
+            id=node_id,
+            parent=values["parent"],
+            kind=kind,
+            spec=values["spec"],
+            summary=values["summary"],
+            decision=values["decision"],
+            evidence=values["evidence"],
+            status=status,
+            agent=values["agent"],
+            merge_target=values["merge_target"],
+        )
+        previous = by_id.get(node_id)
+        if previous is None:
+            order.append(node_id)
+        elif (
+            previous.parent != node.parent
+            or previous.kind != node.kind
+            or previous.spec != node.spec
+            or previous.merge_target != node.merge_target
+        ):
+            problems.append(
+                f"L{row_number} id {node_id} 的 parent／kind／spec 與前一列不同，"
+                "沿用最後一列"
+            )
+        by_id[node_id] = node
+    return [by_id[node_id] for node_id in order], problems, title
+
+
+def pick_current_node(nodes: List[DecisionNode]) -> Optional[DecisionNode]:
+    """Latest node whose status is not done; all-done lines fall back to the newest."""
+    if not nodes:
+        return None
+    pending = [node for node in nodes if not node.is_done]
+    pool = pending or list(nodes)
+    return max(pool, key=lambda node: (node.date, node.row))
+
+
+def build_decision_line(name: str, text: str) -> DecisionLine:
+    """Link parent references into a forest and mark the current node."""
+    nodes, problems, title = parse_decision_table(text, name)
+    line = DecisionLine(name=name, title=title or name, nodes=nodes, problems=problems)
+    index = {node.id: node for node in nodes}
+    roots: List[DecisionNode] = []
+    attached: List[DecisionNode] = []
+    for node in nodes:
+        if node.parent in ("", "-"):
+            roots.append(node)
+        elif node.parent in index:
+            index[node.parent].children.append(node)
+            attached.append(node)
+        else:
+            problems.append(f"L{node.row} id {node.id} 的 parent「{node.parent}」找不到")
+    reachable: Set[str] = set()
+    stack = list(roots)
+    while stack:
+        node = stack.pop()
+        if node.id in reachable:
+            continue
+        reachable.add(node.id)
+        stack.extend(node.children)
+    for node in attached:
+        if node.id not in reachable:
+            problems.append(f"L{node.row} id {node.id} 的 parent 鏈形成迴圈")
+    line.roots = sorted(roots, key=lambda n: (0 if n.kind == "trunk" else 1, n.date, n.row))
+    for node in nodes:
+        node.children.sort(key=lambda child: (child.date, child.row))
+    tree_nodes = [node for node in nodes if node.id in reachable]
+    line.nodes = tree_nodes
+    line.current = pick_current_node(tree_nodes)
+    if line.current is not None:
+        line.current.current = True
+    return line
+
+
+def load_decision_board(directory: Optional[Path] = None, now: Optional[float] = None) -> DecisionBoard:
+    """Read every decisions file. One broken file never hides the other lines."""
+    folder = Path(directory) if directory is not None else decisions_directory()
+    board = DecisionBoard(
+        directory=folder,
+        refreshed_at=time.time() if now is None else now,
+    )
+    if folder.exists() and not folder.is_dir():
+        board.errors.append(f"決策路徑不是資料夾：{folder}")
+        return board
+    try:
+        paths = sorted(
+            path for path in folder.glob("*.md")
+            if path.is_file()
+            and ".bak-" not in path.name
+            and path.name not in DECISION_SKIP_FILES
+        )
+    except OSError as exc:
+        board.errors.append(f"決策目錄無法讀取：{folder}（{exc}）")
+        return board
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            board.errors.append(f"{path.name} 無法讀取：{exc}")
+            continue
+        try:
+            line = build_decision_line(path.stem, text)
+        except Exception as exc:  # 單一檔案的意外不能讓整頁消失
+            board.errors.append(f"{path.name} 解析失敗：{exc}")
+            continue
+        if line.nodes or line.problems:
+            board.lines.append(line)
+    board.lines.sort(key=lambda item: item.name.casefold())
+    return board
+
+
+class DecisionService:
+    """Cache the decisions forest; reread the folder at most once every 60 seconds."""
+
+    def __init__(self, directory: Optional[Path] = None):
+        self.directory = Path(directory) if directory is not None else decisions_directory()
+        self._board: Optional[DecisionBoard] = None
+
+    def board(self, now: Optional[float] = None, force: bool = False) -> DecisionBoard:
+        current = time.time() if now is None else now
+        if (
+            force
+            or self._board is None
+            or current - self._board.refreshed_at >= DECISIONS_REFRESH_SECONDS
+        ):
+            self._board = load_decision_board(self.directory, now=current)
+        return self._board
+
+
+def _walk_decision_nodes(
+    nodes: List[DecisionNode],
+    prefix: str = "",
+    top: bool = True,
+):
+    """Depth-first walk yielding (node, ancestor prefix, branch glyph, child indent)."""
+    for index, node in enumerate(nodes):
+        last = index == len(nodes) - 1
+        if top:
+            branch = ""
+            cont = prefix
+        else:
+            branch = "└─ " if last else "├─ "
+            cont = prefix + ("   " if last else "│  ")
+        yield node, prefix, branch, cont
+        yield from _walk_decision_nodes(node.children, cont, False)
+
+
+def _decision_line_header(line: DecisionLine) -> str:
+    header = (
+        f"[bold #7aa2f7]▌ {escape(line.name)}[/] "
+        f"[#565f89]{len(line.nodes)} 節點[/]"
+    )
+    if line.current is not None:
+        header += (
+            f"[#565f89] · 目前 [/]"
+            f"[bold #e0af68]{escape(line.current.id)}（{escape(line.current.status)}）[/]"
+        )
+    elif line.nodes:
+        header += "[#565f89] · 目前：無法判定[/]"
+    return header
+
+
+def _render_decision_nodes(line: DecisionLine, width: int) -> List[str]:
+    rows: List[str] = []
+    for node, prefix, branch, _cont in _walk_decision_nodes(line.roots):
+        color, glyph = DECISION_STATUS_MARKUP.get(node.status, ("#f7768e", "?"))
+        status_text = f"{glyph} {node.status or '?'}"
+        status_markup = f"[{color}]{escape(status_text)}[/]"
+        id_markup = f"[#c4c9d4]{escape(node.id)}[/]"
+        agent_text = f" @{node.agent}" if node.agent not in ("", "-") else ""
+        agent_markup = (
+            f" [#7dcfff]@{escape(node.agent)}[/]" if agent_text else ""
+        )
+        marker_text = " 目前 " if node.current else " "
+        marker_markup = "[bold #0f1117 on #9ece6a] 目前 [/] " if node.current else " "
+        kind_text = ""
+        kind_markup = ""
+        if node.kind not in ("branch", ""):
+            kind_color, kind_label = DECISION_KIND_MARKUP.get(
+                node.kind, ("#f7768e", node.kind or "?")
+            )
+            label = kind_label
+            if node.kind == "merge-back" and node.merge_target not in ("", "-"):
+                label = f"{kind_label}→{node.merge_target}"
+            kind_text = f" {label}"
+            kind_markup = f" [{kind_color}]{escape(label)}[/]"
+        base_text = f"{prefix}{branch}{node.date} "
+        base_markup = f"{prefix}{branch}[#565f89]{escape(node.date)}[/] "
+        head_markup = ""
+        for show_marker, show_agent, show_kind in (
+            (True, True, True), (True, True, False), (True, False, False), (False, False, False),
+        ):
+            plain = (
+                base_text + (marker_text if show_marker else " ") + status_text + " "
+                + node.id + (agent_text if show_agent else "") + (kind_text if show_kind else "")
+            )
+            if display_width(plain) <= width:
+                head_markup = (
+                    base_markup + (marker_markup if show_marker else " ") + status_markup + " "
+                    + id_markup + (agent_markup if show_agent else "")
+                    + (kind_markup if show_kind else "")
+                )
+                break
+        if not head_markup:
+            head_markup = escape(
+                truncate_display(
+                    base_text + marker_text + status_text + " " + node.id + agent_text + kind_text,
+                    width,
+                )
+            )
+        rows.append(head_markup)
+        summary_indent = prefix + ("   " if branch else "") + "  "
+        summary_width = max(12, width - display_width(summary_indent))
+        summary_style = "[bold #c4c9d4]" if node.current else "[#a9b1bd]"
+        for chunk in wrap_decision_text(node.summary or "-", summary_width):
+            rows.append(f"{summary_indent}{summary_style}{escape(chunk)}[/]")
+    return rows
+
+
+def render_decision_tree(
+    board: DecisionBoard,
+    width: int = 80,
+    now: Optional[float] = None,
+) -> str:
+    """Render every line's decision forest with the current node highlighted."""
+    current_time = time.time() if now is None else now
+    available = max(20, width - 6)
+    total = 0
+    counts = {"running": 0, "waiting": 0, "other": 0}
+    for line in board.lines:
+        for node, _prefix, _branch, _cont in _walk_decision_nodes(line.roots):
+            total += 1
+            if node.status == "running":
+                counts["running"] += 1
+            elif node.status == "waiting":
+                counts["waiting"] += 1
+            elif node.status != "done":
+                counts["other"] += 1
+    header_plain = (
+        f"架構樹  {len(board.lines)} 條線 · {total} 個節點 · "
+        f"進行中 {counts['running']} · 等待 {counts['waiting']}"
+    )
+    header = (
+        f"[bold #7aa2f7]架構樹[/] [#565f89]{len(board.lines)} 條線 · {total} 個節點 · "
+        f"進行中 {counts['running']} · 等待 {counts['waiting']}[/]"
+    )
+    if counts["other"]:
+        header += f" [#f7768e]狀態異常 {counts['other']}[/]"
+        header_plain += f" 狀態異常 {counts['other']}"
+    time_text = f"讀取 {time.strftime('%H:%M:%S', time.localtime(current_time))}"
+    if display_width(header_plain) + 3 + display_width(time_text) <= available:
+        refresh_text = f" · 每 {DECISIONS_REFRESH_SECONDS} 秒重讀"
+        if display_width(header_plain) + 3 + display_width(time_text + refresh_text) <= available:
+            time_text += refresh_text
+        header += f"[#565f89] · {time_text}[/]"
+    rows = [header]
+    for error in board.errors:
+        rows.append(f"[#f7768e]{escape(truncate_display(error, available))}[/]")
+    if not board.lines:
+        rows.append("[#565f89]找不到決策檔（decisions/*.md）[/]")
+    for index, line in enumerate(board.lines):
+        rows.append("")
+        rows.append(_decision_line_header(line))
+        if not line.nodes:
+            rows.append("[#565f89]  （沒有可顯示的節點）[/]")
+        rows.extend(_render_decision_nodes(line, available))
+        if line.problems:
+            rows.append(f"[#f7768e]  無法解析 {len(line.problems)} 列[/]")
+            for problem in line.problems[:6]:
+                rows.append(
+                    f"[#f7768e]    {escape(truncate_display(problem, available - 4))}[/]"
+                )
+            if len(line.problems) > 6:
+                rows.append(f"[#f7768e]    另有 {len(line.problems) - 6} 列[/]")
+    return "\n".join(rows)
+
+
+# ==============================================================================
 # Tab 1: Work Tab Renderers (In-place Static Text)
 # ==============================================================================
 
@@ -3810,8 +4278,11 @@ TabPane {
     color: #a9b1bd;
     padding-left: 1;
 }
-#arch-display, #quota-display, #history-display {
+#arch-display, #quota-display, #history-display, #tree-display {
     height: auto;
+}
+#tree-scroll {
+    padding: 0 1;
 }
 #state-message {
     height: auto;
@@ -4103,7 +4574,7 @@ class HelpScreen(ModalScreen):
             panel.border_title = "快捷鍵 · Esc / ? 返回"
             yield Static(
                 "[bold #9ece6a]AGENT WATCH v10 · 快捷鍵[/]\n\n"
-                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構\n\n"
+                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構    \\[5] 架構樹\n\n"
                 "[bold]工作頁[/]\n"
                 "  j / ↓        下一筆任務\n"
                 "  k / ↑        上一筆任務\n"
@@ -4130,6 +4601,9 @@ class HelpScreen(ModalScreen):
                 "[bold]架構頁[/]\n"
                 "  p            切換專案\n"
                 "  n / f        現在／未來架構\n\n"
+                "[bold]架構樹頁[/]\n"
+                "  R            立刻重讀 decisions/*.md（平常每 60 秒自動）\n"
+                "  ↑↓ / PgUp / PgDn  捲動（滑鼠滾輪亦可）\n\n"
                 "[bold]全域[/]\n"
                 "  ?            開啟／關閉此表\n"
                 "  Esc          關閉此表\n"
@@ -4365,6 +4839,7 @@ class AgentWatchApp(App):
         ("2", "switch_tab('tab-history')", "歷史 (2)"),
         ("3", "switch_tab('tab-quota')", "額度 (3)"),
         ("4", "switch_tab('tab-arch')", "架構 (4)"),
+        ("5", "switch_tab('tab-tree')", "架構樹 (5)"),
         ("j", "next_task", "下一筆"),
         ("down", "next_task", "下一筆"),
         ("k", "previous_task", "上一筆"),
@@ -4385,6 +4860,8 @@ class AgentWatchApp(App):
         ("u", "toggle_read", "已讀"),
         ("r", "restore_task", "撈回主頁"),
         ("g", "toggle_history_mode", "表格／分組"),
+        # Textual 8 sends uppercase letters as "R"; "shift+r" would never match.
+        ("R", "reload_decisions", "重讀架構樹"),
         ("space", "toggle_history_group", "收合專案組"),
         ("slash", "search_history", "搜尋"),
         ("escape", "clear_history_search", "清除搜尋"),
@@ -4395,6 +4872,7 @@ class AgentWatchApp(App):
         runs_path: Path = DEFAULT_RUNS_TSV,
         done_path: Path = DEFAULT_DONE_TSV,
         state_path: Optional[Path] = None,
+        decisions_path: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
@@ -4404,6 +4882,7 @@ class AgentWatchApp(App):
         self.log_parser = LogParser()
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
+        self.decision_svc = DecisionService(decisions_path)
         self.notified_keys: Set[str] = set()
         self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
@@ -4441,6 +4920,7 @@ class AgentWatchApp(App):
             for number, label, tab_id in (
                 (1, "工作", "tab-work"), (2, "歷史", "tab-history"),
                 (3, "額度", "tab-quota"), (4, "架構", "tab-arch"),
+                (5, "架構樹", "tab-tree"),
             ):
                 yield NavTab(f"[{number}] {label}", tab_id)
             yield Label("", id="clock")
@@ -4485,8 +4965,11 @@ class AgentWatchApp(App):
             with TabPane("[4] 架構", id="tab-arch"):
                 with VerticalScroll(id="arch-scroll"):
                     yield Static(id="arch-display")
+            with TabPane("[5] 架構樹", id="tab-tree"):
+                with VerticalScroll(id="tree-scroll"):
+                    yield Static(id="tree-display")
 
-        yield Static("1–4 分頁 │ j/k ↑↓ 選取 │ Enter 深入 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
+        yield Static("1–5 分頁 │ j/k ↑↓ 選取 │ Enter 深入 │ e 展開 │ ? 快捷鍵 │ q 離開", id="key-bar")
 
     def action_toggle_recent(self) -> None:
         self.expand_recent = not self.expand_recent
@@ -5006,8 +5489,30 @@ class AgentWatchApp(App):
             self.query_one("#key-bar", Static).update(
                 "/ 搜尋 Tab 篩選 g 表格/分組 Space 收合 r 撈回 │ i t u │ 1–4 ? q"
             )
+        elif tab_id == "tab-tree":
+            self.update_tree_display(force=True)
+            self.query_one("#key-bar", Static).update(
+                "R 重新讀取（每 60 秒自動）│ ↑↓ 捲動 │ 1–5 分頁 │ ? 快捷鍵 q 離開"
+            )
         else:
             self.query_one("#key-bar", Static).update("1–4 分頁 │ p 專案 n 現在 f 未來 │ ? 快捷鍵 q 離開")
+
+    def update_tree_display(self, force: bool = False) -> None:
+        """Repaint the decisions tree; force rereads the files instead of the cache."""
+        if not self._ui_ready:
+            return
+        try:
+            board = self.decision_svc.board(self._now, force=force)
+            markup = render_decision_tree(board, self.size.width, now=self._now)
+        except Exception as exc:  # 壞資料只降級這一頁
+            markup = f"[#f7768e]架構樹無法顯示：{escape(str(exc))}[/]"
+        self.query_one("#tree-display", Static).update(markup)
+
+    def action_reload_decisions(self) -> None:
+        self.update_tree_display(force=True)
+        self.show_state_message(
+            "架構樹已重讀：" + time.strftime("%H:%M:%S", time.localtime(self._now))
+        )
 
     def action_show_architecture_now(self) -> None:
         self.set_architecture_view("now")
@@ -5058,7 +5563,14 @@ class AgentWatchApp(App):
         self.quota_svc.refresh_in_background()
         self.data_svc.refresh_in_background()
         self.update_data()
+        self.update_tree_display(force=True)
         self.set_interval(2.0, self.poll_data)
+        self.set_interval(float(DECISIONS_REFRESH_SECONDS), self.refresh_decisions)
+
+    def refresh_decisions(self) -> None:
+        """60 秒一次的架構樹重讀；新增的決策檔不用改設定就會出現。"""
+        if self._ui_ready:
+            self.update_tree_display(force=True)
 
     def poll_data(self) -> None:
         self.quota_svc.refresh_in_background()
@@ -5256,6 +5768,7 @@ class AgentWatchApp(App):
                 self.architecture_project_id,
             )
             self.query_one("#arch-display", Static).update(arch_markup)
+            self.update_tree_display()
 
         except Exception as e:
             self.ui_error = f"畫面更新失敗：{e}"

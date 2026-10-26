@@ -5,7 +5,7 @@ agent-watch：在終端機即時看 AI agent 任務狀態的儀表板（Python T
 ## 測試
 ```
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m unittest test_watch test_v8
+.venv/bin/python -m unittest test_watch test_v8 test_tree
 ```
 改畫面後要跑全部測試，全過才算完成。
 
