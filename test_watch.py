@@ -1150,11 +1150,21 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 ]
                 app.quota_svc.refresh_in_background = lambda force=False: False
                 async with app.run_test(size=size) as pilot:
+                    # Wait for the background run reader to land and for its
+                    # deferred row focus to settle; a late TaskRow focus would
+                    # otherwise switch the tab back to work after the key press.
+                    for _ in range(200):
+                        if app.data_svc.has_snapshot and app._row_widgets:
+                            break
+                        await pilot.pause(0.01)
+                    for _ in range(3):
+                        await pilot.pause()
                     if tab_id != "tab-work":
                         await pilot.press({"tab-arch": "4", "tab-quota": "3"}[tab_id])
                     if filename.startswith("arch-"):
                         await pilot.press("f" if "future" in filename else "n")
                     await pilot.pause()
+                    self.assertEqual(app.query_one("#main-tabs").active, tab_id, filename)
                     svg = app.export_screenshot(title=filename)
                     (shots_dir / filename).write_text(svg, encoding="utf-8")
                     exported[filename] = svg
