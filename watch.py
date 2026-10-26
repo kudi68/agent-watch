@@ -173,9 +173,11 @@ PROJECT_LABEL_RE = re.compile(
 PROJECT_LABEL_STRIP_CHARS = "\"'“”‘’"
 # Paths a task's REPORT.md or run.log point at, e.g. ~/Projects/agent-watch/…
 PROJECT_PATH_MENTION_RE = re.compile(r"Projects/([A-Za-z0-9._-]+)/")
-# A path a task is told not to touch is not evidence of where the task ran.
+# A path a task is told not to touch is not evidence of where the task ran. Only a
+# negation of the verb counts: 唯讀／read-only describes the nature of a task, and a
+# read-only review did run on the paths it reviewed.
 PROJECT_PATH_FORBIDDEN_RE = re.compile(
-    r"不改|禁止|不[要]?碰|沒有碰|未碰|forbidden|read[ \t-]?only|唯讀", re.IGNORECASE
+    r"不[要]?改|不[要]?動|禁止|不[要]?碰|沒有碰|未碰|forbidden", re.IGNORECASE
 )
 PROJECT_PATH_MENTION_MIN = 3
 PROJECT_SIGNAL_READ_BYTES = 128 * 1024
