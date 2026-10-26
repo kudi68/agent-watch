@@ -323,9 +323,10 @@ expanded row:
    resolved back to its main repository, so a `personal-ai-os` worktree reports
    `personal-ai-os`; a plain clone inside the runs root is read from its origin URL.
 3. **Mentioned paths** (`路徑`) — the `~/Projects/<name>/` prefix mentioned most
-   often in `REPORT.md` or `run.log`: at least 3 mentions and at least twice the
-   runner-up. The runs root (`night`) is ignored there, because every task folder
-   lives under it.
+   often in `REPORT.md`: at least 3 mentions and at least twice the runner-up.
+   Lines that forbid a path (`不改`／`禁止`／`不碰`／`沒有碰`／`forbidden`／`read-only`) are
+   skipped, and `run.log` only corroborates a path the report already names. The
+   runs root (`night`) is ignored there, because every task folder lives under it.
 4. **Keywords** (`關鍵字`) — `match_keywords` (task name), `path_keywords` (log and
    report paths) and `match_patterns` (regular expressions), with alphanumeric
    boundaries (`misc-task` does not match `sc-`, and `desk1` does not match `K1`);
@@ -334,6 +335,11 @@ expanded row:
    `night`. It records which dispatcher started the task, so on its own it is only
    the last resort and never overrides a git root or the paths a task touched.
 6. Anything left goes to `other` (`未判斷`).
+
+Known limitation: rule 2 only sees a checkout that lives in the task folder or one
+level below it. A task that ran directly in a live repository (`~/Projects/<name>`)
+while the task folder holds no checkout cannot be seen as git evidence — the TSV
+has no workdir column — so it falls through to the path and keyword rules.
 
 An explicit TSV value that is not configured still goes to `other` with one data
 warning. Optional `repo_paths` maps repository locations (for example

@@ -169,8 +169,14 @@ PROJECT_SOURCE_ORDER = (
 PROJECT_LABEL_RE = re.compile(
     r"(?im)^[ \t>*_#`\-]*(?:project|line)[ \t]*[*_`]*[ \t]*[:：][ \t]*([^\s*`|,，;；()（）]+)"
 )
+# Values are often quoted in a status header (`project: "agent-watch"`).
+PROJECT_LABEL_STRIP_CHARS = "\"'“”‘’"
 # Paths a task's REPORT.md or run.log point at, e.g. ~/Projects/agent-watch/…
 PROJECT_PATH_MENTION_RE = re.compile(r"Projects/([A-Za-z0-9._-]+)/")
+# A path a task is told not to touch is not evidence of where the task ran.
+PROJECT_PATH_FORBIDDEN_RE = re.compile(
+    r"不改|禁止|不[要]?碰|沒有碰|未碰|forbidden|read[ \t-]?only|唯讀", re.IGNORECASE
+)
 PROJECT_PATH_MENTION_MIN = 3
 PROJECT_SIGNAL_READ_BYTES = 128 * 1024
 PROJECT_SIGNAL_CACHE_LIMIT = 800
@@ -288,8 +294,19 @@ def _read_signal_text(path: Path, tail: bool = False) -> str:
 
 
 def _label_from_file(path: Path) -> str:
-    match = PROJECT_LABEL_RE.search(_read_signal_text(path))
-    return match.group(1).strip() if match else ""
+    """First `project:` / `line:` value in the file that names a known project.
+
+    Values may be quoted, and an unrelated `Line: 42` before the real label must
+    not use up the one chance the file gets, so every matching line is tried.
+    """
+    for match in PROJECT_LABEL_RE.finditer(_read_signal_text(path)):
+        value = match.group(1).strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
+        if not value:
+            continue
+        _, error = resolve_project(value)
+        if not error:
+            return value
+    return ""
 
 
 def task_project_label(task_dir: Path) -> str:
@@ -432,22 +449,38 @@ def task_git_project(task_dir: Path) -> str:
                 return project_id
         return ""
 
-    return _cached_signal(
+    project_id = _cached_signal(
         _PROJECT_GIT_CACHE, str(task_dir), _directory_stamp(task_dir), produce
     )
+    if not project_id:
+        # `git worktree add` creates `repo/` before `repo/.git`, so a poll can land
+        # in between; an empty answer is cheap to re-check and must not stick.
+        _PROJECT_GIT_CACHE.pop(str(task_dir), None)
+    return project_id
 
 
 def task_path_project(task_dir: Path) -> str:
     """Project whose ~/Projects/<name>/ path a task mentions most often."""
 
-    def produce() -> str:
+    def mentions(filename: str, tail: bool) -> Dict[str, int]:
         counts: Dict[str, int] = {}
-        for filename, tail in (("REPORT.md", False), ("run.log", True)):
-            text = _read_signal_text(task_dir / filename, tail=tail)
-            for name in PROJECT_PATH_MENTION_RE.findall(text):
+        for line in _read_signal_text(task_dir / filename, tail=tail).splitlines():
+            # "do not touch ~/Projects/c1-runtime" names a path the task did not change.
+            if PROJECT_PATH_FORBIDDEN_RE.search(line):
+                continue
+            for name in PROJECT_PATH_MENTION_RE.findall(line):
                 counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def produce() -> str:
+        counts = mentions("REPORT.md", False)
         if not counts:
+            # A log alone cannot decide: it may only quote the rules of the dispatch.
             return ""
+        for name, count in mentions("run.log", True).items():
+            # run.log is corroboration, so it only adds to a path the report names.
+            if name in counts:
+                counts[name] += count
         workspace = ROOT_DIR.name.casefold()
         tallies: Dict[str, int] = {}
         for name, count in counts.items():

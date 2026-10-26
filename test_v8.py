@@ -1150,6 +1150,87 @@ class ProjectEvidenceOrderTests(unittest.TestCase):
         project, source, _ = self.infer(folder, "完全無關的任務")
         self.assertEqual((project, source), ("ios-shortcuts", "標籤"))
 
+    def test_quoted_label_value_is_read(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            '# 任務\nproject: "agent-watch"\n', encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("agent-watch", "標籤"))
+
+    def test_unrelated_line_number_does_not_use_up_the_label(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            "Line: 42\nlog 貼上的 line: foo\nproject: ios-shortcuts\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("ios-shortcuts", "標籤"))
+
+    def test_unknown_label_falls_through_to_the_next_known_one(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            "project: no-such-project\nproject: personal-ai-os\n", encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("personal-ai-os", "標籤"))
+
+    def test_path_named_only_as_forbidden_is_not_evidence(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text(
+            "不改 ~/Projects/c1-runtime/*\n"
+            "不改 ~/Projects/c1-runtime/hermes/a.py\n"
+            "禁止 ~/Projects/c1-runtime/b.py\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_run_log_cannot_decide_paths_on_its_own(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text("只改了幾個檔\n", encoding="utf-8")
+        (folder / "run.log").write_text(
+            "~/Projects/c1-runtime/a\n" * 5, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_a_single_forbidden_mention_is_not_padded_by_the_log(self):
+        folder = self.task_dir("backup-inventory")
+        (folder / "REPORT.md").write_text(
+            "沒有碰 `~/.hermes`、`~/Projects/c1-runtime/*`、Keychain。\n",
+            encoding="utf-8",
+        )
+        (folder / "run.log").write_text(
+            "~/Projects/c1-runtime/a\n" * 5, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "backup-inventory")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_run_log_corroborates_a_path_the_report_names(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text(
+            "主要改 ~/Projects/agent-watch/watch.py\n"
+            "測試 ~/Projects/agent-watch/test_v8.py\n"
+            "說明 ~/Projects/agent-watch/README.md\n",
+            encoding="utf-8",
+        )
+        (folder / "run.log").write_text(
+            "~/Projects/agent-watch/watch.py\n" * 3, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("agent-watch", "路徑"))
+
+    def test_empty_git_answer_is_not_cached(self):
+        folder = self.task_dir("late-checkout")
+        checkout = folder / "repo"
+        checkout.mkdir()
+        self.assertEqual(watch.task_git_project(folder), "")
+        # git worktree add writes repo/ before repo/.git; the task folder's mtime
+        # does not change for the second half, so the empty answer must not stick.
+        self.add_worktree(folder, "agent-watch")
+        self.assertEqual(watch.task_git_project(folder), "agent-watch")
+
     def test_git_root_wins_over_keywords_and_mentioned_paths(self):
         folder = self.task_dir("shortcut-cleanup")
         self.add_worktree(folder, "agent-watch")
