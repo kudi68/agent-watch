@@ -324,9 +324,13 @@ expanded row:
    `personal-ai-os`; a plain clone inside the runs root is read from its origin URL.
 3. **Mentioned paths** (`路徑`) — the `~/Projects/<name>/` prefix mentioned most
    often in `REPORT.md`: at least 3 mentions and at least twice the runner-up.
-   Lines that forbid a path (`不改`／`禁止`／`不碰`／`沒有碰`／`forbidden`／`read-only`) are
-   skipped, and `run.log` only corroborates a path the report already names. The
-   runs root (`night`) is ignored there, because every task folder lives under it.
+   A path a negation names (`不改`／`不要改`／`不要動`／`不動`／`禁止`／`不碰`／`沒有碰`／`未碰`／
+   `forbidden`) is skipped, but only that path: in `不改 ~/Projects/c1-runtime，只改
+   ~/Projects/agent-watch/watch.py` the second path still counts. `唯讀` and
+   `read-only` describe what a task may do, not a path it avoided, so a read-only
+   review is still grouped by the paths it reviewed. `run.log` only corroborates a
+   path the report already names. The runs root (`night`) is ignored there, because
+   every task folder lives under it.
 4. **Keywords** (`關鍵字`) — `match_keywords` (task name), `path_keywords` (log and
    report paths) and `match_patterns` (regular expressions), with alphanumeric
    boundaries (`misc-task` does not match `sc-`, and `desk1` does not match `K1`);

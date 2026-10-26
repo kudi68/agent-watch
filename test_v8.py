@@ -1207,6 +1207,46 @@ class ProjectEvidenceOrderTests(unittest.TestCase):
         project, source, _ = self.infer(folder, "backup-inventory")
         self.assertEqual((project, source), ("other", "未判斷"))
 
+    def test_read_only_review_groups_by_the_paths_it_reviewed(self):
+        folder = self.task_dir("aw-reread")
+        (folder / "REPORT.md").write_text(
+            "唯讀審查 ~/Projects/agent-watch/watch.py\n" * 3, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "aw-reread")
+        self.assertEqual((project, source), ("agent-watch", "路徑"))
+
+    def test_english_read_only_review_groups_by_path(self):
+        folder = self.task_dir("os-audit")
+        (folder / "REPORT.md").write_text(
+            "read-only review of ~/Projects/personal-ai-os/bin/app.py\n"
+            "read only review of ~/Projects/personal-ai-os/tests/a.py\n"
+            "readonly review of ~/Projects/personal-ai-os/README.md\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "os-audit")
+        self.assertEqual((project, source), ("personal-ai-os", "路徑"))
+
+    def test_do_not_touch_paths_are_not_evidence(self):
+        folder = self.task_dir("wp34-install")
+        (folder / "REPORT.md").write_text(
+            "不改 ~/Projects/c1-runtime/\n"
+            "不要改 ~/Projects/c1-runtime/a.py\n"
+            "不要動 ~/Projects/c1-runtime/\n"
+            "不動 ~/Projects/c1-runtime/b.py\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "wp34-install")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_forbidden_path_on_a_shared_line_does_not_drop_the_normal_one(self):
+        folder = self.task_dir("wp3-allowlist")
+        (folder / "REPORT.md").write_text(
+            "不改 ~/Projects/c1-runtime，只改 ~/Projects/agent-watch/watch.py\n" * 3,
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "wp3-allowlist")
+        self.assertEqual((project, source), ("agent-watch", "路徑"))
+
     def test_run_log_corroborates_a_path_the_report_names(self):
         folder = self.task_dir("wp5-install")
         (folder / "REPORT.md").write_text(
