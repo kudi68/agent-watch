@@ -1,4 +1,4 @@
-"""Tests for the 架構樹 tab: decisions parsing, tree building, current node, rendering."""
+"""Tests for the 專案樹 tab: decisions parsing, tree building, current node, rendering."""
 
 import os
 import tempfile
@@ -439,7 +439,7 @@ class TreeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one("#main-tabs", watch.TabbedContent).active, "tab-tree")
             text = await self.screen_text(app)
-            self.assertIn("架構樹", text)
+            self.assertIn("專案樹", text)
             self.assertIn("demo", text)
             self.assertIn("目前工作進行中", text)
             self.assertIn("目前", text)

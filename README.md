@@ -97,7 +97,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `2` | History tab |
 | `3` | Quota tab |
 | `4` | Architecture tab |
-| `5` | Decision-tree tab (架構樹) |
+| `5` | Project-tree tab (專案樹) |
 | `j` / `k`, arrows | Select next / previous task |
 | `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup (its last two rows hand the question to an upper agent) |
 | `e` | Work: expand / collapse recent completions |
@@ -221,23 +221,26 @@ note: （備註照留，可空）
 `x` 清除、`X` 清除過期／被取代、通知只跳一次、格式錯誤只顯示原文、Esc 取消與備註流程
 都跟原本一樣，沒有改動 SPEC §3.3 的檔案格式。
 
-### 架構樹頁（decisions 決策節點）
+### 專案樹頁（decisions 決策節點）
 
-`5` 開啟架構樹頁。每個 `~/Projects/status/decisions/<line>.md` 是一條線，一棵以
-`parent` 連成的樹，`trunk` 放在最上面，越往下是越新的節點。每列顯示日期、狀態
-（`✓ done`／`● running`／`○ waiting`）、節點 id、負責 agent 與摘要；`merge-back`
-另外顯示合流目標。
+`5` 開啟專案樹頁。這一頁回答一個問題：每個專案現在走到哪。
 
-每條線的標題列會寫出「目前」節點：最新一個 `status` 不是 `done` 的節點；如果整條線
-都 `done`，取日期最新的節點。該列用綠底「目前」標記、摘要加粗，方便一眼看出走到哪。
+每個 `~/Projects/status/decisions/<line>.md` 是一條線。節點用 `parent` 連成一棵樹。
+`trunk` 在最上面。越往下，節點越新。每列顯示日期、狀態（`✓ done`／`● running`／
+`○ waiting`）、節點 id、負責 agent 與摘要。`merge-back` 另外顯示合流目標。
 
-載入時讀一次，之後每 60 秒重讀整個資料夾，`R` 可立刻重讀。新增的 `<line>.md`
-不必改任何設定就會自動出現；`FORMAT.md` 與 `*.bak-*` 會跳過。欄數不對、`parent`
-找不到、parent 迴圈、id／日期／狀態格式異常的列不會讓整頁掛掉：它們被排除在樹外，
-列在該線底下的「無法解析」小區，正常節點照常顯示。同一 id 有多列時依格式說明取
-最後一列當目前狀態，前面的列只用來保留開啟日期。
+標題列會標出「目前」節點。規則是：取最新一個 `status` 不是 `done` 的節點。如果整條
+線都 `done`，取日期最新的節點。該列有綠底「目前」標記。摘要加粗。
 
-這一頁只讀檔，不查程序、不寫任何東西，也不修改 `decisions/*.md`。
+看板載入時讀一次檔。之後每 60 秒自動重讀整個資料夾。按 `R` 可以立刻重讀。新增的
+`<line>.md` 會自動出現，不必改設定。`FORMAT.md` 與 `*.bak-*` 會跳過。
+
+壞資料不會讓整頁消失。欄數不對、`parent` 找不到、parent 迴圈、id／日期／狀態格式
+異常的列會排到樹外。它們列在該線底下的「無法解析」小區。正常節點照常顯示。
+
+同一個 id 有很多列時，看板取最後一列當目前狀態。前面的列只保留開啟日期。
+
+這一頁只讀檔。它不查程序，不寫任何東西，也不改 `decisions/*.md`。
 
 Run once and print a plain-text summary instead of the full-screen UI (works
 without a TTY, useful for logs and CI):
@@ -250,6 +253,29 @@ without a TTY, useful for logs and CI):
 If neither `magpie` nor a Codex sessions directory is available, the quota line
 shows `無資料` (no data). That is expected and not an error; every other part of
 the dashboard keeps working.
+
+### 額度頁的 Grok Bot 與 Cursor
+
+額度頁除了 magpie 的服務，還讀兩個本機檔。兩個檔都只讀，不執行任何外部指令。
+
+- **Grok Bot**：`~/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json`。
+  看板只取 `series` 裡 `providerId` 是 `grok-bot` 的那一筆，用最後一個 sample 的
+  `usedPercent`、`resetAt`、`sampledAt`、`durationSeconds`。畫面顯示「Grok Bot · 7 天」
+  窗口與讀取時間。帳號欄位不讀、不顯示、不記錄。這個檔約 2 MB，所以看板在背景執行緒
+  讀，並快取至少 60 秒；mtime 沒變就不重讀。
+- **Cursor**：`~/Projects/status/quota-codexbar.json`（已去識別化的匯出檔）。只取
+  `providers` 裡 `provider` 是 `cursor` 的 `windows[].label`、`usedPercent`、
+  `resetsAt` 與 `updatedAt`。
+
+任一個檔讀不到、JSON 壞掉或沒有對應區塊時，該服務就顯示「無資料」。看板不猜數字。
+時間進度（時間過了多少 vs 用量多少）跟其他服務用同一套規則。
+
+### 完成時間
+
+已完成的任務都顯示台北時間加相對時間，例如 `完成：10/27 02:17（12 分鐘前）`。
+今天的任務也帶日期。相對時間的規則：不滿 1 分鐘顯示「剛剛」；不滿 60 分鐘顯示
+「N 分鐘前」；不滿 24 小時顯示「N 小時 M 分前」；再久就顯示「N 天前」。
+時間未知時照舊顯示「時間未確認」。欄位太窄時先縮成果文字，完成時間不縮。
 
 ## Configuration
 
@@ -264,8 +290,10 @@ Everything machine-specific is read from the environment. CLI flags `--runs` and
 | `AGENT_WATCH_STATE` | `~/Projects/night/agent-watch-state.json` | Dashboard-owned state; independent of runs root |
 | `AGENT_WATCH_CODEX_SESSIONS` | `~/.codex/sessions` | Codex session logs used for quota |
 | `AGENT_WATCH_ARCH` | `arch.json` next to `watch.py` | Architecture graph definition |
-| `AGENT_WATCH_DECISIONS` | `~/Projects/status/decisions` | Decision-node folder shown in the 架構樹 tab |
+| `AGENT_WATCH_DECISIONS` | `~/Projects/status/decisions` | Decision-node folder shown in the 專案樹 tab |
 | `AGENT_WATCH_MAGPIE` | `magpie` | Executable used for `quota --json` |
+| `AGENT_WATCH_GROK_QUOTA` | `~/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json` | Syrtis pace history read for the Grok Bot window |
+| `AGENT_WATCH_CURSOR_QUOTA` | `~/Projects/status/quota-codexbar.json` | De-identified CodexBar export read for the Cursor windows |
 
 `scripts/night-watch.sh` uses `AGENT_WATCH_RUNS_ROOT` in its `main_example`; the bash
 test accepts `NIGHT_WATCH_SCRIPT` to point at a different copy of that helper.
@@ -416,7 +444,7 @@ arch.json                 architecture views and the real project table
 agent-watch-v8            launcher using .venv/bin/python
 test_watch.py             UI and behaviour tests
 test_v8.py                status and quota regression tests
-test_tree.py              decisions parsing, trees, current node, 架構樹 tab
+test_tree.py              decisions parsing, trees, current node, 專案樹 tab
 tests/test_night_watch.sh bash tests for scripts/night-watch.sh
 tests/fixtures/           quota JSON fixtures
 scripts/night-watch.sh    PID/result-report helper
@@ -431,7 +459,7 @@ agent-watch 是一個純終端機的 AI agent 監控看板。它讀取 TSV 清�
 所有路徑與外部指令都可用環境變數覆寫，預設值指向 `~/Projects/night`（只是預設，可用
 `AGENT_WATCH_RUNS_ROOT` 改）。第一次使用先建好 `.venv`（`./agent-watch-v8` 需要它），
 再建立空的 `agent-runs.tsv`（或指定自己的目錄），否則只會看到「TSV 不存在」提示。
-安裝後執行 `./agent-watch-v8`；按鍵 `1`/`2`/`3`/`4`/`5` 切換工作、歷史、額度、架構、架構樹分頁，`E`
+安裝後執行 `./agent-watch-v8`；按鍵 `1`/`2`/`3`/`4`/`5` 切換工作、歷史、額度、架構、專案樹分頁，`E`
 展開／收起剛完成清單，`P` 切換專案，`N`/`F` 切換架構頁的現在／未來視圖，`?` 開關
 快捷鍵表，`Q` 離開。或加 `--once` 印出單次摘要。
 沒安裝 magpie 或沒有 Codex sessions 時，額度列顯示「無資料」屬正常。測試指令見上。

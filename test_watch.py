@@ -642,7 +642,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             self.assertEqual(first.elapsed, "~00:02:30")
             self.assertEqual(later.elapsed, "~00:02:30")
             self.assertEqual(first.completion_time, finished)
-            self.assertEqual(format_completion_time(0), "08:00")
+            self.assertRegex(format_completion_time(0), r"^1970/01/01 08:00（\d+ 天前）$")
 
     def test_archived_completion_time_stays_frozen(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -666,7 +666,29 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             self.assertEqual(first.completion_time, finished)
             self.assertEqual(first.elapsed, "~00:04:00")
             self.assertEqual(later.elapsed, first.elapsed)
-            self.assertRegex(render_done_tasks([later]), r"完成：\d{2}:\d{2}")
+            self.assertRegex(render_done_tasks([later]), r"完成：(\d{4}/)?\d{2}/\d{2} \d{2}:\d{2}（[^）]+）")
+
+    def test_completion_time_shows_taipei_date_and_relative_age(self):
+        now = watch.quota_epoch("2026-10-27T02:29:00+08:00")
+        self.assertEqual(watch.format_relative_time(now - 30, now), "剛剛")
+        self.assertEqual(watch.format_relative_time(now - 12 * 60, now), "12 分鐘前")
+        self.assertEqual(watch.format_relative_time(now - 65 * 60, now), "1 小時 5 分前")
+        self.assertEqual(watch.format_relative_time(now - 3 * 86400, now), "3 天前")
+        # Today keeps its date: the boss must see how old the run is, not just a clock.
+        self.assertEqual(format_completion_time(now - 12 * 60, now), "10/27 02:17（12 分鐘前）")
+        self.assertEqual(format_completion_time(None, now), "時間未確認")
+
+    def test_done_row_keeps_the_completion_time_when_columns_are_tight(self):
+        now = watch.quota_epoch("2026-10-27T02:29:00+08:00")
+        agent = AgentInfo(
+            "長名稱任務", Path("/tmp/run.log"), Path("/tmp/REPORT.md"), "complete",
+            "model-x", now - 3600, "~01:00:00", "成果" * 80,
+            completion_time=now - 12 * 60, stage="階段" * 30,
+            harness="codex", project="agent-watch", project_source="標籤",
+        )
+        markup = render_done_tasks([agent], width=70, now=now)
+        self.assertIn("完成：10/27 02:17（12 分鐘前）", markup)
+        self.assertIn("…", markup)
 
     def test_completion_list_sorts_newest_first(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -857,7 +879,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             self.assertEqual(agent.last_path, report)
             self.assertEqual(agent.stage, "P2 回歸驗證中")
             self.assertIn("目前階段：P2 回歸驗證中", markup)
-            self.assertRegex(markup, r"完成：\d{2}:\d{2}")
+            self.assertRegex(markup, r"完成：(\d{4}/)?\d{2}/\d{2} \d{2}:\d{2}（[^）]+）")
 
     def test_dead_pid_with_new_branch_commit_is_complete(self):
         with tempfile.TemporaryDirectory() as tmpdir:

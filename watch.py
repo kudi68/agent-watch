@@ -229,6 +229,8 @@ QUOTA_PROVIDER_NAMES = {
     "claude": "Claude",
     "opencode-go": "OpenCode Go",
     "openrouter": "OpenRouter",
+    "grok-bot": "Grok Bot",
+    "cursor": "Cursor",
 }
 
 
@@ -2567,6 +2569,159 @@ def normalize_magpie_item(value: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def grok_quota_path() -> Path:
+    """Syrtis pace history; only one series and one sample are ever read."""
+    return _env_path(
+        "AGENT_WATCH_GROK_QUOTA",
+        Path.home() / "Library" / "Application Support" / "com.nyanako.tokenbar"
+        / "quota-pace-history-v3.json",
+    )
+
+
+def cursor_quota_path() -> Path:
+    """De-identified CodexBar export kept under the status folder."""
+    return _env_path(
+        "AGENT_WATCH_CURSOR_QUOTA",
+        Path.home() / "Projects" / "status" / "quota-codexbar.json",
+    )
+
+
+GROK_QUOTA_REFRESH_SECONDS = 60
+_GROK_QUOTA_LOCK = threading.Lock()
+_GROK_QUOTA_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _quota_item_without_data(provider: str, name: str, reason: str) -> Dict[str, Any]:
+    return {"provider": provider, "name": name, "asOf": None, "windows": [], "reason": reason}
+
+
+def read_grok_quota_item(
+    path: Optional[Path] = None,
+    now: Optional[float] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Read the last grok-bot sample; account fields never leave the file."""
+    target = Path(path) if path is not None else grok_quota_path()
+    try:
+        stamp_file = target.stat()
+    except OSError:
+        return _quota_item_without_data("grok-bot", "Grok Bot", "無資料（找不到歷史檔）")
+    current = time.monotonic() if now is None else now
+    key = str(target)
+    with _GROK_QUOTA_LOCK:
+        cached = _GROK_QUOTA_CACHE.get(key)
+    if cached is not None and not force:
+        if current - cached["read_at"] < GROK_QUOTA_REFRESH_SECONDS \
+                or cached["mtime"] == stamp_file.st_mtime:
+            return copy.deepcopy(cached["item"])
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return _quota_item_without_data("grok-bot", "Grok Bot", "無資料（JSON 格式錯誤）")
+
+    series = payload.get("series") if isinstance(payload, dict) else None
+    entry = next(
+        (row for row in series
+         if isinstance(row, dict) and row.get("providerId") == "grok-bot"),
+        None,
+    ) if isinstance(series, list) else None
+    samples = entry.get("samples") if isinstance(entry, dict) else None
+    sample = samples[-1] if isinstance(samples, list) and samples else None
+    if not isinstance(sample, dict):
+        item = _quota_item_without_data(
+            "grok-bot", "Grok Bot", "無資料（沒有 grok-bot 系列）",
+        )
+        with _GROK_QUOTA_LOCK:
+            _GROK_QUOTA_CACHE[key] = {
+                "read_at": current, "mtime": stamp_file.st_mtime,
+                "item": copy.deepcopy(item),
+            }
+        return item
+
+    used = valid_quota_percent(sample.get("usedPercent"))
+    reset = quota_epoch(sample.get("resetAt"))
+    duration = sample.get("durationSeconds")
+    minutes = (
+        duration / 60
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0
+        else None
+    )
+    if used is None or reset is None:
+        item = _quota_item_without_data(
+            "grok-bot", "Grok Bot", "無資料（樣本沒有有效數字）",
+        )
+        with _GROK_QUOTA_LOCK:
+            _GROK_QUOTA_CACHE[key] = {
+                "read_at": current, "mtime": stamp_file.st_mtime,
+                "item": copy.deepcopy(item),
+            }
+        return item
+    item = {
+        "provider": "grok-bot",
+        "name": "Grok Bot",
+        "asOf": sample.get("sampledAt"),
+        "windows": [{
+            "name": "7 days" if minutes == 10080 else "額度窗口",
+            "used": round(used, 1),
+            "resetsAt": reset,
+            "window_minutes": minutes,
+        }],
+    }
+    with _GROK_QUOTA_LOCK:
+        _GROK_QUOTA_CACHE[key] = {
+            "read_at": current, "mtime": stamp_file.st_mtime,
+            "item": copy.deepcopy(item),
+        }
+    return item
+
+
+def read_cursor_quota_item(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read only the cursor provider block from the de-identified export."""
+    target = Path(path) if path is not None else cursor_quota_path()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except OSError:
+        return _quota_item_without_data("cursor", "Cursor", "無資料（找不到匯出檔）")
+    except (UnicodeDecodeError, ValueError):
+        return _quota_item_without_data("cursor", "Cursor", "無資料（JSON 格式錯誤）")
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    entry = next(
+        (row for row in providers
+         if isinstance(row, dict) and str(row.get("provider") or "").casefold() == "cursor"),
+        None,
+    ) if isinstance(providers, list) else None
+    if not isinstance(entry, dict):
+        return _quota_item_without_data("cursor", "Cursor", "無資料（沒有 cursor 區塊）")
+    windows = []
+    raw_windows = entry.get("windows")
+    if isinstance(raw_windows, list):
+        for window in raw_windows:
+            if not isinstance(window, dict):
+                continue
+            used = valid_quota_percent(window.get("usedPercent"))
+            if used is None:
+                continue
+            minutes = window.get("windowMinutes")
+            windows.append({
+                "name": str(window.get("label") or "額度窗口"),
+                "used": used,
+                "resetsAt": window.get("resetsAt"),
+                "window_minutes": (
+                    minutes
+                    if isinstance(minutes, (int, float)) and not isinstance(minutes, bool)
+                    else None
+                ),
+            })
+    if not windows:
+        return _quota_item_without_data("cursor", "Cursor", "無資料（窗口沒有有效數字）")
+    return {
+        "provider": "cursor",
+        "name": "Cursor",
+        "asOf": entry.get("updatedAt"),
+        "windows": windows,
+    }
+
+
 class QuotaService:
     """Fetches Codex session quota and optional non-Codex magpie quota."""
 
@@ -2670,6 +2825,14 @@ class QuotaService:
                 items = [item for item in items if str(item.get("provider", "")).lower() != "codex"]
                 items.insert(0, codex_item)
                 providers.add("codex")
+        for local_item in (read_grok_quota_item(), read_cursor_quota_item()):
+            provider = local_item["provider"]
+            items = [
+                item for item in items
+                if str(item.get("provider", "")).casefold() != provider
+            ]
+            items.append(local_item)
+            providers.add(provider)
         for provider in QUOTA_PROVIDER_NAMES:
             if provider not in providers:
                 items.append({
@@ -3231,7 +3394,7 @@ def render_architecture_view(
 
 
 # ==============================================================================
-# 架構樹頁：~/Projects/status/decisions/*.md 的決策節點森林
+# 專案樹頁：~/Projects/status/decisions/*.md 的決策節點森林
 # ==============================================================================
 
 DECISIONS_REFRESH_SECONDS = 60
@@ -3384,10 +3547,10 @@ def parse_decision_table(
             header_seen = True
             if any(cell.casefold() in DECISION_COLUMNS for cell in cells):
                 continue
-            problems.append(f"L{row_number} 第一列不是標準表頭，直接當資料列解讀")
+            problems.append(f"L{row_number} 第一列不是表頭。當成資料列解讀。")
         if len(cells) != len(DECISION_COLUMNS):
             problems.append(
-                f"L{row_number} 欄數 {len(cells)}，需 {len(DECISION_COLUMNS)}："
+                f"L{row_number} 欄數 {len(cells)}。需 {len(DECISION_COLUMNS)} 欄。內容："
                 f"{truncate_display(stripped, 72)}"
             )
             continue
@@ -3398,14 +3561,14 @@ def parse_decision_table(
             continue
         if not DECISION_ID_RE.match(node_id):
             problems.append(
-                f"L{row_number} id「{truncate_display(node_id, 24)}」格式不對"
-                "（小寫英數字與 -）"
+                f"L{row_number} id「{truncate_display(node_id, 24)}」格式不對。"
+                "請用小寫英文、數字與 -。"
             )
             continue
         status = values["status"].casefold()
         if not DECISION_DATE_RE.match(values["date"]):
             problems.append(
-                f"L{row_number} id {node_id} 日期格式異常：{values['date'] or '-'}"
+                f"L{row_number} id {node_id} 日期格式異常。值：{values['date'] or '-'}"
             )
         if status not in DECISION_STATUS_MARKUP:
             problems.append(
@@ -3442,8 +3605,8 @@ def parse_decision_table(
             or previous.merge_target != node.merge_target
         ):
             problems.append(
-                f"L{row_number} id {node_id} 的 parent／kind／spec 與前一列不同，"
-                "沿用最後一列"
+                f"L{row_number} id {node_id} 的 parent／kind／spec 與前一列不同。"
+                "沿用最後一列。"
             )
         by_id[node_id] = node
     return [by_id[node_id] for node_id in order], problems, title
@@ -3503,7 +3666,7 @@ def load_decision_board(directory: Optional[Path] = None, now: Optional[float] =
         refreshed_at=time.time() if now is None else now,
     )
     if folder.exists() and not folder.is_dir():
-        board.errors.append(f"決策路徑不是資料夾：{folder}")
+        board.errors.append(f"決策路徑不是資料夾。路徑：{folder}")
         return board
     try:
         paths = sorted(
@@ -3513,18 +3676,18 @@ def load_decision_board(directory: Optional[Path] = None, now: Optional[float] =
             and path.name not in DECISION_SKIP_FILES
         )
     except OSError as exc:
-        board.errors.append(f"決策目錄無法讀取：{folder}（{exc}）")
+        board.errors.append(f"決策目錄無法讀取。路徑：{folder}。原因：{exc}")
         return board
     for path in paths:
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            board.errors.append(f"{path.name} 無法讀取：{exc}")
+            board.errors.append(f"{path.name} 無法讀取。原因：{exc}")
             continue
         try:
             line = build_decision_line(path.stem, text)
         except Exception as exc:  # 單一檔案的意外不能讓整頁消失
-            board.errors.append(f"{path.name} 解析失敗：{exc}")
+            board.errors.append(f"{path.name} 解析失敗。原因：{exc}")
             continue
         if line.nodes or line.problems:
             board.lines.append(line)
@@ -3571,7 +3734,7 @@ def _walk_decision_nodes(
 def _decision_line_header(line: DecisionLine) -> str:
     header = (
         f"[bold #7aa2f7]▌ {escape(line.name)}[/] "
-        f"[#565f89]{len(line.nodes)} 節點[/]"
+        f"[#565f89]{len(line.nodes)} 個節點[/]"
     )
     if line.current is not None:
         header += (
@@ -3579,7 +3742,7 @@ def _decision_line_header(line: DecisionLine) -> str:
             f"[bold #e0af68]{escape(line.current.id)}（{escape(line.current.status)}）[/]"
         )
     elif line.nodes:
-        header += "[#565f89] · 目前：無法判定[/]"
+        header += "[#565f89] · 目前：無法判斷[/]"
     return header
 
 
@@ -3660,19 +3823,19 @@ def render_decision_tree(
             elif node.status != "done":
                 counts["other"] += 1
     header_plain = (
-        f"架構樹  {len(board.lines)} 條線 · {total} 個節點 · "
+        f"專案樹  {len(board.lines)} 條線 · {total} 個節點 · "
         f"進行中 {counts['running']} · 等待 {counts['waiting']}"
     )
     header = (
-        f"[bold #7aa2f7]架構樹[/] [#565f89]{len(board.lines)} 條線 · {total} 個節點 · "
+        f"[bold #7aa2f7]專案樹[/] [#565f89]{len(board.lines)} 條線 · {total} 個節點 · "
         f"進行中 {counts['running']} · 等待 {counts['waiting']}[/]"
     )
     if counts["other"]:
-        header += f" [#f7768e]狀態異常 {counts['other']}[/]"
-        header_plain += f" 狀態異常 {counts['other']}"
+        header += f" [#f7768e]狀態不明 {counts['other']}[/]"
+        header_plain += f" 狀態不明 {counts['other']}"
     time_text = f"讀取 {time.strftime('%H:%M:%S', time.localtime(current_time))}"
     if display_width(header_plain) + 3 + display_width(time_text) <= available:
-        refresh_text = f" · 每 {DECISIONS_REFRESH_SECONDS} 秒重讀"
+        refresh_text = f" · 每 {DECISIONS_REFRESH_SECONDS} 秒自動重讀"
         if display_width(header_plain) + 3 + display_width(time_text + refresh_text) <= available:
             time_text += refresh_text
         header += f"[#565f89] · {time_text}[/]"
@@ -3680,21 +3843,21 @@ def render_decision_tree(
     for error in board.errors:
         rows.append(f"[#f7768e]{escape(truncate_display(error, available))}[/]")
     if not board.lines:
-        rows.append("[#565f89]找不到決策檔（decisions/*.md）[/]")
+        rows.append("[#565f89]找不到決策檔。請確認 decisions 資料夾。[/]")
     for index, line in enumerate(board.lines):
         rows.append("")
         rows.append(_decision_line_header(line))
         if not line.nodes:
-            rows.append("[#565f89]  （沒有可顯示的節點）[/]")
+            rows.append("[#565f89]  這條線沒有節點。[/]")
         rows.extend(_render_decision_nodes(line, available))
         if line.problems:
-            rows.append(f"[#f7768e]  無法解析 {len(line.problems)} 列[/]")
+            rows.append(f"[#f7768e]  有 {len(line.problems)} 列無法解析。[/]")
             for problem in line.problems[:6]:
                 rows.append(
                     f"[#f7768e]    {escape(truncate_display(problem, available - 4))}[/]"
                 )
             if len(line.problems) > 6:
-                rows.append(f"[#f7768e]    另有 {len(line.problems) - 6} 列[/]")
+                rows.append(f"[#f7768e]    另有 {len(line.problems) - 6} 列無法解析。[/]")
     return "\n".join(rows)
 
 
@@ -3745,10 +3908,32 @@ def truncate_display(text: str, width: int) -> str:
     return "".join(output) + "…"
 
 
-def format_completion_time(timestamp: Optional[float]) -> str:
+def format_relative_time(timestamp: Optional[float], now: Optional[float] = None) -> str:
+    """Say how old a completion is; never guess when the timestamp is missing."""
     if timestamp is None:
         return "時間未確認"
-    return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Taipei")).strftime("%H:%M")
+    current = time.time() if now is None else now
+    seconds = max(0.0, current - timestamp)
+    if seconds < 60:
+        return "剛剛"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} 分鐘前"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} 小時 {rest} 分前"
+    return f"{int(seconds // 86400)} 天前"
+
+
+def format_completion_time(timestamp: Optional[float], now: Optional[float] = None) -> str:
+    """Show the full Taipei time plus its age, so the date is never ambiguous."""
+    if timestamp is None:
+        return "時間未確認"
+    current = time.time() if now is None else now
+    moment = datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Taipei"))
+    today = datetime.fromtimestamp(current, ZoneInfo("Asia/Taipei"))
+    pattern = "%m/%d %H:%M" if moment.year == today.year else "%Y/%m/%d %H:%M"
+    return f"{moment.strftime(pattern)}（{format_relative_time(timestamp, current)}）"
 
 
 def compact_elapsed(agent: AgentInfo) -> str:
@@ -3786,12 +3971,15 @@ def render_board_active(agents: List[AgentInfo], width: int) -> str:
     return "\n".join(lines)
 
 
-def render_board_recent(agents: List[AgentInfo], width: int, expanded: bool = False) -> str:
+def render_board_recent(
+    agents: List[AgentInfo], width: int, expanded: bool = False,
+    now: Optional[float] = None,
+) -> str:
     lines = []
     for agent in agents if expanded else agents[:3]:
         marker = "⚠" if agent.status == "partial" else "✓"
         label = " 已回報" if agent.status == "reported" else ""
-        text = f"{marker} {format_completion_time(agent.completion_time)} {agent.name}{label} │ {agent.latest}"
+        text = f"{marker} {format_completion_time(agent.completion_time, now)} {agent.name}{label} │ {agent.latest}"
         lines.append(f"[#e0af68]{escape(truncate_display(text, max(16, width - 4)))}[/]")
     if not expanded and len(agents) > 3:
         lines.append(f"[#565f89]  … 另 {len(agents) - 3} 筆  \\[e] 展開[/]")
@@ -4309,7 +4497,7 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
         status = history_label or "已完成"
     if bucket in ("recent", "history"):
         line = "{}{} {} │ {} │ {}".format(
-            marker, format_completion_time(agent.completion_time),
+            marker, format_completion_time(agent.completion_time, now),
             agent.name, status, agent.latest,
         )
         return Text(truncate_display(line, width), style=color)
@@ -4364,8 +4552,27 @@ def render_home_quota(
     """Show the most urgent window per provider, using the full chart's algorithm."""
     parts = []
     items = ordered_quota_items(raw)
-    for provider in QUOTA_PROVIDER_NAMES:
-        name = QUOTA_PROVIDER_NAMES[provider]
+    providers: List[str] = []
+    for item in items:
+        provider = str(item.get("provider") or "").casefold()
+        if provider and provider not in providers:
+            providers.append(provider)
+    # Keep the one-line summary short: a source with no window and no balance
+    # only stays when nothing else has data, so the line still reads "無資料".
+    def _has_value(item: Dict[str, Any]) -> bool:
+        return bool(valid_quota_windows(item)) or (
+            isinstance(item.get("balance"), str) and bool(item["balance"].strip())
+        )
+
+    with_values = [
+        provider for provider in providers
+        if any(str(item.get("provider") or "").casefold() == provider and _has_value(item)
+               for item in items)
+    ]
+    if with_values:
+        providers = with_values
+    for provider in providers:
+        name = QUOTA_PROVIDER_NAMES.get(provider, provider)
         candidates = []
         balances = []
         for item in items:
@@ -4420,7 +4627,7 @@ def render_work_board(
         if active:
             lines.append(render_board_active(active, width))
         if recent:
-            lines.append(render_board_recent(recent, width, expand_recent))
+            lines.append(render_board_recent(recent, width, expand_recent, current))
     lines.append(escape(render_history_summary(agents, current)))
     return "\n".join(lines)
 
@@ -4485,22 +4692,28 @@ def _render_done_agent(
     index: int,
     width: int,
     recent: bool,
+    now: Optional[float] = None,
 ) -> List[str]:
     badge = STATUS_BADGE_MARKUP.get(agent.status, "[#565f89][未知][/#565f89]")
     name = truncate_display(agent.name, max(12, width - 34))
     result = truncate_display(agent.latest, max(12, width - 12))
-    finished = format_completion_time(agent.completion_time)
+    finished = format_completion_time(agent.completion_time, now)
     marker = "●" if recent else "✓"
     title_color = "#9ece6a" if recent else "#c0caf5"
     recent_tag = "[bold #0f1117 on #9ece6a] 剛完成 [/] " if recent else ""
+    # The completion time is the answer to "how long ago?", so it is never cut;
+    # a narrow terminal only shortens the stage text before it.
+    tail = (
+        f" | 費時：{agent.elapsed} | 完成：{finished}"
+        f" | 依：{agent.project_source or PROJECT_SOURCE_NONE}"
+    )
+    stage = truncate_display(agent.stage or UNKNOWN_IDENTITY, max(12, width - 18))
     return [
         f"[bold {title_color}]{marker} #{index:02d}[/bold {title_color}] "
         f"{recent_tag}[bold #c0caf5]{escape(name)}[/bold #c0caf5] {badge}",
         f"    [#c0caf5]Harness：{escape(truncate_display(agent.harness, 18))} | "
         f"模型：{escape(truncate_display(agent.model, max(12, width - 32)))}[/#c0caf5]",
-        f"    [#e0af68]目前階段：{escape(truncate_display(agent.stage or UNKNOWN_IDENTITY, max(12, width - 18)))}"
-        f" | 費時：{escape(agent.elapsed)} | 完成：{escape(finished)}"
-        f" | 依：{escape(agent.project_source or PROJECT_SOURCE_NONE)}[/#e0af68]",
+        f"    [#e0af68]目前階段：{escape(stage)}{escape(tail)}[/#e0af68]",
         f"    [#9aa5ce]成果：{escape(result)}[/#9aa5ce]",
         "",
     ]
@@ -4530,13 +4743,15 @@ def render_recent_done_tasks(
         )
         for agent in agents:
             index += 1
-            lines.extend(_render_done_agent(agent, index, width, recent=True))
+            lines.extend(_render_done_agent(agent, index, width, recent=True, now=now))
         if group_index + 1 < len(ordered):
             lines.append("")
     return "\n".join(lines).strip()
 
 
-def render_done_tasks(done_agents: List[AgentInfo], width: int = 80) -> str:
+def render_done_tasks(
+    done_agents: List[AgentInfo], width: int = 80, now: Optional[float] = None,
+) -> str:
     """Render older completed tasks grouped by project."""
     if not done_agents:
         return "[#565f89]  (目前沒有其他已完成的 agent 任務)[/#565f89]"
@@ -4556,7 +4771,7 @@ def render_done_tasks(done_agents: List[AgentInfo], width: int = 80) -> str:
         )
         for agent in agents:
             index += 1
-            lines.extend(_render_done_agent(agent, index, width, recent=False))
+            lines.extend(_render_done_agent(agent, index, width, recent=False, now=now))
         if group_index + 1 < len(groups):
             lines.append("")
     return "\n".join(lines).strip()
@@ -5111,7 +5326,7 @@ class HelpScreen(ModalScreen):
             panel.border_title = "快捷鍵 · Esc / ? 返回"
             yield Static(
                 "[bold #9ece6a]AGENT WATCH v10 · 快捷鍵[/]\n\n"
-                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構    \\[5] 架構樹\n\n"
+                "\\[1] 工作    \\[2] 歷史    \\[3] 額度    \\[4] 架構    \\[5] 專案樹\n\n"
                 "[bold]工作頁[/]\n"
                 "  j / ↓        下一筆任務\n"
                 "  k / ↑        上一筆任務\n"
@@ -5138,9 +5353,10 @@ class HelpScreen(ModalScreen):
                 "[bold]架構頁[/]\n"
                 "  p            切換專案\n"
                 "  n / f        現在／未來架構\n\n"
-                "[bold]架構樹頁[/]\n"
-                "  R            立刻重讀 decisions/*.md（平常每 60 秒自動）\n"
-                "  ↑↓ / PgUp / PgDn  捲動（滑鼠滾輪亦可）\n\n"
+                "[bold]專案樹頁[/]\n"
+                "  看每個專案目前的決策節點。\n"
+                "  R            立刻重讀決策檔。平常每 60 秒自動重讀。\n"
+                "  ↑↓ / PgUp / PgDn  捲動。也可用滑鼠滾輪。\n\n"
                 "[bold]全域[/]\n"
                 "  ?            開啟／關閉此表\n"
                 "  Esc          關閉此表\n"
@@ -5399,7 +5615,7 @@ class AgentWatchApp(App):
         ("2", "switch_tab('tab-history')", "歷史 (2)"),
         ("3", "switch_tab('tab-quota')", "額度 (3)"),
         ("4", "switch_tab('tab-arch')", "架構 (4)"),
-        ("5", "switch_tab('tab-tree')", "架構樹 (5)"),
+        ("5", "switch_tab('tab-tree')", "專案樹 (5)"),
         ("j", "next_task", "下一筆"),
         ("down", "next_task", "下一筆"),
         ("k", "previous_task", "上一筆"),
@@ -5421,7 +5637,7 @@ class AgentWatchApp(App):
         ("r", "restore_task", "撈回主頁"),
         ("g", "toggle_history_mode", "表格／分組"),
         # Textual 8 sends uppercase letters as "R"; "shift+r" would never match.
-        ("R", "reload_decisions", "重讀架構樹"),
+        ("R", "reload_decisions", "重讀專案樹"),
         ("space", "toggle_history_group", "收合專案組"),
         ("slash", "search_history", "搜尋"),
         ("escape", "clear_history_search", "清除搜尋"),
@@ -5480,7 +5696,7 @@ class AgentWatchApp(App):
             for number, label, tab_id in (
                 (1, "工作", "tab-work"), (2, "歷史", "tab-history"),
                 (3, "額度", "tab-quota"), (4, "架構", "tab-arch"),
-                (5, "架構樹", "tab-tree"),
+                (5, "專案樹", "tab-tree"),
             ):
                 yield NavTab(f"[{number}] {label}", tab_id)
             yield Label("", id="clock")
@@ -5525,7 +5741,7 @@ class AgentWatchApp(App):
             with TabPane("[4] 架構", id="tab-arch"):
                 with VerticalScroll(id="arch-scroll"):
                     yield Static(id="arch-display")
-            with TabPane("[5] 架構樹", id="tab-tree"):
+            with TabPane("[5] 專案樹", id="tab-tree"):
                 with VerticalScroll(id="tree-scroll"):
                     yield Static(id="tree-display")
 
@@ -5840,8 +6056,8 @@ class AgentWatchApp(App):
         old_index = table.cursor_row
         selected = self.history_rows[old_index] if old_index < len(self.history_rows) else None
         table.clear(columns=True)
-        widths = [11, 10, 7, 15, max(17, self.size.width - 63), 5]
-        for name, width in zip(("時間", "專案", "標籤", "名稱", "結果摘要", "已讀"), widths):
+        widths = [11, 10, 10, 7, 15, max(17, self.size.width - 73), 5]
+        for name, width in zip(("時間", "多久", "專案", "標籤", "名稱", "結果摘要", "已讀"), widths):
             table.add_column(name, width=width)
         self.history_rows = []
 
@@ -5849,11 +6065,12 @@ class AgentWatchApp(App):
             entry = self.state.task(agent.key)
             timestamp = done_timestamp(agent)
             stamp = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M") if timestamp else "時間未知"
+            age = format_relative_time(timestamp, self._now) if timestamp else "時間未確認"
             status = self.state.stale_info(agent, self._now) or (
                 "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
             )
             disposition = "隱藏 · " if entry.get("hidden") else ""
-            cells = (stamp, project_label(agent.project), ", ".join(entry.get("tags", [])),
+            cells = (stamp, age, project_label(agent.project), ", ".join(entry.get("tags", [])),
                      agent.name, disposition + status + " · " + agent.latest,
                      "已讀" if entry.get("read") else "●未讀")
             table.add_row(*(Text(truncate_display(value, width),
@@ -5864,7 +6081,7 @@ class AgentWatchApp(App):
         if self.history_grouped:
             for project, members in group_agents_by_project(tasks).items():
                 closed = project in self.history_collapsed
-                cells = ("▸ 專案" if closed else "▾ 專案", project_label(project), "",
+                cells = ("▸ 專案" if closed else "▾ 專案", "", project_label(project), "",
                          "%d 筆" % len(members), "Space / Enter 展開" if closed else "Space / Enter 收合", "")
                 table.add_row(*(Text(truncate_display(value, width), style="bold #9ece6a")
                                 for value, width in zip(cells, widths)))
@@ -6077,13 +6294,13 @@ class AgentWatchApp(App):
             board = self.decision_svc.board(self._now, force=force)
             markup = render_decision_tree(board, self.size.width, now=self._now)
         except Exception as exc:  # 壞資料只降級這一頁
-            markup = f"[#f7768e]架構樹無法顯示：{escape(str(exc))}[/]"
+            markup = f"[#f7768e]專案樹無法顯示。原因：{escape(str(exc))}[/]"
         self.query_one("#tree-display", Static).update(markup)
 
     def action_reload_decisions(self) -> None:
         self.update_tree_display(force=True)
         self.show_state_message(
-            "架構樹已重讀：" + time.strftime("%H:%M:%S", time.localtime(self._now))
+            "已重讀專案樹。時間 " + time.strftime("%H:%M:%S", time.localtime(self._now))
         )
 
     def action_show_architecture_now(self) -> None:
@@ -6140,7 +6357,7 @@ class AgentWatchApp(App):
         self.set_interval(float(DECISIONS_REFRESH_SECONDS), self.refresh_decisions)
 
     def refresh_decisions(self) -> None:
-        """60 秒一次的架構樹重讀；新增的決策檔不用改設定就會出現。"""
+        """60 秒一次的專案樹重讀；新增的決策檔不用改設定就會出現。"""
         if self._ui_ready:
             self.update_tree_display(force=True)
 

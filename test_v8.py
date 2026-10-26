@@ -672,6 +672,13 @@ class QuotaRegressions(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.sessions = Path(self._tmp.name)
+        # The two local quota files stay outside the real home folder in tests.
+        local_env = patch.dict(os.environ, {
+            "AGENT_WATCH_GROK_QUOTA": str(self.sessions / "no-grok.json"),
+            "AGENT_WATCH_CURSOR_QUOTA": str(self.sessions / "no-cursor.json"),
+        })
+        local_env.start()
+        self.addCleanup(local_env.stop)
 
     def test_missing_provider_keeps_its_place_in_home_summary(self):
         service = watch.QuotaService(sessions_path=self.sessions)
@@ -683,15 +690,25 @@ class QuotaRegressions(unittest.TestCase):
             self.assertIn(name, summary)
         self.assertIn("Claude：無資料", summary)
         self.assertIn("OpenRouter $0.00", summary)
-        self.assertEqual(len(raw), 4)
+        self.assertIn("Grok Bot：無資料", summary)
+        self.assertIn("Cursor：無資料", summary)
+        self.assertEqual(len(raw), 6)
 
     def test_magpie_fixture_parses_every_provider_window(self):
         payload = self.FIXTURE.read_text(encoding="utf-8")
         service = watch.QuotaService(sessions_path=self.sessions)
-        with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
-            summary, raw = service.fetch(force=True)
+        fixtures = Path(__file__).parent / "tests" / "fixtures"
+        with patch.dict(os.environ, {
+            "AGENT_WATCH_GROK_QUOTA": str(fixtures / "grok_pace.json"),
+            "AGENT_WATCH_CURSOR_QUOTA": str(fixtures / "cursor_quota.json"),
+        }):
+            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                summary, raw = service.fetch(force=True)
         providers = [item["provider"] for item in raw]
-        self.assertEqual(providers, ["claude", "codex", "opencode-go", "openrouter"])
+        self.assertEqual(
+            providers,
+            ["claude", "codex", "opencode-go", "openrouter", "grok-bot", "cursor"],
+        )
         self.assertIn("Claude 5h 50%", summary)
         self.assertIn("7d 46%", summary)
         self.assertIn("Codex 5h 85%", summary)
@@ -702,8 +719,11 @@ class QuotaRegressions(unittest.TestCase):
         self.assertNotIn("重置", summary)
         self.assertNotIn("資料時間", summary)
         self.assertEqual(summary.count("更新"), 1)
-        self.assertEqual(raw[-1]["kind"], "balance")
-        self.assertEqual(raw[-1]["balance"], "$19.58")
+        openrouter = [item for item in raw if item["provider"] == "openrouter"][0]
+        self.assertEqual(openrouter["kind"], "balance")
+        self.assertEqual(openrouter["balance"], "$19.58")
+        self.assertIn("Grok Bot 7d 22%", summary)
+        self.assertIn("Cursor 7d 21%", summary)
         details = watch.render_full_quota_view(raw)
         self.assertIn("帳戶餘額 $19.58", details)
         self.assertIn("資料時間：2026-10-25 15:00:54", details)
@@ -759,7 +779,7 @@ class QuotaRegressions(unittest.TestCase):
                     summary, raw = service.fetch(force=True)
                 self.assertIn("Claude：magpie 讀取失敗", summary)
                 self.assertIn("OpenRouter：magpie 讀取失敗", summary)
-                self.assertEqual(len(raw), 4)
+                self.assertEqual(len(raw), 6)
                 self.assertTrue(service.stale)
 
     def test_magpie_timeout_shows_no_data(self):
@@ -767,7 +787,7 @@ class QuotaRegressions(unittest.TestCase):
         with patch("watch.subprocess.run", side_effect=watch.subprocess.TimeoutExpired("magpie", 10)):
             summary, raw = service.fetch(force=True)
         self.assertIn("magpie 讀取失敗", summary)
-        self.assertEqual(len(raw), 4)
+        self.assertEqual(len(raw), 6)
         self.assertIn("逾時", service.last_error)
 
     def test_codex_session_limits_used_when_magpie_omits_codex(self):
@@ -965,6 +985,103 @@ class QuotaRegressions(unittest.TestCase):
         self.assertIn("OpenRouter $19.58", Text.from_markup(wide).plain)
 
 
+class LocalQuotaSourceTests(unittest.TestCase):
+    """Grok Bot and Cursor read only the two local files, never a real account."""
+
+    FIXTURES = Path(__file__).parent / "tests" / "fixtures"
+    NOW = watch.quota_epoch("2026-10-27T02:30:00+08:00")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_grok_uses_the_last_sample_and_keeps_account_fields_out(self):
+        item = watch.read_grok_quota_item(self.FIXTURES / "grok_pace.json", now=self.NOW)
+        self.assertEqual(item["provider"], "grok-bot")
+        self.assertEqual(item["name"], "Grok Bot")
+        self.assertEqual([window["used"] for window in item["windows"]], [22.5])
+        self.assertEqual(item["windows"][0]["window_minutes"], 10080)
+        self.assertEqual(watch.quota_window_label(item["windows"][0]), "7 天")
+        self.assertEqual(item["asOf"], 1793039569)
+        self.assertNotIn("accountScope", json.dumps(item))
+
+    def test_grok_missing_file_broken_json_and_missing_series_say_no_data(self):
+        missing = watch.read_grok_quota_item(self.root / "absent.json", now=self.NOW)
+        self.assertIn("無資料", missing["reason"])
+        broken = self.root / "broken.json"
+        broken.write_text("{not json", encoding="utf-8")
+        self.assertIn("無資料", watch.read_grok_quota_item(broken, now=self.NOW)["reason"])
+        other = self.root / "other.json"
+        other.write_text(json.dumps({"series": [{"providerId": "claude", "samples": []}]}),
+                         encoding="utf-8")
+        no_series = watch.read_grok_quota_item(other, now=self.NOW)
+        self.assertIn("無資料", no_series["reason"])
+        self.assertEqual(no_series["windows"], [])
+
+    def test_grok_cache_waits_for_ttl_and_a_new_mtime(self):
+        payload = json.loads((self.FIXTURES / "grok_pace.json").read_text(encoding="utf-8"))
+        path = self.root / "grok.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        first = watch.read_grok_quota_item(path, now=1000.0)
+        self.assertEqual(first["windows"][0]["used"], 22.5)
+
+        stat = path.stat()
+        payload["series"][1]["samples"][-1]["usedPercent"] = 90.0
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        os.utime(path, (stat.st_atime, stat.st_mtime))
+
+        inside_ttl = watch.read_grok_quota_item(path, now=1030.0)
+        self.assertEqual(inside_ttl["windows"][0]["used"], 22.5)
+        # Past the TTL but with the same mtime the file is not parsed again.
+        same_mtime = watch.read_grok_quota_item(path, now=1070.0)
+        self.assertEqual(same_mtime["windows"][0]["used"], 22.5)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        refreshed = watch.read_grok_quota_item(path, now=1080.0)
+        self.assertEqual(refreshed["windows"][0]["used"], 90.0)
+
+    def test_cursor_reads_only_its_own_windows(self):
+        item = watch.read_cursor_quota_item(self.FIXTURES / "cursor_quota.json")
+        self.assertEqual(item["provider"], "cursor")
+        self.assertEqual(item["name"], "Cursor")
+        self.assertEqual([window["used"] for window in item["windows"]], [21.1])
+        self.assertEqual(watch.quota_window_label(item["windows"][0]), "7 天")
+        self.assertEqual(item["asOf"], "2026-10-27T02:12:40+08:00")
+        self.assertNotIn("codex", json.dumps(item).casefold())
+
+    def test_cursor_missing_broken_and_no_block_say_no_data(self):
+        self.assertIn("無資料", watch.read_cursor_quota_item(self.root / "absent.json")["reason"])
+        broken = self.root / "broken.json"
+        broken.write_text("[]", encoding="utf-8")
+        self.assertIn("無資料", watch.read_cursor_quota_item(broken)["reason"])
+        other = self.root / "other.json"
+        other.write_text(json.dumps({"providers": [{"provider": "codex", "windows": []}]}),
+                         encoding="utf-8")
+        self.assertIn("無資料", watch.read_cursor_quota_item(other)["reason"])
+
+    def test_service_adds_both_local_sources_to_the_quota_page(self):
+        service = watch.QuotaService(sessions_path=self.root / "sessions")
+        with patch.dict(os.environ, {
+            "AGENT_WATCH_GROK_QUOTA": str(self.FIXTURES / "grok_pace.json"),
+            "AGENT_WATCH_CURSOR_QUOTA": str(self.FIXTURES / "cursor_quota.json"),
+        }):
+            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout="[]")):
+                summary, raw = service.fetch(force=True)
+        self.assertEqual(len(raw), 6)
+        self.assertEqual(
+            [item["provider"] for item in watch.ordered_quota_items(raw)],
+            ["codex", "claude", "opencode-go", "openrouter", "grok-bot", "cursor"],
+        )
+        self.assertIn("Grok Bot 7d 22%", summary)
+        self.assertIn("Cursor 7d 21%", summary)
+        page = "\n".join(Text.from_markup(line).plain
+                         for line in watch.render_full_quota_view(raw, 100, now=self.NOW).splitlines())
+        self.assertIn("Grok Bot", page)
+        self.assertIn("7d", page)
+        self.assertIn("Cursor", page)
+        self.assertIn("資料時間：2026-10-27 02:12:40", page)
+
+
 class QuotaSnapshotTests(unittest.IsolatedAsyncioTestCase):
     FIXTURE = Path(__file__).parent / "tests" / "fixtures" / "magpie_quota.json"
     NOW = watch.quota_epoch("2026-10-25T14:30:00+08:00")
@@ -983,8 +1100,13 @@ class QuotaSnapshotTests(unittest.IsolatedAsyncioTestCase):
             state.write_text('{"version": 1, "tasks": {}, "projects": {}}')
             payload = self.FIXTURE.read_text(encoding="utf-8")
             service = watch.QuotaService(sessions_path=root / "sessions")
-            with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
-                summary, raw = service.fetch(force=True)
+            fixtures = Path(__file__).parent / "tests" / "fixtures"
+            with patch.dict(os.environ, {
+                "AGENT_WATCH_GROK_QUOTA": str(fixtures / "grok_pace.json"),
+                "AGENT_WATCH_CURSOR_QUOTA": str(fixtures / "cursor_quota.json"),
+            }):
+                with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=payload)):
+                    summary, raw = service.fetch(force=True)
             before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)]
             shots = Path(__file__).parent / "shots" if os.environ.get(
                 "AGENT_WATCH_UPDATE_S4_SHOTS") else root / "shots"
