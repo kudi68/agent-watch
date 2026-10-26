@@ -1953,6 +1953,32 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.query_one("#bottom-log-title").render().plain, agents[0].name)
             self.assertFalse(app.ui_error)
 
+    async def test_deferred_row_focus_does_not_steal_an_explicit_tab(self):
+        """A pending restore_selection focus must not pull the view back to 工作."""
+        app = self.fixture_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            for tab_id in ("tab-arch", "tab-quota", "tab-tree"):
+                with self.subTest(tab=tab_id):
+                    app.action_switch_tab("tab-work")
+                    await pilot.pause()
+                    app.restore_selection(True)  # leaves a deferred row focus
+                    app.action_switch_tab(tab_id)  # user switches in the same tick
+                    for _ in range(3):
+                        await pilot.pause()
+                    self.assertEqual(app.query_one("#main-tabs").active, tab_id)
+            # Staying on the work tab must still focus the selected row.
+            app.action_switch_tab("tab-work")
+            await pilot.pause()
+            app.set_focus(None)
+            await pilot.pause()
+            self.assertIsNone(app.focused)
+            app.restore_selection(True)
+            for _ in range(3):
+                await pilot.pause()
+            self.assertIsInstance(app.focused, watch.TaskRow)
+            self.assertFalse(app.ui_error)
+
     async def test_background_result_after_shutdown_ignores_cancelled_callback(self):
         app = self.fixture_app([])
         with patch.object(app, "call_from_thread", side_effect=watch.CancelledError()):
