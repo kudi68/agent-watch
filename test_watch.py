@@ -694,13 +694,14 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
 
     def test_project_inference_uses_declared_table_and_safe_token_match(self):
         cases = (
-            ("example-project build", "/tmp/example-project/run.log", "example-project"),
-            ("pa 合併後狀態同步", "/tmp/pa-sync/run.log", "project-a"),
-            ("shortcut 編譯修復", "/tmp/shortcut-diag/run.log", "project-b"),
-            ("kanban 卡片回報規則", "/tmp/project-c-report/run.log", "project-c"),
-            ("quota 新增工作組", "/tmp/quota/run.log", "project-d"),
+            ("personal-ai-os 狀態整理", "/tmp/work/run.log", "personal-ai-os"),
+            ("pai 合併後狀態同步", "/tmp/pai-sync/run.log", "personal-ai-os"),
+            ("ios-shortcuts 編譯修復", "/tmp/work/run.log", "ios-shortcuts"),
+            ("sc-pkg6 通知觸發", "/tmp/work/run.log", "ios-shortcuts"),
+            ("c1 退役備份", "/tmp/work/run.log", "c1-runtime"),
+            ("M5-setup 盤點", "/tmp/work/run.log", "M5-setup"),
             ("pair task", "/tmp/other/run.log", "other"),
-            ("PR #41 第二輪修正", "/tmp/fix2-pr41/run.log", "project-a"),
+            ("完全無關的任務", "/tmp/elsewhere/run.log", "other"),
         )
         for name, log_path, expected in cases:
             with self.subTest(name=name):
@@ -709,9 +710,9 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
     def test_recent_done_is_top_highlighted_and_grouped(self):
         now = 1_700_200_000.0
         recent_agent = AgentInfo(
-            name="example-project 剛完成",
-            log_path=Path("/tmp/example-project/run.log"),
-            last_path=Path("/tmp/example-project/LAST.md"),
+            name="agent-watch 剛完成",
+            log_path=Path("/tmp/agent-watch/run.log"),
+            last_path=Path("/tmp/agent-watch/LAST.md"),
             status="complete",
             model="model-x",
             start_time=now - 300,
@@ -719,10 +720,10 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             latest="DONE",
             harness="Codex",
             completion_time=now - 60,
-            project="example-project",
+            project="agent-watch",
         )
         older_agent = AgentInfo(
-            name="project-d 舊完成",
+            name="ios-shortcuts 舊完成",
             log_path=Path("/tmp/project-d/run.log"),
             last_path=Path("/tmp/project-d/LAST.md"),
             status="complete",
@@ -732,10 +733,10 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             latest="DONE",
             harness="Codex",
             completion_time=now - RECENT_DONE_SECONDS - 1,
-            project="project-d",
+            project="ios-shortcuts",
         )
         recent_magpie_agent = AgentInfo(
-            name="project-d 也剛完成",
+            name="ios-shortcuts 也剛完成",
             log_path=Path("/tmp/project-d/run.log"),
             last_path=Path("/tmp/project-d/LAST.md"),
             status="complete",
@@ -745,27 +746,27 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             latest="DONE",
             harness="Codex",
             completion_time=now - 120,
-            project="project-d",
+            project="ios-shortcuts",
         )
         recent, older = split_recent_done([older_agent, recent_magpie_agent, recent_agent], now)
         self.assertEqual(
             [agent.name for agent in recent],
-            ["example-project 剛完成", "project-d 也剛完成"],
+            ["agent-watch 剛完成", "ios-shortcuts 也剛完成"],
         )
-        self.assertEqual([agent.name for agent in older], ["project-d 舊完成"])
+        self.assertEqual([agent.name for agent in older], ["ios-shortcuts 舊完成"])
 
         markup = render_recent_done_tasks([older_agent, recent_magpie_agent, recent_agent], now=now)
         self.assertIn("剛完成", markup)
-        self.assertIn("example-project (1)", markup)
+        self.assertIn("agent-watch (1)", markup)
         self.assertIn("剛完成 [/]", markup)
-        self.assertLess(markup.index("example-project 剛完成"), markup.index("project-d 也剛完成"))
-        self.assertNotIn("project-d 舊完成", markup)
-        self.assertIn("Project D (1)", render_done_tasks(older))
+        self.assertLess(markup.index("agent-watch 剛完成"), markup.index("ios-shortcuts 也剛完成"))
+        self.assertNotIn("ios-shortcuts 舊完成", markup)
+        self.assertIn("iOS 捷徑 (1)", render_done_tasks(older))
 
     def test_future_completion_within_clock_skew_stays_recent(self):
         now = time.time()
         agent = AgentInfo(
-            name="project-d 時鐘偏差",
+            name="ios-shortcuts 時鐘偏差",
             log_path=Path("/tmp/project-d/run.log"),
             last_path=Path("/tmp/project-d/LAST.md"),
             status="complete",
@@ -775,7 +776,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             latest="DONE",
             harness="Codex",
             completion_time=now + 60,
-            project="project-d",
+            project="ios-shortcuts",
         )
         self.assertEqual(task_bucket(agent, now), "recent")
         self.assertEqual(task_bucket(agent, now + 300), "recent")
@@ -797,14 +798,14 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 project=project,
             )
             for name, project in (
-                ("example-project task", "example-project"),
-                ("project-d task", "project-d"),
+                ("agent-watch task", "agent-watch"),
+                ("ios-shortcuts task", "ios-shortcuts"),
             )
         ]
         markup = render_active_flow(agents)
-        self.assertIn("example-project (1)", markup)
-        self.assertIn("Project D (1)", markup)
-        self.assertLess(markup.index("example-project (1)"), markup.index("Project D (1)"))
+        self.assertIn("agent-watch (1)", markup)
+        self.assertIn("iOS 捷徑 (1)", markup)
+        self.assertLess(markup.index("agent-watch (1)"), markup.index("iOS 捷徑 (1)"))
 
     def test_live_pid_overrides_failed_report_and_log_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1056,9 +1057,9 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                     await pilot.press("4")
                     self.assertEqual(tc.active, "tab-arch")
                     self.assertEqual(app.architecture_view_id, "now")
-                    self.assertEqual(app.architecture_project_id, "example-project")
+                    self.assertEqual(app.architecture_project_id, "personal-ai-os")
                     await pilot.press("p")
-                    self.assertEqual(app.architecture_project_id, "project-a")
+                    self.assertEqual(app.architecture_project_id, "agent-watch")
                     await pilot.press("f")
                     self.assertEqual(app.architecture_view_id, "future")
                     await pilot.press("n")
@@ -1196,13 +1197,13 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         """Architecture labels remain readable at 80 columns and narrow widths."""
         empty: List[AgentInfo] = []
         wide = render_architecture_view(
-            empty, width=100, view_id="future", project_id="example-project"
+            empty, width=100, view_id="future", project_id="agent-watch"
         )
         self.assertIn("Planner", wide)
         self.assertIn("Reviewer", wide)
 
         normal = render_architecture_view(
-            empty, width=80, view_id="future", project_id="example-project"
+            empty, width=80, view_id="future", project_id="agent-watch"
         )
         self.assertIn("Planner", normal)
         self.assertIn("Reviewer", normal)
@@ -1211,13 +1212,13 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             self.assertLessEqual(display_width(plain), 80)
 
         narrow = render_architecture_view(
-            empty, width=26, view_id="future", project_id="example-project"
+            empty, width=26, view_id="future", project_id="agent-watch"
         )
         self.assertIn("Planner", narrow)
         self.assertIn("┌", narrow)
 
         now_80 = render_architecture_view(
-            empty, width=80, view_id="now", project_id="example-project"
+            empty, width=80, view_id="now", project_id="agent-watch"
         )
         self.assertIn("Worker A", now_80)
         self.assertIn("Worker B", now_80)
@@ -1239,7 +1240,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 elapsed="00:10:00",
                 latest="修正架構圖",
                 stage="P4 架構",
-                project="example-project",
+                project="agent-watch",
             ),
             AgentInfo(
                 name="example-project Worker B",
@@ -1253,7 +1254,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 latest="主要實作完成",
                 stage="P3 實作",
                 completion_time=time.time() - 120,
-                project="example-project",
+                project="agent-watch",
             ),
             AgentInfo(
                 name="example-project Worker C audit",
@@ -1266,7 +1267,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 elapsed="00:05:00",
                 latest="updating parser",
                 stage="P2 調查",
-                project="example-project",
+                project="agent-watch",
             ),
             AgentInfo(
                 name="example-project Reviewer",
@@ -1279,7 +1280,7 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 elapsed="00:03:00",
                 latest="done",
                 completion_time=time.time() - 60,
-                project="example-project",
+                project="agent-watch",
             ),
         ]
 
@@ -1301,13 +1302,13 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         self.assertTrue(is_node_active("worker-c", dummy_agents))
 
         now_text = render_architecture_view(
-            dummy_agents, width=80, view_id="now", project_id="example-project"
+            dummy_agents, width=80, view_id="now", project_id="agent-watch"
         )
         wide_text = render_architecture_view(
-            dummy_agents, width=180, view_id="now", project_id="example-project"
+            dummy_agents, width=180, view_id="now", project_id="agent-watch"
         )
         future_text = render_architecture_view(
-            dummy_agents, width=80, view_id="future", project_id="example-project"
+            dummy_agents, width=80, view_id="future", project_id="agent-watch"
         )
         self.assertIn("Coordinator", now_text)
         self.assertIn("Mobile entry", now_text)
@@ -1336,8 +1337,14 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         self.assertEqual(set(data["architectures"]), {"now", "future"})
         self.assertEqual(
             set(data["projects"]),
-            {"example-project", "project-a", "project-b", "project-c", "project-d",
-             "personal-ai-os", "agent-watch", "ios-shortcuts", "K1", "other"},
+            {"personal-ai-os", "agent-watch", "ios-shortcuts", "c1-runtime",
+             "m5-coding-canary", "M5-setup", "agentq-canary", "K1", "hermes",
+             "night", "other"},
+        )
+        self.assertEqual(
+            set(data["projects"]["night"]),
+            {"label", "aliases", "match_keywords", "path_keywords", "repo_paths",
+             "repo_names", "default_view", "dispatch_only"},
         )
         self.assertEqual(
             data["architectures"]["now"]["layers"][-1],
@@ -1573,7 +1580,7 @@ class V10ScreenAndWorkerTests(IsolatedState, unittest.TestCase):
     def test_architecture_ignores_ended_history(self):
         old = AgentInfo("example-project Worker A", Path("/dev/null"), Path("/dev/null"),
                         "complete", "fixture", 100, "00:01:00", "old task must disappear",
-                        project="example-project", completion_time=time.time() - 8000)
+                        project="agent-watch", completion_time=time.time() - 8000)
         self.assertNotIn("old task must disappear", render_architecture_view([old], 120))
 
 
@@ -1590,7 +1597,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
     def fixture_agents(self):
         fixtures = Path(__file__).parent / "tests" / "fixtures"
 
-        def agent(key, status, project="example-project", **values):
+        def agent(key, status, project="agent-watch", **values):
             defaults = dict(
                 name=key, log_path=fixtures / "unused.log",
                 last_path=fixtures / "unused-report", key=key, status=status,
@@ -1604,12 +1611,12 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
 
         return [
             agent("failed-review", "failed", latest="測試失敗", completion_time=self.now - 30),
-            agent("missing-report", "no_report", "project-a", latest="已結束、無報告"),
+            agent("missing-report", "no_report", "c1-runtime", latest="已結束、無報告"),
             agent("blocked-task", "blocked", latest="等待必要資料"),
             agent("quiet-task", "waiting", latest="日誌暫無更新"),
             agent("answer-hook", "question", latest="第⑤段等回答接點"),
             agent("工作頁排版", "running", stage="P2 實作主頁", model="deepseek-v4.1-" + "very-long-model-" * 4),
-            agent("preview-follows-cursor", "running", "project-a", stage="P3 測試", log_mtime=self.now + 100),
+            agent("preview-follows-cursor", "running", "c1-runtime", stage="P3 測試", log_mtime=self.now + 100),
             *[agent("recent-%d" % index, "complete", completion_time=self.now - 100 - index)
               for index in range(4)],
             agent("archived-task", "complete", completion_time=self.now - 9000),
@@ -1719,8 +1726,8 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             runs, done = root / "runs.tsv", root / "done.tsv"
             runs.write_text("")
             done.write_text(
-                f"failed-review\t{log}\t{failed}\t\tCodex\tmodel-x\texample-project\n"
-                f"missing-report\t{log}\t{root / 'missing'}\t\tClaude\tmodel-y\tproject-a\n"
+                f"failed-review\t{log}\t{failed}\t\tCodex\tmodel-x\tagent-watch\n"
+                f"missing-report\t{log}\t{root / 'missing'}\t\tClaude\tmodel-y\tpersonal-ai-os\n"
             )
             before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in (runs, done)}
             agents, errors = load_all_agents(runs, done, LogParser(process_start_reader=None), self.now)
@@ -1816,8 +1823,8 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             titles = {section.border_title for section in app.query(".project-section")}
             self.assertEqual(titles, {
-                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4",
-                f"{watch.project_label('project-a')} · 進行中 1 · 剛完成 0",
+                f"{watch.project_label('agent-watch')} · 進行中 1 · 剛完成 4 · 依 未判斷 5",
+                f"{watch.project_label('c1-runtime')} · 進行中 1 · 剛完成 0 · 依 未判斷 1",
             })
             # Collapsing only changes the visible rows; the count stays at the total.
             self.assertIn("另 1 筆", self.screen_text(app))
@@ -1825,7 +1832,8 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             titles = {section.border_title for section in app.query(".project-section")}
             self.assertIn(
-                f"{watch.project_label('example-project')} · 進行中 1 · 剛完成 4", titles
+                f"{watch.project_label('agent-watch')} · 進行中 1 · 剛完成 4 · 依 未判斷 5",
+                titles,
             )
             self.assertNotIn("另 1 筆", self.screen_text(app))
             self.assertFalse(app.ui_error)
@@ -2080,7 +2088,7 @@ class V10StateTests(unittest.TestCase):
         agents = self.agents[7:]
         for agent in agents:
             self.state.apply("done", agent, agents, self.now)
-        agents[1].project = "project-a"
+        agents[1].project = "personal-ai-os"
         self.state.apply("tags", agents[1], agents, self.now, ["追蹤"])
         self.state.apply("read", agents[1], agents, self.now)
         self.state.apply("hide", agents[2], agents, self.now)
@@ -2088,13 +2096,13 @@ class V10StateTests(unittest.TestCase):
         self.assertEqual(find(), [a.key for a in agents])
         self.assertEqual(find(query="RECENT-1"), [agents[1].key])
         self.assertEqual(find(query="追蹤"), [agents[1].key])
-        self.assertEqual(find(project="project-a"), [agents[1].key])
+        self.assertEqual(find(project="personal-ai-os"), [agents[1].key])
         self.assertEqual(find(tag="追蹤"), [agents[1].key])
         self.assertEqual(find(read="read"), [agents[1].key])
         self.assertNotIn(agents[1].key, find(read="unread"))
         self.assertEqual(find(hidden="hidden"), [agents[2].key])
         self.assertNotIn(agents[2].key, find(hidden="visible"))
-        self.assertEqual(find(query="追蹤", project="project-a", tag="追蹤", read="read", hidden="visible"),
+        self.assertEqual(find(query="追蹤", project="personal-ai-os", tag="追蹤", read="read", hidden="visible"),
                          [agents[1].key])
         self.assertEqual(find(query="no-such-result"), [])
 
@@ -2117,8 +2125,10 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
 
     def history_fixture(self):
         agents = self.fixture_agents()[7:]
-        agents[1].project = "project-a"
-        agents[-1].project = "project-a"
+        for agent in agents:
+            agent.project = "personal-ai-os"
+        agents[1].project = "agent-watch"
+        agents[-1].project = "agent-watch"
         for agent in agents:
             agent.completion_time -= 9000
         app = self.fixture_app(agents)
@@ -2131,20 +2141,20 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 40)) as pilot:
             await pilot.press("2", "g")
             self.assertTrue(app.history_grouped)
-            self.assertEqual(app.history_rows[0], ("project", "example-project"))
+            self.assertEqual(app.history_rows[0], ("project", "personal-ai-os"))
             self.assertEqual(app.history_rows[1:4], [("task", a.key) for a in (agents[0], agents[2], agents[3])])
             # Switching to grouped mode keeps the cursor on the previously selected task,
             # so select the project header before exercising collapse/expand.
             table = app.query_one("#history-table", watch.DataTable)
-            table.move_cursor(row=app.history_rows.index(("project", "example-project")))
+            table.move_cursor(row=app.history_rows.index(("project", "personal-ai-os")))
             await pilot.pause()
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "personal-ai-os"))
             await pilot.press("space")
-            self.assertIn("example-project", app.history_collapsed)
+            self.assertIn("personal-ai-os", app.history_collapsed)
             self.assertNotIn(("task", agents[0].key), app.history_rows)
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "personal-ai-os"))
             await pilot.press("enter")
-            self.assertNotIn("example-project", app.history_collapsed)
+            self.assertNotIn("personal-ai-os", app.history_collapsed)
             self.assertIn(("task", agents[0].key), app.history_rows)
             self.assertFalse(app.ui_error)
 
@@ -2156,9 +2166,9 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             # 切到分組模式會保留原本的任務游標，這次刻意不先移到專案列。
             self.assertEqual(app.history_rows[table.cursor_row], ("task", agents[0].key))
             await pilot.press("space")
-            self.assertIn("example-project", app.history_collapsed)
+            self.assertIn("personal-ai-os", app.history_collapsed)
             self.assertNotIn(("task", agents[0].key), app.history_rows)
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "example-project"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "personal-ai-os"))
             self.assertFalse(app.ui_error)
 
     async def test_grouped_search_input_filters_and_escape_clear(self):
@@ -2167,9 +2177,9 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.press("2", "g", "slash")
             await pilot.press(*"recent-1")
             self.assertEqual(app.history_query, "recent-1")
-            self.assertEqual(app.history_rows, [("project", "project-a"), ("task", agents[1].key)])
+            self.assertEqual(app.history_rows, [("project", "agent-watch"), ("task", agents[1].key)])
             await pilot.press("enter")
-            for field, value in (("project", "project-a"), ("tag", "追蹤"), ("read", "read"), ("hidden", "visible")):
+            for field, value in (("project", "agent-watch"), ("tag", "追蹤"), ("read", "read"), ("hidden", "visible")):
                 app.query_one("#filter-" + field, watch.Select).value = value
                 await pilot.pause()
                 self.assertIn(("task", agents[1].key), app.history_rows)
@@ -2544,7 +2554,7 @@ class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             name="question-task", log_path=log, last_path=root / "REPORT.md",
             status=status, harness="Claude", model="claude-fixture",
             start_time=self.now - 900, elapsed="00:15:00", latest="等回答",
-            log_lines=["等回答中"], log_mtime=self.now - 1, project="example-project",
+            log_lines=["等回答中"], log_mtime=self.now - 1, project="agent-watch",
             key="question-task::%s::%s" % (log, root / "REPORT.md"), question=question,
         )
         defaults.update(values)

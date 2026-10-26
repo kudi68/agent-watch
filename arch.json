@@ -1,58 +1,67 @@
 {
   "title": "Agent 協作架構",
   "projects": {
-    "example-project": {
-      "label": "example-project",
-      "aliases": ["example"],
-      "match_keywords": ["example-project", "example project"],
-      "path_keywords": ["example-project"],
-      "default_view": "now"
-    },
-    "project-a": {
-      "label": "project-a",
-      "aliases": ["pa"],
-      "match_keywords": ["project-a", "project a", "pa", "alpha"],
-      "match_patterns": ["(?<![a-z0-9])pr\\s*#\\d+(?![a-z0-9])", "(?<![a-z0-9])pr-\\d+(?![a-z0-9])"],
-      "path_keywords": ["project-a", "alpha-"],
-      "default_view": "now"
-    },
-    "project-b": {
-      "label": "Project B",
-      "match_keywords": ["project-b", "project b", "shortcut", "sc-"],
-      "path_keywords": ["project-b", "shortcut", "sc-"],
-      "default_view": "now"
-    },
-    "project-c": {
-      "label": "Project C",
-      "match_keywords": ["project-c", "project c", "kanban"],
-      "path_keywords": ["project-c", "kanban"],
-      "default_view": "now"
-    },
-    "project-d": {
-      "label": "Project D",
-      "match_keywords": ["project-d", "project d", "quota"],
-      "path_keywords": ["project-d", "quota"],
-      "default_view": "now"
-    },
     "personal-ai-os": {
       "label": "personal-ai-os",
       "aliases": ["pai"],
-      "match_keywords": ["personal-ai-os", "pai"],
+      "match_keywords": ["personal-ai-os", "pai", "personal ai os"],
       "path_keywords": ["personal-ai-os"],
+      "repo_paths": ["Projects/personal-ai-os"],
+      "repo_names": ["personal-ai-os"],
       "default_view": "now"
     },
     "agent-watch": {
       "label": "agent-watch",
       "aliases": ["aw"],
-      "match_keywords": ["agent-watch", "aw"],
+      "match_keywords": ["agent-watch", "aw", "awv10", "awv9"],
       "path_keywords": ["agent-watch"],
+      "repo_paths": ["Projects/agent-watch"],
+      "repo_names": ["agent-watch"],
       "default_view": "now"
     },
     "ios-shortcuts": {
       "label": "iOS 捷徑",
       "aliases": ["ios"],
-      "match_keywords": ["ios-shortcuts", "ios"],
-      "path_keywords": ["ios-shortcuts"],
+      "match_keywords": ["ios-shortcuts", "ios", "shortcut", "shortcuts", "iphone", "sc-", "捷徑"],
+      "path_keywords": ["ios-shortcuts", "shortcuts"],
+      "repo_paths": ["Projects/ios-shortcuts"],
+      "repo_names": ["ios-shortcuts"],
+      "default_view": "now"
+    },
+    "c1-runtime": {
+      "label": "c1-runtime",
+      "aliases": ["c1"],
+      "match_keywords": ["c1-runtime", "c1"],
+      "path_keywords": ["c1-runtime"],
+      "repo_paths": ["Projects/c1-runtime"],
+      "repo_names": ["c1-runtime"],
+      "default_view": "now"
+    },
+    "m5-coding-canary": {
+      "label": "m5-coding-canary",
+      "aliases": [],
+      "match_keywords": ["m5-coding-canary", "coding-canary"],
+      "path_keywords": ["m5-coding-canary"],
+      "repo_paths": [],
+      "repo_names": ["m5-coding-canary"],
+      "default_view": "now"
+    },
+    "M5-setup": {
+      "label": "M5-setup",
+      "aliases": ["m5-setup"],
+      "match_keywords": ["m5-setup"],
+      "path_keywords": ["M5-setup"],
+      "repo_paths": ["Projects/M5-setup"],
+      "repo_names": ["M5-setup"],
+      "default_view": "now"
+    },
+    "agentq-canary": {
+      "label": "agentq-canary",
+      "aliases": ["agentq"],
+      "match_keywords": ["agentq-canary", "agentq"],
+      "path_keywords": ["agentq-canary"],
+      "repo_paths": ["Projects/agentq-canary"],
+      "repo_names": ["agentq-canary"],
       "default_view": "now"
     },
     "K1": {
@@ -60,7 +69,28 @@
       "aliases": ["k1"],
       "match_keywords": ["K1"],
       "path_keywords": ["K1"],
+      "repo_paths": [],
+      "repo_names": [],
       "default_view": "now"
+    },
+    "hermes": {
+      "label": "Hermes",
+      "aliases": ["hermes"],
+      "match_keywords": ["hermes"],
+      "path_keywords": ["hermes"],
+      "repo_paths": [],
+      "repo_names": ["hermes"],
+      "default_view": "now"
+    },
+    "night": {
+      "label": "night",
+      "aliases": ["night"],
+      "match_keywords": ["night", "queuefix", "mirror-canary"],
+      "path_keywords": [],
+      "repo_paths": [],
+      "repo_names": [],
+      "default_view": "now",
+      "dispatch_only": true
     },
     "other": {
       "label": "其他",

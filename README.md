@@ -125,6 +125,14 @@ Start the full-screen dashboard in an interactive terminal:
 `/` 搜尋，不分英文大小寫；Enter 回清單，Esc 清除搜尋。上方四個下拉選單可以同時
 篩選專案、自由標籤、已讀／未讀、已隱藏／未隱藏。Tab 移動焦點，方向鍵與 Enter 選擇。
 
+工作頁每個專案標題後面會寫「依：…」，說明這個分組是怎麼判斷的：`標籤`（任務
+PROMPT.md／REPORT.md 的 `project:`／`line:`，或 TSV 第 7 欄）、`git`（任務的
+worktree 所屬 repo）、`路徑`（REPORT.md／run.log 最常提到的 `~/Projects/<名稱>/`）、
+`關鍵字`（任務名與路徑比對）、`派工`（`night` 這種只代表派工系統的標籤，最後才用）、
+`未判斷`（放進「其他」）。`night` 不會壓過 git 或路徑的結果，所以捷徑任務會分到
+iOS 捷徑，不會因為 `--project night` 被丟進 night 或「其他」。規則細節見下面
+「How a task is put in a group」。
+
 `g` 在表格與依專案分組之間切換。每組內按完成時間由新到舊排序；選中綠色專案列，
 按 Space 或 Enter 收合／展開。分組模式沿用相同搜尋與篩選，收合狀態在本次開啟期間保留。
 在分組模式下，選中任務列按 Space 也會收合它所屬的專案，游標會跳到該專案列。
@@ -280,29 +288,65 @@ name<TAB>log_path<TAB>last_report_path<TAB>pid<TAB>harness<TAB>model<TAB>project
 | `pid` | no | Process id; a live PID means "running" |
 | `harness` | no | Display label, for example `agent-a` |
 | `model` | no | Display label, for example `model-x` |
-| `project` | no | Configured project ID or case-insensitive alias; explicit values override inference |
+| `project` | no | Configured project ID or case-insensitive alias; an explicit value wins over inference unless the project is `dispatch_only` (see below) |
 | `started_at` | no | ISO 8601 timestamp with timezone, for example `2026-10-25T18:00:00+08:00` |
 | `note` | no | Free-form note; `SUPERSEDED(by name; ...)` identifies a replacement run. |
 
 Example:
 
 ```text
-example-project build	example-project/build/run.log	example-project/build/LAST.md	48213	agent-a	model-x
-docs pass	example-project/docs/run.log	example-project/docs/REPORT.md
+ios-shortcuts build	ios-shortcuts/build/run.log	ios-shortcuts/build/LAST.md	48213	agent-a	model-x
+docs pass	20261027/docs/run.log	20261027/docs/REPORT.md
 ```
 
 Project grouping and the architecture tab are configured in `arch.json`. Point
 `AGENT_WATCH_ARCH` at your own file to describe your projects and workers; the bundled
 file is an example and is validated at startup.
 
-The bundled project table includes `personal-ai-os` (`pai`), `agent-watch` (`aw`),
-`ios-shortcuts` (`ios`), and `K1`, plus the original example projects. Unknown explicit
-projects go to `other` with one data warning. Inferred keywords use alphanumeric
-boundaries (`misc-task` does not match `sc-`, and `desk1` does not match `K1`);
-a keyword ending in punctuation such as `sc-` is a delimited prefix.
-Optional `match_patterns` contain regular expressions for names and paths.
-Missing, invalid, or unreadable architecture JSON falls back to an internal graph
-with one warning. Edges must still join adjacent layers.
+The bundled project table names the real projects this dashboard runs for:
+`personal-ai-os` (`pai`), `agent-watch` (`aw`, `awv10`, `awv9`), `ios-shortcuts`
+(`ios`, `shortcut`, `iphone`, `sc-`, `捷徑`), `c1-runtime` (`c1`), `m5-coding-canary`,
+`M5-setup`, `agentq-canary`, `K1`, `hermes`, and the `night` dispatcher.
+
+### How a task is put in a group
+
+A task is grouped by the first rule that answers, and the dashboard shows the
+evidence it used — next to the group title (`依：標籤 2／git 1`) and on every
+expanded row:
+
+1. **Label** (`標籤`) — a `project:` or `line:` line (any capitalisation) in the
+   task folder's `PROMPT.md` or `REPORT.md`, or the TSV `project` column. The value
+   must be a configured project id or alias. This label is display metadata only
+   and does not widen any workdir whitelist.
+2. **git root** (`git`) — the repository that owns the task's checkout
+   (`<task>/repo`, `<task>/wt`, or the task folder itself). A linked worktree is
+   resolved back to its main repository, so a `personal-ai-os` worktree reports
+   `personal-ai-os`; a plain clone inside the runs root is read from its origin URL.
+3. **Mentioned paths** (`路徑`) — the `~/Projects/<name>/` prefix mentioned most
+   often in `REPORT.md`: at least 3 mentions and at least twice the runner-up.
+   Lines that forbid a path (`不改`／`禁止`／`不碰`／`沒有碰`／`forbidden`／`read-only`) are
+   skipped, and `run.log` only corroborates a path the report already names. The
+   runs root (`night`) is ignored there, because every task folder lives under it.
+4. **Keywords** (`關鍵字`) — `match_keywords` (task name), `path_keywords` (log and
+   report paths) and `match_patterns` (regular expressions), with alphanumeric
+   boundaries (`misc-task` does not match `sc-`, and `desk1` does not match `K1`);
+   a keyword ending in punctuation such as `sc-` is a delimited prefix.
+5. **Dispatch label** (`派工`) — a project marked `"dispatch_only": true`, such as
+   `night`. It records which dispatcher started the task, so on its own it is only
+   the last resort and never overrides a git root or the paths a task touched.
+6. Anything left goes to `other` (`未判斷`).
+
+Known limitation: rule 2 only sees a checkout that lives in the task folder or one
+level below it. A task that ran directly in a live repository (`~/Projects/<name>`)
+while the task folder holds no checkout cannot be seen as git evidence — the TSV
+has no workdir column — so it falls through to the path and keyword rules.
+
+An explicit TSV value that is not configured still goes to `other` with one data
+warning. Optional `repo_paths` maps repository locations (for example
+`Projects/agent-watch`) and `repo_names` maps repository names seen in an origin URL;
+both are only used by rule 2. Missing, invalid, or unreadable architecture JSON
+falls back to an internal graph with one warning. Edges must still join adjacent
+layers.
 
 Elapsed time prefers column 8, then a live PID's start time from
 `ps -o lstart= -p <pid>` (queried once per PID, with `LC_ALL=C` so the output parses),
@@ -366,7 +410,7 @@ and switching tabs. It proves headless responsiveness, not a live ten-minute run
 
 ```text
 watch.py                  dashboard and status logic
-arch.json                 example architecture/project configuration
+arch.json                 architecture views and the real project table
 agent-watch-v8            launcher using .venv/bin/python
 test_watch.py             UI and behaviour tests
 test_v8.py                status and quota regression tests

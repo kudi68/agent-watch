@@ -77,7 +77,10 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
     for project_id, project in projects.items():
         if not isinstance(project, dict) or not project.get("label"):
             raise ValueError(f"project {project_id!r} has no label")
-        for key in ("aliases", "match_keywords", "path_keywords", "match_patterns"):
+        for key in (
+            "aliases", "match_keywords", "path_keywords", "match_patterns",
+            "repo_paths", "repo_names",
+        ):
             values = project.get(key, [])
             if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
                 raise ValueError(f"project {project_id!r} has invalid {key}")
@@ -87,6 +90,8 @@ def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
         default_view = project.get("default_view", "now")
         if default_view not in architectures:
             raise ValueError(f"project {project_id!r} uses unknown architecture {default_view!r}")
+        if "dispatch_only" in project and not isinstance(project["dispatch_only"], bool):
+            raise ValueError(f"project {project_id!r} has a non-boolean dispatch_only")
 
     for view_id, view in architectures.items():
         if not isinstance(view, dict):
@@ -144,6 +149,40 @@ def ensure_architecture_data() -> None:
         ARCHITECTURE_ERRORS[:] = [f"arch.json 無法讀取，使用預設架構：{exc}"]
     ARCHITECTURE_DATA.update(data)
 PROJECT_OTHER = "other"
+# Evidence order for grouping a task: an explicit label wins, then where the
+# task actually ran, then the paths it touched, and only then name keywords.
+PROJECT_SOURCE_LABEL = "標籤"
+PROJECT_SOURCE_GIT = "git"
+PROJECT_SOURCE_PATH = "路徑"
+PROJECT_SOURCE_KEYWORD = "關鍵字"
+PROJECT_SOURCE_DISPATCH = "派工"
+PROJECT_SOURCE_NONE = "未判斷"
+PROJECT_SOURCE_ORDER = (
+    PROJECT_SOURCE_LABEL,
+    PROJECT_SOURCE_GIT,
+    PROJECT_SOURCE_PATH,
+    PROJECT_SOURCE_KEYWORD,
+    PROJECT_SOURCE_DISPATCH,
+    PROJECT_SOURCE_NONE,
+)
+# `project:` / `line:` on its own line in a task's PROMPT.md or REPORT.md.
+PROJECT_LABEL_RE = re.compile(
+    r"(?im)^[ \t>*_#`\-]*(?:project|line)[ \t]*[*_`]*[ \t]*[:：][ \t]*([^\s*`|,，;；()（）]+)"
+)
+# Values are often quoted in a status header (`project: "agent-watch"`).
+PROJECT_LABEL_STRIP_CHARS = "\"'“”‘’"
+# Paths a task's REPORT.md or run.log point at, e.g. ~/Projects/agent-watch/…
+PROJECT_PATH_MENTION_RE = re.compile(r"Projects/([A-Za-z0-9._-]+)/")
+# A path a task is told not to touch is not evidence of where the task ran.
+PROJECT_PATH_FORBIDDEN_RE = re.compile(
+    r"不改|禁止|不[要]?碰|沒有碰|未碰|forbidden|read[ \t-]?only|唯讀", re.IGNORECASE
+)
+PROJECT_PATH_MENTION_MIN = 3
+PROJECT_SIGNAL_READ_BYTES = 128 * 1024
+PROJECT_SIGNAL_CACHE_LIMIT = 800
+_PROJECT_LABEL_CACHE: Dict[str, Any] = {}
+_PROJECT_GIT_CACHE: Dict[str, Any] = {}
+_PROJECT_PATH_CACHE: Dict[str, Any] = {}
 RECENT_DONE_SECONDS = 2 * 60 * 60
 # Tolerate small clock skew so a just-finished task is not aged into history.
 FUTURE_SKEW_TOLERANCE_SECONDS = 5 * 60
@@ -207,12 +246,272 @@ def resolve_project(value: str) -> Tuple[str, str]:
     return PROJECT_OTHER, f"未知專案：{value}"
 
 
-def infer_project(
+def project_is_dispatch_only(project_id: str) -> bool:
+    """True for a project label that only names the dispatch system, not a project."""
+    ensure_architecture_data()
+    config = ARCHITECTURE_DATA.get("projects", {}).get(project_id)
+    return isinstance(config, dict) and bool(config.get("dispatch_only"))
+
+
+def _cached_signal(cache: Dict[str, Any], key: str, stamp: Any, produce: Callable[[], Any]) -> Any:
+    """Reuse an inference result until the file or directory that feeds it changes."""
+    hit = cache.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    value = produce()
+    if len(cache) >= PROJECT_SIGNAL_CACHE_LIMIT:
+        cache.clear()
+    cache[key] = (stamp, value)
+    return value
+
+
+def _path_stamp(path: Path) -> Optional[Tuple[float, int]]:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_mtime, info.st_size)
+
+
+def _directory_stamp(path: Path) -> Optional[float]:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _read_signal_text(path: Path, tail: bool = False) -> str:
+    """Read a bounded slice of a file; a missed file is simply no evidence."""
+    try:
+        with path.open("rb") as handle:
+            if tail:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - PROJECT_SIGNAL_READ_BYTES))
+            data = handle.read(PROJECT_SIGNAL_READ_BYTES)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _label_from_file(path: Path) -> str:
+    """First `project:` / `line:` value in the file that names a known project.
+
+    Values may be quoted, and an unrelated `Line: 42` before the real label must
+    not use up the one chance the file gets, so every matching line is tried.
+    """
+    for match in PROJECT_LABEL_RE.finditer(_read_signal_text(path)):
+        value = match.group(1).strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
+        if not value:
+            continue
+        _, error = resolve_project(value)
+        if not error:
+            return value
+    return ""
+
+
+def task_project_label(task_dir: Path) -> str:
+    """Return an explicit `project:` / `line:` label from the task folder, if any."""
+    for filename in ("PROMPT.md", "REPORT.md"):
+        path = task_dir / filename
+        stamp = _path_stamp(path)
+        if stamp is None or not path.is_file():
+            continue
+        label = _cached_signal(
+            _PROJECT_LABEL_CACHE, str(path), stamp, lambda p=path: _label_from_file(p)
+        )
+        if label:
+            return label
+    return ""
+
+
+def _git_owner_root(directory: Path) -> Optional[Path]:
+    """Return the repository a worktree belongs to, following a `.git` file."""
+    dotgit = directory / ".git"
+    try:
+        if dotgit.is_dir():
+            return directory
+        if not dotgit.is_file():
+            return None
+        text = _read_signal_text(dotgit)[:4096]
+    except OSError:
+        return None
+    match = re.search(r"^gitdir:[ \t]*(.+?)[ \t]*$", text, re.MULTILINE)
+    if not match:
+        return None
+    target = Path(match.group(1)).expanduser()
+    if not target.is_absolute():
+        target = directory / target
+    parts = target.parts
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] == ".git":
+            return Path(*parts[:index])
+    return None
+
+
+def _git_worktree_config(root: Path) -> Optional[Path]:
+    dotgit = root / ".git"
+    if dotgit.is_dir():
+        return dotgit / "config"
+    text = _read_signal_text(dotgit)[:4096]
+    match = re.search(r"^gitdir:[ \t]*(.+?)[ \t]*$", text, re.MULTILINE)
+    if not match:
+        return None
+    target = Path(match.group(1)).expanduser()
+    if not target.is_absolute():
+        target = root / target
+    return target / "config"
+
+
+def _git_origin_name(root: Path) -> str:
+    config_path = _git_worktree_config(root)
+    if config_path is None:
+        return ""
+    text = _read_signal_text(config_path)
+    section = re.search(r'\[remote "origin"\](.*?)(?:\n\[|\Z)', text, re.DOTALL)
+    if not section:
+        return ""
+    url = re.search(r"^[ \t]*url[ \t]*=[ \t]*(.+?)[ \t]*$", section.group(1), re.MULTILINE)
+    if not url:
+        return ""
+    return url.group(1).rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+
+
+def _project_for_repo_name(name: str) -> str:
+    if not name:
+        return ""
+    ensure_architecture_data()
+    wanted = name.casefold()
+    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
+        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+            continue
+        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        if wanted in {str(value).casefold() for value in names}:
+            return project_id
+    return ""
+
+
+def _project_for_repo_path(root: Path) -> str:
+    ensure_architecture_data()
+    haystack = str(root).casefold().replace("\\", "/").rstrip("/") + "/"
+    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
+        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+            continue
+        for needle in config.get("repo_paths", []):
+            if not isinstance(needle, str):
+                continue
+            probe = needle.strip("/").casefold() + "/"
+            if probe and probe in haystack:
+                return project_id
+    return _project_for_repo_name(root.name)
+
+
+def _is_under_runs_root(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(ROOT_DIR.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _git_candidates(task_dir: Path) -> List[Path]:
+    """A task folder, plus its worktree folders (`repo/`, `wt/`, …)."""
+    candidates = [task_dir]
+    if not _is_under_runs_root(task_dir):
+        return candidates
+    try:
+        children = sorted(child for child in task_dir.iterdir() if child.is_dir())
+    except OSError:
+        return candidates
+    for child in children[:40]:
+        if child.name.startswith(".") or child.is_symlink():
+            # Symlinked mirrors of other repos are not where the task ran.
+            continue
+        if (child / ".git").exists():
+            candidates.append(child)
+    return candidates
+
+
+def task_git_project(task_dir: Path) -> str:
+    """Project owning a task's git worktree; a plain clone is read from its origin."""
+
+    def produce() -> str:
+        for candidate in _git_candidates(task_dir):
+            owner = _git_owner_root(candidate)
+            if owner is None:
+                continue
+            if _is_under_runs_root(owner):
+                # A clone checked out inside the runs root is named after the task,
+                # so only its origin URL can identify the real project.
+                project_id = _project_for_repo_name(_git_origin_name(owner))
+            else:
+                project_id = _project_for_repo_path(owner)
+            if project_id:
+                return project_id
+        return ""
+
+    project_id = _cached_signal(
+        _PROJECT_GIT_CACHE, str(task_dir), _directory_stamp(task_dir), produce
+    )
+    if not project_id:
+        # `git worktree add` creates `repo/` before `repo/.git`, so a poll can land
+        # in between; an empty answer is cheap to re-check and must not stick.
+        _PROJECT_GIT_CACHE.pop(str(task_dir), None)
+    return project_id
+
+
+def task_path_project(task_dir: Path) -> str:
+    """Project whose ~/Projects/<name>/ path a task mentions most often."""
+
+    def mentions(filename: str, tail: bool) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for line in _read_signal_text(task_dir / filename, tail=tail).splitlines():
+            # "do not touch ~/Projects/c1-runtime" names a path the task did not change.
+            if PROJECT_PATH_FORBIDDEN_RE.search(line):
+                continue
+            for name in PROJECT_PATH_MENTION_RE.findall(line):
+                counts[name] = counts.get(name, 0) + 1
+        return counts
+
+    def produce() -> str:
+        counts = mentions("REPORT.md", False)
+        if not counts:
+            # A log alone cannot decide: it may only quote the rules of the dispatch.
+            return ""
+        for name, count in mentions("run.log", True).items():
+            # run.log is corroboration, so it only adds to a path the report names.
+            if name in counts:
+                counts[name] += count
+        workspace = ROOT_DIR.name.casefold()
+        tallies: Dict[str, int] = {}
+        for name, count in counts.items():
+            # Every task folder lives under the runs root; that path is not evidence.
+            if name.casefold() == workspace:
+                continue
+            project_id, error = resolve_project(name)
+            if error:
+                continue
+            tallies[project_id] = tallies.get(project_id, 0) + count
+        if not tallies:
+            return ""
+        ranked = sorted(tallies.items(), key=lambda item: item[1], reverse=True)
+        top_project, top_count = ranked[0]
+        runner_up = ranked[1][1] if len(ranked) > 1 else 0
+        if top_count < PROJECT_PATH_MENTION_MIN or top_count < runner_up * 2:
+            return ""
+        return top_project
+
+    stamp = tuple(
+        _path_stamp(task_dir / filename) for filename in ("REPORT.md", "run.log")
+    )
+    return _cached_signal(_PROJECT_PATH_CACHE, str(task_dir), stamp, produce)
+
+
+def keyword_project(
     name: str,
     log_path: Optional[Path] = None,
     last_path: Optional[Path] = None,
 ) -> str:
-    """Map a task to the configured project table; unknown tasks use other."""
+    """Legacy name/path keyword table, kept as the last inference step."""
     ensure_architecture_data()
     name_text = name.casefold()
     path_text = " ".join(
@@ -235,7 +534,96 @@ def infer_project(
             for keyword in path_keywords
         ):
             return project_id
-    return PROJECT_OTHER
+    return ""
+
+
+def project_folder(
+    log_path: Optional[Path] = None,
+    last_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """The task folder that holds PROMPT.md / REPORT.md / run.log."""
+    for candidate in (log_path, last_path):
+        if candidate is None:
+            continue
+        parent = Path(candidate).parent
+        if str(parent) in ("", "/dev") or not parent.is_dir():
+            continue
+        return parent
+    return None
+
+
+def infer_project_details(
+    name: str,
+    log_path: Optional[Path] = None,
+    last_path: Optional[Path] = None,
+    *,
+    task_dir: Optional[Path] = None,
+    project_hint: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """Group a task by explicit label, then location, paths, and finally keywords.
+
+    Returns `(project_id, evidence_source, warning)`. The warning is only set for
+    a malformed explicit project column, which keeps the historical data error.
+    """
+    ensure_architecture_data()
+    folder = task_dir if task_dir is not None else project_folder(log_path, last_path)
+    weak_hint = ""
+    if project_hint:
+        project_id, error = resolve_project(project_hint)
+        if error:
+            return PROJECT_OTHER, PROJECT_SOURCE_NONE, error
+        if project_is_dispatch_only(project_id):
+            # `--project night` records the dispatch system, not the project.
+            weak_hint = project_id
+        else:
+            return project_id, PROJECT_SOURCE_LABEL, ""
+    if folder is not None:
+        label = task_project_label(folder)
+        if label:
+            project_id, error = resolve_project(label)
+            if not error:
+                if project_is_dispatch_only(project_id):
+                    weak_hint = weak_hint or project_id
+                else:
+                    return project_id, PROJECT_SOURCE_LABEL, ""
+        project_id = task_git_project(folder)
+        if project_id:
+            return project_id, PROJECT_SOURCE_GIT, ""
+        project_id = task_path_project(folder)
+        if project_id:
+            return project_id, PROJECT_SOURCE_PATH, ""
+    project_id = keyword_project(name, log_path, last_path)
+    if project_id:
+        return project_id, PROJECT_SOURCE_KEYWORD, ""
+    if weak_hint:
+        return weak_hint, PROJECT_SOURCE_DISPATCH, ""
+    return PROJECT_OTHER, PROJECT_SOURCE_NONE, ""
+
+
+def infer_project(
+    name: str,
+    log_path: Optional[Path] = None,
+    last_path: Optional[Path] = None,
+    *,
+    task_dir: Optional[Path] = None,
+    project_hint: Optional[str] = None,
+) -> str:
+    """Map a task to the configured project table; unknown tasks use other."""
+    return infer_project_details(
+        name, log_path, last_path, task_dir=task_dir, project_hint=project_hint
+    )[0]
+
+
+def project_source_summary(agents: List["AgentInfo"]) -> str:
+    """Show why a group landed where it did, e.g. `標籤 2／git 1`."""
+    counts: Dict[str, int] = {}
+    for agent in agents:
+        source = agent.project_source or PROJECT_SOURCE_NONE
+        counts[source] = counts.get(source, 0) + 1
+    ordered = [source for source in PROJECT_SOURCE_ORDER if source in counts]
+    ordered += [source for source in counts if source not in PROJECT_SOURCE_ORDER]
+    return "／".join(f"{source} {counts[source]}" for source in ordered)
+
 
 
 def project_label(project_id: str) -> str:
@@ -943,6 +1331,7 @@ class AgentInfo:
     stage: str = ""
     harness: str = UNKNOWN_IDENTITY
     project: str = PROJECT_OTHER
+    project_source: str = ""
     start_source: str = ""
     elapsed_estimated: bool = False
     question: Optional[Dict[str, Any]] = None
@@ -1636,8 +2025,8 @@ def build_agent(
     else:
         latest = data_err or "尚無訊息"
 
-    resolved_project, project_error = resolve_project(project) if project else (
-        infer_project(name, log_path, result_path), ""
+    resolved_project, project_source, project_error = infer_project_details(
+        name, log_path, result_path, project_hint=project,
     )
     data_err = "；".join(value for value in (data_err, project_error) if value)
     return AgentInfo(
@@ -1660,6 +2049,7 @@ def build_agent(
         completion_time=completion_time,
         stage=stage,
         project=resolved_project,
+        project_source=project_source,
         start_source=start_source,
         elapsed_estimated=estimated,
         question=question,
@@ -3381,7 +3771,12 @@ def render_board_active(agents: List[AgentInfo], width: int) -> str:
         lines.append(f"[#7dcfff]{escape(title)}[/] {badge}")
         detail = agent.stage or agent.latest
         if detail and detail != UNKNOWN_IDENTITY:
-            lines.append(f"  [#a9b1d6]{escape(truncate_display(detail, max(12, width - 6)))}[/]")
+            reason = f" · 依：{agent.project_source or PROJECT_SOURCE_NONE}"
+            room = max(12, width - 6 - display_width(reason))
+            lines.append(
+                f"  [#a9b1d6]{escape(truncate_display(detail, room))}[/]"
+                f"[#565f89]{escape(reason)}[/]"
+            )
         if agent.error:
             lines.append(f"  [#ff9e3b]{escape(truncate_display(agent.error, max(12, width - 6)))}[/]")
     return "\n".join(lines)
@@ -4012,7 +4407,10 @@ def render_work_board(
     current = time.time() if now is None else now
     lines = []
     for project, tasks in work_board_groups(agents, current).items():
-        lines.append(f"[bold #bb9af7]▌ {escape(project_label(project))}[/]")
+        lines.append(
+            f"[bold #bb9af7]▌ {escape(project_label(project))}[/]"
+            f"[#565f89] 依：{escape(project_source_summary(tasks))}[/]"
+        )
         active = [a for a in tasks if task_bucket(a, current) != "recent"]
         recent = [a for a in tasks if task_bucket(a, current) == "recent"]
         if active:
@@ -4038,6 +4436,7 @@ def render_active_flow(active_agents: List[AgentInfo], width: int = 80) -> str:
     for group_index, (project_id, agents) in enumerate(grouped_items):
         lines.append(
             f"[bold #bb9af7]▌ {escape(project_label(project_id))} ({len(agents)})[/bold #bb9af7]"
+            f"[#565f89] 依：{escape(project_source_summary(agents))}[/]"
         )
         for item_index, a in enumerate(agents):
             flat_index += 1
@@ -4096,7 +4495,8 @@ def _render_done_agent(
         f"    [#c0caf5]Harness：{escape(truncate_display(agent.harness, 18))} | "
         f"模型：{escape(truncate_display(agent.model, max(12, width - 32)))}[/#c0caf5]",
         f"    [#e0af68]目前階段：{escape(truncate_display(agent.stage or UNKNOWN_IDENTITY, max(12, width - 18)))}"
-        f" | 費時：{escape(agent.elapsed)} | 完成：{escape(finished)}[/#e0af68]",
+        f" | 費時：{escape(agent.elapsed)} | 完成：{escape(finished)}"
+        f" | 依：{escape(agent.project_source or PROJECT_SOURCE_NONE)}[/#e0af68]",
         f"    [#9aa5ce]成果：{escape(result)}[/#9aa5ce]",
         "",
     ]
@@ -4120,7 +4520,10 @@ def render_recent_done_tasks(
     lines = ["[bold #0f1117 on #9ece6a] 剛完成 · 最近 2 小時 · 最新在上 [/]"]
     index = 0
     for group_index, (project_id, agents) in enumerate(ordered):
-        lines.append(f"[bold #9ece6a]▌ {escape(project_label(project_id))} ({len(agents)})[/]")
+        lines.append(
+            f"[bold #9ece6a]▌ {escape(project_label(project_id))} ({len(agents)})[/]"
+            f"[#565f89] 依：{escape(project_source_summary(agents))}[/]"
+        )
         for agent in agents:
             index += 1
             lines.extend(_render_done_agent(agent, index, width, recent=True))
@@ -4143,7 +4546,10 @@ def render_done_tasks(done_agents: List[AgentInfo], width: int = 80) -> str:
     lines = []
     index = 0
     for group_index, (project_id, agents) in enumerate(groups.items()):
-        lines.append(f"[bold #bb9af7]▌ {escape(project_label(project_id))} ({len(agents)})[/]")
+        lines.append(
+            f"[bold #bb9af7]▌ {escape(project_label(project_id))} ({len(agents)})[/]"
+            f"[#565f89] 依：{escape(project_source_summary(agents))}[/]"
+        )
         for agent in agents:
             index += 1
             lines.extend(_render_done_agent(agent, index, width, recent=False))
@@ -5168,14 +5574,15 @@ class AgentWatchApp(App):
             recent = [a for a in tasks if self.state.bucket(a, now) == "recent"]
             visible = running + (recent if self.expand_recent else recent[:3])
             visible_groups.append(
-                (project, visible, len(recent) - min(3, len(recent)), len(recent))
+                (project, visible, len(recent) - min(3, len(recent)), len(recent),
+                 project_source_summary(tasks))
             )
         structure = (
             tuple(a.key for a in attention),
             tuple(a.key for a in pinned),
             tuple(
-                (project, tuple(a.key for a in tasks), extra, recent_count)
-                for project, tasks, extra, recent_count in visible_groups
+                (project, tuple(a.key for a in tasks), extra, recent_count, source)
+                for project, tasks, extra, recent_count, source in visible_groups
             ),
             self.expand_recent,
         )
@@ -5213,7 +5620,7 @@ class AgentWatchApp(App):
             Static("尚無可顯示的釘選", classes="empty-row"),
         ]))
         sections = []
-        for project, tasks, extra, recent_count in visible_groups:
+        for project, tasks, extra, recent_count, source in visible_groups:
             children = [row(a) for a in tasks]
             if extra and not self.expand_recent:
                 children.append(Static(
@@ -5223,6 +5630,7 @@ class AgentWatchApp(App):
             running_count = sum(self.state.bucket(a, now) == "running" for a in tasks)
             section.border_title = (
                 f"{project_label(project)} · 進行中 {running_count} · 剛完成 {recent_count}"
+                f" · 依 {source}"
             )
             sections.append(section)
         if sections:
@@ -5771,6 +6179,7 @@ class AgentWatchApp(App):
                 a.is_done_file,
                 a.stage,
                 a.project,
+                a.project_source,
                 a.start_time,
                 self.state.bucket(a, current),
             )

@@ -561,7 +561,7 @@ class V10DataRegressions(unittest.TestCase):
             watch.ARCHITECTURE_ERRORS[:] = warnings
 
 
-def example_agent(name, status, now, project="example-project", **kwargs):
+def example_agent(name, status, now, project="agent-watch", **kwargs):
     fields = dict(
         name=name, status=status, log_path=Path("/tmp/example/run.log"),
         last_path=Path("/tmp/example/LAST.md"), model="model-x", harness="Agent A",
@@ -576,16 +576,16 @@ class BoardRegressions(unittest.TestCase):
     def test_t4_projects_prioritize_attention_running_recent_then_history(self):
         now = 1_800_000_000
         agents = [
-            example_agent("old-result", "complete", now, "project-a", completion_time=now - 8000),
-            example_agent("active-build", "running", now, "example-project"),
-            example_agent("recent-result", "reported", now, "project-c", completion_time=now - 10),
-            example_agent("needs-input", "waiting", now, "project-b"),
+            example_agent("old-result", "complete", now, "c1-runtime", completion_time=now - 8000),
+            example_agent("active-build", "running", now, "agent-watch"),
+            example_agent("recent-result", "reported", now, "ios-shortcuts", completion_time=now - 10),
+            example_agent("needs-input", "waiting", now, "personal-ai-os"),
         ]
         text = watch.render_work_board(agents, now=now)
-        self.assertLess(text.index("Project B"), text.index("example-project"))
-        self.assertLess(text.index("example-project"), text.index("Project C"))
+        self.assertLess(text.index("personal-ai-os"), text.index("agent-watch"))
+        self.assertLess(text.index("agent-watch"), text.index("iOS 捷徑"))
         self.assertNotIn("old-result", text)
-        self.assertIn("歷史 1 筆（project-a 1）", text)
+        self.assertIn("歷史 1 筆（c1-runtime 1）", text)
 
     def test_buckets_cover_statuses_and_expire_old_failures(self):
         now = 1_800_000_000
@@ -640,13 +640,13 @@ class BoardRegressions(unittest.TestCase):
     def test_project_ties_use_last_finish_and_long_cards_keep_timer(self):
         now = 1_800_000_000
         agents = [
-            example_agent("active-a", "running", now, "project-a", log_mtime=now),
-            example_agent("active-b", "running", now, "project-b", log_mtime=now - 100),
-            example_agent("result-a", "complete", now, "project-a", completion_time=now - 500),
-            example_agent("result-b", "complete", now, "project-b", completion_time=now - 50),
+            example_agent("active-a", "running", now, "personal-ai-os", log_mtime=now),
+            example_agent("active-b", "running", now, "c1-runtime", log_mtime=now - 100),
+            example_agent("result-a", "complete", now, "personal-ai-os", completion_time=now - 500),
+            example_agent("result-b", "complete", now, "c1-runtime", completion_time=now - 50),
         ]
         text = watch.render_work_board(agents, now=now)
-        self.assertLess(text.index("Project B"), text.index("project-a"))
+        self.assertLess(text.index("c1-runtime"), text.index("personal-ai-os"))
         long = example_agent("Very long task name " * 5, "running", now)
         from rich.text import Text
         lines = Text.from_markup(watch.render_board_active([long], 80)).plain.splitlines()
@@ -1025,64 +1025,68 @@ class QuotaSnapshotTests(unittest.IsolatedAsyncioTestCase):
 class ProjectGroupingRegressions(unittest.TestCase):
     """Every configured grouping rule gets at least one concrete example."""
 
-    def test_project_a_rules(self):
+    def test_personal_ai_os_rules(self):
         cases = (
-            ("alpha 退役備份（步驟 1-3a）", "/tmp/alpha-retire/run.log"),
-            ("PR #42 第二輪修正", "/tmp/fix2-pr42/run.log"),
-            ("PR #41-43 複查", "/tmp/review-pr41-43/run.log"),
-            ("pa 合併後狀態同步", "/tmp/pa-sync/run.log"),
-            ("project-a 狀態整理", "/tmp/work/run.log"),
-            ("example-runtime 清理", "/tmp/project-a/example-runtime/run.log"),
-            ("alpha-migration 檢查", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/project-a/run.log"),
-            ("雜項任務", "/tmp/pr-43-fix/run.log"),
+            ("pai 合併後狀態同步", "/tmp/pa-sync/run.log"),
+            ("personal-ai-os 狀態整理", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/Projects/personal-ai-os/repo/run.log"),
         )
         for name, log_path in cases:
             with self.subTest(name=name, log_path=log_path):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "project-a"
+                    watch.infer_project(name, Path(log_path)), "personal-ai-os"
                 )
 
-    def test_example_project_rule(self):
-        self.assertEqual(
-            watch.infer_project("example-project v8.1 修正", Path("/tmp/run.log")),
-            "example-project",
+    def test_agent_watch_rules(self):
+        cases = (
+            ("aw-answer 等回答顏色", "/tmp/work/run.log"),
+            ("awv10-s3 畫面整理", "/tmp/work/run.log"),
+            ("awv9-s1 審查", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/Projects/agent-watch/repo/run.log"),
         )
+        for name, log_path in cases:
+            with self.subTest(name=name, log_path=log_path):
+                self.assertEqual(
+                    watch.infer_project(name, Path(log_path)), "agent-watch"
+                )
 
-    def test_project_b_rules(self):
+    def test_ios_shortcut_rules(self):
         cases = (
             ("sc-pkg6 通知觸發", "/tmp/work/run.log"),
             ("shortcut 編譯修復", "/tmp/work/run.log"),
-            ("shortcut 匯入檢查", "/tmp/work/run.log"),
-            ("project-b 收件流程", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/project-b/run.log"),
+            ("shortcuts 匯入檢查", "/tmp/work/run.log"),
+            ("iphone 自動化檢查", "/tmp/work/run.log"),
+            ("記帳捷徑盤點", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/Projects/ios-shortcuts/build/run.log"),
         )
         for name, log_path in cases:
             with self.subTest(name=name, log_path=log_path):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "project-b"
+                    watch.infer_project(name, Path(log_path)), "ios-shortcuts"
                 )
 
-    def test_project_c_rules(self):
-        cases = (
-            ("kanban 卡片回報規則", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/project-c/run.log"),
-        )
-        for name, log_path in cases:
+    def test_c1_runtime_rules(self):
+        for name, log_path in (
+            ("c1 退役備份", "/tmp/work/run.log"),
+            ("c1-runtime 切換", "/tmp/work/run.log"),
+            ("雜項任務", "/tmp/Projects/c1-runtime/hermes/run.log"),
+        ):
             with self.subTest(name=name, log_path=log_path):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "project-c"
+                    watch.infer_project(name, Path(log_path)), "c1-runtime"
                 )
 
-    def test_project_d_rule(self):
+    def test_m5_coding_canary_and_k1_rules(self):
         cases = (
-            ("quota 新增工作組", "/tmp/work/run.log"),
-            ("雜項任務", "/tmp/project-d/run.log"),
+            ("m5-coding-canary 端到端", "m5-coding-canary"),
+            ("K1 真實任務準備", "K1"),
+            ("Hermes 派工腳本修正", "hermes"),
+            ("M5-setup 盤點", "M5-setup"),
         )
-        for name, log_path in cases:
-            with self.subTest(name=name, log_path=log_path):
+        for name, expected in cases:
+            with self.subTest(name=name):
                 self.assertEqual(
-                    watch.infer_project(name, Path(log_path)), "project-d"
+                    watch.infer_project(name, Path("/tmp/work/run.log")), expected
                 )
 
     def test_unmatched_task_stays_other(self):
@@ -1090,6 +1094,205 @@ class ProjectGroupingRegressions(unittest.TestCase):
             watch.infer_project("完全無關的任務", Path("/tmp/elsewhere/run.log")),
             "other",
         )
+
+
+class ProjectEvidenceOrderTests(unittest.TestCase):
+    """a project label, then git root, then mentioned paths, then keywords."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.runs = self.base / "runs"
+        self.runs.mkdir()
+        patcher = patch.object(watch, "ROOT_DIR", self.runs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def task_dir(self, name="task"):
+        folder = self.runs / "20261027" / name
+        folder.mkdir(parents=True)
+        (folder / "run.log").write_text("工作紀錄\n", encoding="utf-8")
+        return folder
+
+    def add_worktree(self, task_dir: Path, repo_name: str, worktree: str = "repo"):
+        owner = self.base / "Projects" / repo_name
+        gitdir = owner / ".git" / "worktrees" / worktree
+        gitdir.mkdir(parents=True)
+        checkout = task_dir / worktree
+        checkout.mkdir(parents=True, exist_ok=True)
+        (checkout / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        return checkout
+
+    def infer(self, folder: Path, name: str, hint=None):
+        return watch.infer_project_details(
+            name,
+            folder / "run.log",
+            folder / "REPORT.md",
+            task_dir=folder,
+            project_hint=hint,
+        )
+
+    def test_explicit_label_wins_over_git_and_paths(self):
+        folder = self.task_dir()
+        self.add_worktree(folder, "agent-watch")
+        (folder / "PROMPT.md").write_text(
+            "# 任務\nproject: personal-ai-os\n", encoding="utf-8"
+        )
+        project, source, warning = self.infer(folder, "shortcut 編譯")
+        self.assertEqual((project, source, warning), ("personal-ai-os", "標籤", ""))
+
+    def test_line_label_is_case_insensitive(self):
+        folder = self.task_dir()
+        (folder / "REPORT.md").write_text(
+            "DONE\n**Line**：ios-shortcuts\n", encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("ios-shortcuts", "標籤"))
+
+    def test_quoted_label_value_is_read(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            '# 任務\nproject: "agent-watch"\n', encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("agent-watch", "標籤"))
+
+    def test_unrelated_line_number_does_not_use_up_the_label(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            "Line: 42\nlog 貼上的 line: foo\nproject: ios-shortcuts\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("ios-shortcuts", "標籤"))
+
+    def test_unknown_label_falls_through_to_the_next_known_one(self):
+        folder = self.task_dir()
+        (folder / "PROMPT.md").write_text(
+            "project: no-such-project\nproject: personal-ai-os\n", encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "完全無關的任務")
+        self.assertEqual((project, source), ("personal-ai-os", "標籤"))
+
+    def test_path_named_only_as_forbidden_is_not_evidence(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text(
+            "不改 ~/Projects/c1-runtime/*\n"
+            "不改 ~/Projects/c1-runtime/hermes/a.py\n"
+            "禁止 ~/Projects/c1-runtime/b.py\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_run_log_cannot_decide_paths_on_its_own(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text("只改了幾個檔\n", encoding="utf-8")
+        (folder / "run.log").write_text(
+            "~/Projects/c1-runtime/a\n" * 5, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_a_single_forbidden_mention_is_not_padded_by_the_log(self):
+        folder = self.task_dir("backup-inventory")
+        (folder / "REPORT.md").write_text(
+            "沒有碰 `~/.hermes`、`~/Projects/c1-runtime/*`、Keychain。\n",
+            encoding="utf-8",
+        )
+        (folder / "run.log").write_text(
+            "~/Projects/c1-runtime/a\n" * 5, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "backup-inventory")
+        self.assertEqual((project, source), ("other", "未判斷"))
+
+    def test_run_log_corroborates_a_path_the_report_names(self):
+        folder = self.task_dir("wp5-install")
+        (folder / "REPORT.md").write_text(
+            "主要改 ~/Projects/agent-watch/watch.py\n"
+            "測試 ~/Projects/agent-watch/test_v8.py\n"
+            "說明 ~/Projects/agent-watch/README.md\n",
+            encoding="utf-8",
+        )
+        (folder / "run.log").write_text(
+            "~/Projects/agent-watch/watch.py\n" * 3, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "wp5-install")
+        self.assertEqual((project, source), ("agent-watch", "路徑"))
+
+    def test_empty_git_answer_is_not_cached(self):
+        folder = self.task_dir("late-checkout")
+        checkout = folder / "repo"
+        checkout.mkdir()
+        self.assertEqual(watch.task_git_project(folder), "")
+        # git worktree add writes repo/ before repo/.git; the task folder's mtime
+        # does not change for the second half, so the empty answer must not stick.
+        self.add_worktree(folder, "agent-watch")
+        self.assertEqual(watch.task_git_project(folder), "agent-watch")
+
+    def test_git_root_wins_over_keywords_and_mentioned_paths(self):
+        folder = self.task_dir("shortcut-cleanup")
+        self.add_worktree(folder, "agent-watch")
+        (folder / "REPORT.md").write_text(
+            "改 ~/Projects/ios-shortcuts/build/a\n" * 6, encoding="utf-8"
+        )
+        project, source, _ = self.infer(folder, "shortcut-cleanup")
+        self.assertEqual((project, source), ("agent-watch", "git"))
+
+    def test_mentioned_paths_win_over_keywords(self):
+        folder = self.task_dir("sc-pkg6")
+        (folder / "REPORT.md").write_text(
+            "主要修改 ~/Projects/personal-ai-os/bin/a.py\n"
+            "還有 ~/Projects/personal-ai-os/bin/b.py\n"
+            "測試 ~/Projects/personal-ai-os/tests/a.py\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "sc-pkg6 通知")
+        self.assertEqual((project, source), ("personal-ai-os", "路徑"))
+
+    def test_keywords_are_the_last_rule(self):
+        folder = self.task_dir()
+        (folder / "REPORT.md").write_text("沒有提到任何專案路徑\n", encoding="utf-8")
+        project, source, _ = self.infer(folder, "shortcut 編譯")
+        self.assertEqual((project, source), ("ios-shortcuts", "關鍵字"))
+
+    def test_night_dispatch_label_does_not_override_git_root(self):
+        folder = self.task_dir("shortcut-cleanup")
+        self.add_worktree(folder, "ios-shortcuts")
+        project, source, _ = self.infer(folder, "shortcut-cleanup", hint="night")
+        self.assertEqual((project, source), ("ios-shortcuts", "git"))
+
+    def test_night_dispatch_label_does_not_override_paths(self):
+        folder = self.task_dir("wp5-review")
+        (folder / "REPORT.md").write_text(
+            "~/Projects/c1-runtime/a\n~/Projects/c1-runtime/b\n"
+            "~/Projects/c1-runtime/c\n",
+            encoding="utf-8",
+        )
+        project, source, _ = self.infer(folder, "wp5-review", hint="night")
+        self.assertEqual((project, source), ("c1-runtime", "路徑"))
+
+    def test_night_dispatch_label_is_the_last_resort(self):
+        folder = self.task_dir("wp5-review")
+        project, source, _ = self.infer(folder, "wp5-review", hint="night")
+        self.assertEqual((project, source), ("night", "派工"))
+
+    def test_unknown_explicit_project_keeps_its_data_error(self):
+        folder = self.task_dir()
+        project, source, warning = self.infer(folder, "雜項", hint="no-such-project")
+        self.assertEqual((project, source), ("other", "未判斷"))
+        self.assertIn("未知專案", warning)
+
+    def test_generated_group_evidence_line_lists_sources(self):
+        from dataclasses import replace
+        agent = watch.AgentInfo(
+            name="a", log_path=Path("/tmp/a"), last_path=Path("/tmp/a"),
+            status="running", model="m", start_time=None, elapsed="0",
+            latest="l", project="ios-shortcuts", project_source="git",
+        )
+        other = replace(agent, name="b", project_source="標籤")
+        self.assertEqual(watch.project_source_summary([agent, other]), "標籤 1／git 1")
 
 
 if __name__ == "__main__":
