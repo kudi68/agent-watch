@@ -1153,20 +1153,20 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         future80_text = html.unescape(exported["arch-future-80x30.svg"]).replace("\xa0", " ")
         quota_text = html.unescape(exported["quota-100x35.svg"]).replace("\xa0", " ")
         self.assertIn("現在", arch_text)
-        self.assertIn("Coordinator", arch_text)
+        self.assertIn("專案教練", arch_text)
         self.assertIn("Mobile entry", arch_text)
         self.assertIn("watcher.sh", arch_text)
         self.assertIn("┌", arch_text)
         self.assertIn("▼", arch_text)
         self.assertIn("未來", future_text)
-        self.assertIn("Planner", future_text)
+        self.assertIn("專案教練", future_text)
         self.assertIn("┌", future_text)
         self.assertIn("▼", future_text)
         self.assertIn("現在", arch80_text)
-        self.assertIn("Coordinator", arch80_text)
+        self.assertIn("專案教練", arch80_text)
         self.assertIn("┌", arch80_text)
         self.assertIn("▼", arch80_text)
-        self.assertIn("Planner", future80_text)
+        self.assertIn("專案教練", future80_text)
         self.assertIn("┌", future80_text)
         self.assertIn("▼", future80_text)
         self.assertIn("服務額度用量", quota_text)
@@ -1199,14 +1199,14 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         wide = render_architecture_view(
             empty, width=100, view_id="future", project_id="agent-watch"
         )
-        self.assertIn("Planner", wide)
-        self.assertIn("Reviewer", wide)
+        self.assertIn("專案教練", wide)
+        self.assertIn("獨立審查", wide)
 
         normal = render_architecture_view(
             empty, width=80, view_id="future", project_id="agent-watch"
         )
-        self.assertIn("Planner", normal)
-        self.assertIn("Reviewer", normal)
+        self.assertIn("專案教練", normal)
+        self.assertIn("獨立審查", normal)
         for line in normal.splitlines():
             plain = re.sub(r"\[/?[^\[\]]*\]", "", line)
             self.assertLessEqual(display_width(plain), 80)
@@ -1214,28 +1214,28 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         narrow = render_architecture_view(
             empty, width=26, view_id="future", project_id="agent-watch"
         )
-        self.assertIn("Planner", narrow)
+        self.assertIn("專案教練", narrow)
         self.assertIn("┌", narrow)
 
         now_80 = render_architecture_view(
             empty, width=80, view_id="now", project_id="agent-watch"
         )
-        self.assertIn("Worker A", now_80)
-        self.assertIn("Worker B", now_80)
-        self.assertIn("Worker C", now_80)
-        self.assertIn("Coordinator", now_80)
-        self.assertIn("watcher.sh", now_80)
+        self.assertIn("OpenCode", now_80)
+        self.assertIn("Codex", now_80)
+        self.assertIn("Claude Code", now_80)
+        self.assertIn("專案教練", now_80)
+        self.assertIn("watcher", now_80)
 
     def test_architecture_node_status(self):
         """Verify worker state, model, role and progress come from TSV agents."""
         dummy_agents = [
             AgentInfo(
-                name="example-project Worker A",
+                name="example-project OpenCode",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="running",
-                harness="Agent A",
-                model="model-x",
+                harness="OpenCode",
+                model="group/night-flash",
                 start_time=100.0,
                 elapsed="00:10:00",
                 latest="修正架構圖",
@@ -1243,12 +1243,12 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 project="agent-watch",
             ),
             AgentInfo(
-                name="example-project Worker B",
+                name="example-project Codex",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="complete",
-                harness="Agent B",
-                model="model-y",
+                harness="Codex",
+                model="codex-sol-flash",
                 start_time=100.0,
                 elapsed="00:08:00",
                 latest="主要實作完成",
@@ -1257,12 +1257,12 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 project="agent-watch",
             ),
             AgentInfo(
-                name="example-project Worker C audit",
+                name="example-project Claude Code audit",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="running",
-                harness="Agent C",
-                model="model-z",
+                harness="Claude",
+                model="sonnet-5-5",
                 start_time=100.0,
                 elapsed="00:05:00",
                 latest="updating parser",
@@ -1270,12 +1270,12 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                 project="agent-watch",
             ),
             AgentInfo(
-                name="example-project Reviewer",
+                name="example-project agy research",
                 log_path=Path("/dev/null"),
                 last_path=Path("/dev/null"),
                 status="complete",
-                harness="Reviewer",
-                model="model-w",
+                harness="agy",
+                model="gemini-research",
                 start_time=100.0,
                 elapsed="00:03:00",
                 latest="done",
@@ -1284,22 +1284,22 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             ),
         ]
 
-        worker_a_active, worker_a_count, worker_a_text = get_worker_status("worker-a", dummy_agents)
-        self.assertTrue(worker_a_active)
-        self.assertEqual(worker_a_count, 1)
-        self.assertIn("執行中", worker_a_text)
-        self.assertTrue(is_node_active("worker-a", dummy_agents))
+        opencode_active, opencode_count, opencode_text = get_worker_status("opencode", dummy_agents)
+        self.assertTrue(opencode_active)
+        self.assertEqual(opencode_count, 1)
+        self.assertIn("執行中", opencode_text)
+        self.assertTrue(is_node_active("opencode", dummy_agents))
 
-        reviewer_active, reviewer_count, reviewer_text = get_worker_status("reviewer", dummy_agents)
-        self.assertFalse(reviewer_active)
-        self.assertEqual(reviewer_count, 0)
-        self.assertIn("待命中", reviewer_text)
-        self.assertFalse(is_node_active("reviewer", dummy_agents))
+        agy_active, agy_count, agy_text = get_worker_status("agy", dummy_agents)
+        self.assertFalse(agy_active)
+        self.assertEqual(agy_count, 0)
+        self.assertIn("待命中", agy_text)
+        self.assertFalse(is_node_active("agy", dummy_agents))
 
-        worker_c_active, worker_c_count, _ = get_worker_status("worker-c", dummy_agents)
-        self.assertTrue(worker_c_active)
-        self.assertEqual(worker_c_count, 1)
-        self.assertTrue(is_node_active("worker-c", dummy_agents))
+        claude_active, claude_count, _ = get_worker_status("claude-code", dummy_agents)
+        self.assertTrue(claude_active)
+        self.assertEqual(claude_count, 1)
+        self.assertTrue(is_node_active("claude-code", dummy_agents))
 
         now_text = render_architecture_view(
             dummy_agents, width=80, view_id="now", project_id="agent-watch"
@@ -1310,24 +1310,24 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         future_text = render_architecture_view(
             dummy_agents, width=80, view_id="future", project_id="agent-watch"
         )
-        self.assertIn("Coordinator", now_text)
-        self.assertIn("Mobile entry", now_text)
-        self.assertIn("watcher.sh", now_text)
+        self.assertIn("專案教練", now_text)
+        self.assertIn("Mobile", now_text)
+        self.assertIn("watcher", now_text)
         self.assertIn("● running", now_text)
         self.assertIn("✓ done", now_text)
         self.assertIn("P4 架構", now_text)
-        self.assertIn("model-x", wide_text)
-        self.assertIn("實作與修正", wide_text)
-        self.assertIn("model-z", wide_text)
-        self.assertIn("獨立審查", wide_text)
+        self.assertIn("group/night-flash", wide_text)
+        self.assertIn("跑 small 唯讀調查與文件修改", wide_text)
+        self.assertIn("sonnet-5-5", wide_text)
+        self.assertIn("跑 review 與 claude 任務", wide_text)
         self.assertIn("最近事件", now_text)
         self.assertIn("修正架構圖", now_text)
         self.assertIn("┌", now_text)
         self.assertIn("▼", now_text)
         self.assertIn("▲", now_text)
-        self.assertIn("Planner", future_text)
-        self.assertIn("Reviewer", future_text)
-        self.assertIn("Worker D", future_text)
+        self.assertIn("專案教練", future_text)
+        self.assertIn("獨立審查", future_text)
+        self.assertIn("agy", future_text)
         self.assertIn("┌", future_text)
         self.assertIn("▼", future_text)
 
@@ -1348,15 +1348,15 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
         )
         self.assertEqual(
             data["architectures"]["now"]["layers"][-1],
-            ["worker-a", "worker-b", "worker-c", "reviewer"],
+            ["opencode", "codex", "claude-code", "agy"],
         )
         self.assertEqual(
-            data["architectures"]["now"]["nodes"]["worker-b"]["model"],
-            "model-y",
+            data["architectures"]["now"]["nodes"]["codex"]["model"],
+            "codex-sol-flash / sub-all-smart / codex-main",
         )
         self.assertEqual(
             data["architectures"]["future"]["layers"][2],
-            ["worker-a", "worker-c", "worker-d"],
+            ["opencode", "codex", "claude-code", "agy"],
         )
         for project in data["projects"].values():
             self.assertIn(project["default_view"], data["architectures"])
@@ -1368,8 +1368,8 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
                     [], width=80, view_id="now", project_id=project_id
                 )
                 self.assertIn(str(project["label"]), rendered)
-                self.assertIn("Coordinator", rendered)
-                self.assertIn("Worker A", rendered)
+                self.assertIn("專案教練", rendered)
+                self.assertIn("OpenCode", rendered)
                 self.assertIn("最近事件", rendered)
                 self.assertIn("┌", rendered)
                 self.assertIn("▼", rendered)

@@ -3,89 +3,190 @@
   "projects": {
     "personal-ai-os": {
       "label": "personal-ai-os",
-      "aliases": ["pai"],
-      "match_keywords": ["personal-ai-os", "pai", "personal ai os"],
-      "path_keywords": ["personal-ai-os"],
-      "repo_paths": ["Projects/personal-ai-os"],
-      "repo_names": ["personal-ai-os"],
+      "aliases": [
+        "pai"
+      ],
+      "match_keywords": [
+        "personal-ai-os",
+        "pai",
+        "personal ai os"
+      ],
+      "path_keywords": [
+        "personal-ai-os"
+      ],
+      "repo_paths": [
+        "Projects/personal-ai-os"
+      ],
+      "repo_names": [
+        "personal-ai-os"
+      ],
       "default_view": "now"
     },
     "agent-watch": {
       "label": "agent-watch",
-      "aliases": ["aw"],
-      "match_keywords": ["agent-watch", "aw", "awv10", "awv9"],
-      "path_keywords": ["agent-watch"],
-      "repo_paths": ["Projects/agent-watch"],
-      "repo_names": ["agent-watch"],
+      "aliases": [
+        "aw"
+      ],
+      "match_keywords": [
+        "agent-watch",
+        "aw",
+        "awv10",
+        "awv9"
+      ],
+      "path_keywords": [
+        "agent-watch"
+      ],
+      "repo_paths": [
+        "Projects/agent-watch"
+      ],
+      "repo_names": [
+        "agent-watch"
+      ],
       "default_view": "now"
     },
     "ios-shortcuts": {
       "label": "iOS 捷徑",
-      "aliases": ["ios"],
-      "match_keywords": ["ios-shortcuts", "ios", "shortcut", "shortcuts", "iphone", "sc-", "捷徑"],
-      "path_keywords": ["ios-shortcuts", "shortcuts"],
-      "repo_paths": ["Projects/ios-shortcuts"],
-      "repo_names": ["ios-shortcuts"],
+      "aliases": [
+        "ios"
+      ],
+      "match_keywords": [
+        "ios-shortcuts",
+        "ios",
+        "shortcut",
+        "shortcuts",
+        "iphone",
+        "sc-",
+        "捷徑"
+      ],
+      "path_keywords": [
+        "ios-shortcuts",
+        "shortcuts"
+      ],
+      "repo_paths": [
+        "Projects/ios-shortcuts"
+      ],
+      "repo_names": [
+        "ios-shortcuts"
+      ],
       "default_view": "now"
     },
     "c1-runtime": {
       "label": "c1-runtime",
-      "aliases": ["c1"],
-      "match_keywords": ["c1-runtime", "c1"],
-      "path_keywords": ["c1-runtime"],
-      "repo_paths": ["Projects/c1-runtime"],
-      "repo_names": ["c1-runtime"],
+      "aliases": [
+        "c1"
+      ],
+      "match_keywords": [
+        "c1-runtime",
+        "c1"
+      ],
+      "path_keywords": [
+        "c1-runtime"
+      ],
+      "repo_paths": [
+        "Projects/c1-runtime"
+      ],
+      "repo_names": [
+        "c1-runtime"
+      ],
       "default_view": "now"
     },
     "m5-coding-canary": {
       "label": "m5-coding-canary",
       "aliases": [],
-      "match_keywords": ["m5-coding-canary", "coding-canary"],
-      "path_keywords": ["m5-coding-canary"],
+      "match_keywords": [
+        "m5-coding-canary",
+        "coding-canary"
+      ],
+      "path_keywords": [
+        "m5-coding-canary"
+      ],
       "repo_paths": [],
-      "repo_names": ["m5-coding-canary"],
+      "repo_names": [
+        "m5-coding-canary"
+      ],
       "default_view": "now"
     },
     "M5-setup": {
       "label": "M5-setup",
-      "aliases": ["m5-setup"],
-      "match_keywords": ["m5-setup"],
-      "path_keywords": ["M5-setup"],
-      "repo_paths": ["Projects/M5-setup"],
-      "repo_names": ["M5-setup"],
+      "aliases": [
+        "m5-setup"
+      ],
+      "match_keywords": [
+        "m5-setup"
+      ],
+      "path_keywords": [
+        "M5-setup"
+      ],
+      "repo_paths": [
+        "Projects/M5-setup"
+      ],
+      "repo_names": [
+        "M5-setup"
+      ],
       "default_view": "now"
     },
     "agentq-canary": {
       "label": "agentq-canary",
-      "aliases": ["agentq"],
-      "match_keywords": ["agentq-canary", "agentq"],
-      "path_keywords": ["agentq-canary"],
-      "repo_paths": ["Projects/agentq-canary"],
-      "repo_names": ["agentq-canary"],
+      "aliases": [
+        "agentq"
+      ],
+      "match_keywords": [
+        "agentq-canary",
+        "agentq"
+      ],
+      "path_keywords": [
+        "agentq-canary"
+      ],
+      "repo_paths": [
+        "Projects/agentq-canary"
+      ],
+      "repo_names": [
+        "agentq-canary"
+      ],
       "default_view": "now"
     },
     "K1": {
       "label": "K1",
-      "aliases": ["k1"],
-      "match_keywords": ["K1"],
-      "path_keywords": ["K1"],
+      "aliases": [
+        "k1"
+      ],
+      "match_keywords": [
+        "K1"
+      ],
+      "path_keywords": [
+        "K1"
+      ],
       "repo_paths": [],
       "repo_names": [],
       "default_view": "now"
     },
     "hermes": {
       "label": "Hermes",
-      "aliases": ["hermes"],
-      "match_keywords": ["hermes"],
-      "path_keywords": ["hermes"],
+      "aliases": [
+        "hermes"
+      ],
+      "match_keywords": [
+        "hermes"
+      ],
+      "path_keywords": [
+        "hermes"
+      ],
       "repo_paths": [],
-      "repo_names": ["hermes"],
+      "repo_names": [
+        "hermes"
+      ],
       "default_view": "now"
     },
     "night": {
       "label": "night",
-      "aliases": ["night"],
-      "match_keywords": ["night", "queuefix", "mirror-canary"],
+      "aliases": [
+        "night"
+      ],
+      "match_keywords": [
+        "night",
+        "queuefix",
+        "mirror-canary"
+      ],
       "path_keywords": [],
       "repo_paths": [],
       "repo_names": [],
@@ -102,68 +203,486 @@
   "architectures": {
     "now": {
       "label": "現在",
-      "caption": "Coordinator 統籌派工；Worker A／B／C 執行；Reviewer 審查；watcher 回報喚醒。",
+      "caption": "專案教練用 night-dispatch 照規則 A 派工。OpenCode、Codex、Claude Code、agy 執行任務。Grok Bot 管額度並支援審查。run-watcher 完成時叫醒教練。",
       "event_limit": 4,
       "layers": [
-        ["user", "entry", "watcher"],
-        ["coordinator"],
-        ["worker-a", "worker-b", "worker-c", "reviewer"]
+        [
+          "user",
+          "entry",
+          "planner",
+          "grok-bot",
+          "watcher"
+        ],
+        [
+          "coordinator"
+        ],
+        [
+          "opencode",
+          "codex",
+          "claude-code",
+          "agy"
+        ]
       ],
       "nodes": {
-        "user": {"label": "Operator", "abbr": "Operator", "model": "Human", "role": "需求與驗收", "kind": "actor"},
-        "entry": {"label": "Mobile entry", "abbr": "entry", "model": "Mobile", "role": "手機入口", "kind": "support", "match_keywords": ["entry"]},
-        "watcher": {"label": "watcher.sh", "abbr": "watcher", "model": "macOS", "role": "任務結束叫醒協調者", "kind": "support", "match_keywords": ["watcher"]},
-        "coordinator": {"label": "Coordinator", "abbr": "Coord", "model": "model-x", "role": "規劃、派工、驗收", "kind": "coordinator", "match_keywords": ["coordinator"]},
-        "worker-a": {"label": "Worker A", "abbr": "Worker A", "model": "model-x", "role": "實作與修正", "kind": "worker", "match_keywords": ["worker-a", "worker a"]},
-        "worker-b": {"label": "Worker B", "abbr": "Worker B", "model": "model-y", "role": "主要實作與整合", "kind": "worker", "match_keywords": ["worker-b", "worker b"]},
-        "worker-c": {"label": "Worker C", "abbr": "Worker C", "model": "model-z", "role": "調查與修正", "kind": "worker", "match_keywords": ["worker-c", "worker c"]},
-        "reviewer": {"label": "Reviewer", "abbr": "Reviewer", "model": "model-w", "role": "獨立審查", "kind": "worker", "match_keywords": ["reviewer"]}
+        "user": {
+          "label": "博元 (Operator)",
+          "abbr": "Operator",
+          "model": "Human",
+          "role": "定方向、核准提案、合併 PR",
+          "kind": "actor",
+          "match_keywords": [
+            "operator",
+            "human"
+          ]
+        },
+        "planner": {
+          "label": "規劃師／考官",
+          "abbr": "Planner",
+          "model": "Claude Code / 決策表 v1",
+          "role": "寫 v4 spec 與 plan，出考卷",
+          "kind": "support",
+          "match_keywords": [
+            "planner",
+            "examiner",
+            "exam",
+            "p1-5",
+            "p1-15"
+          ]
+        },
+        "grok-bot": {
+          "label": "額度管家 (Grok Bot)",
+          "abbr": "Grok Bot",
+          "model": "Grok Bot (box)",
+          "role": "寫 latest.json，補額度欄位",
+          "kind": "support",
+          "match_keywords": [
+            "grok",
+            "quota",
+            "p1-13"
+          ]
+        },
+        "watcher": {
+          "label": "watcher.sh (run-watcher)",
+          "abbr": "watcher",
+          "model": "macOS + K1",
+          "role": "看守任務，結束時叫醒教練",
+          "kind": "support",
+          "match_keywords": [
+            "watcher",
+            "run-watcher"
+          ]
+        },
+        "coordinator": {
+          "label": "專案教練 + night-dispatch",
+          "abbr": "Coach",
+          "model": "Grok Bot + 規則 A",
+          "role": "拆卡、寫 PROMPT、照規則 A 派工",
+          "kind": "coordinator",
+          "match_keywords": [
+            "coordinator",
+            "coach",
+            "night-dispatch",
+            "night_ops"
+          ]
+        },
+        "opencode": {
+          "label": "OpenCode",
+          "abbr": "OpenCode",
+          "model": "group/night-flash (deepseek-v4.1-flash)",
+          "role": "跑 small 唯讀調查與文件修改",
+          "kind": "worker",
+          "match_keywords": [
+            "opencode",
+            "night-flash",
+            "deepseek",
+            "hl-p1-14",
+            "hl-p1-21"
+          ]
+        },
+        "codex": {
+          "label": "Codex",
+          "abbr": "Codex",
+          "model": "codex-sol-flash / sub-all-smart / codex-main",
+          "role": "跑 big 實作與 design",
+          "kind": "worker",
+          "match_keywords": [
+            "codex",
+            "codex-sol-flash",
+            "sub-all-smart",
+            "codex-main",
+            "codex-budget",
+            "gpt-6",
+            "hl-p1-17-prop"
+          ]
+        },
+        "claude-code": {
+          "label": "Claude Code (含 Review)",
+          "abbr": "Claude",
+          "model": "claude-haiku-5-5 / sonnet-5-5 / opus-5-5",
+          "role": "跑 review 與 claude 任務",
+          "kind": "worker",
+          "match_keywords": [
+            "claude",
+            "claude-code",
+            "haiku",
+            "sonnet",
+            "opus",
+            "reviewer",
+            "review"
+          ]
+        },
+        "agy": {
+          "label": "agy",
+          "abbr": "agy",
+          "model": "gemini-search / gemini-research",
+          "role": "跑 research 唯讀研究",
+          "kind": "worker",
+          "match_keywords": [
+            "agy",
+            "gemini",
+            "research",
+            "aw-arch-research"
+          ]
+        },
+        "entry": {
+          "label": "Mobile entry",
+          "abbr": "entry",
+          "model": "Mobile",
+          "role": "手機入口",
+          "kind": "support",
+          "match_keywords": [
+            "entry"
+          ]
+        }
       },
       "edges": [
-        ["user", "coordinator", "需求"],
-        ["entry", "coordinator", "手機派工"],
-        ["watcher", "coordinator", "完成喚醒"],
-        ["coordinator", "worker-a", "派工"],
-        ["coordinator", "worker-b", "派工"],
-        ["coordinator", "worker-c", "派工"],
-        ["coordinator", "reviewer", "派工"],
-        ["worker-a", "coordinator", "回報"],
-        ["worker-b", "coordinator", "回報"],
-        ["worker-c", "coordinator", "回報"],
-        ["reviewer", "coordinator", "回報"]
+        [
+          "user",
+          "coordinator",
+          "定方向與核准"
+        ],
+        [
+          "planner",
+          "coordinator",
+          "v4 規格與決策表"
+        ],
+        [
+          "coordinator",
+          "grok-bot",
+          "交辦 P1-13"
+        ],
+        [
+          "grok-bot",
+          "coordinator",
+          "額度與 P1-14 審查"
+        ],
+        [
+          "watcher",
+          "coordinator",
+          "完成喚醒"
+        ],
+        [
+          "coordinator",
+          "opencode",
+          "派工 small"
+        ],
+        [
+          "coordinator",
+          "codex",
+          "派工 big / design"
+        ],
+        [
+          "coordinator",
+          "claude-code",
+          "派工 review / claude"
+        ],
+        [
+          "coordinator",
+          "agy",
+          "派工 research"
+        ],
+        [
+          "opencode",
+          "coordinator",
+          "回報 REPORT.md"
+        ],
+        [
+          "codex",
+          "coordinator",
+          "回報 REPORT.md"
+        ],
+        [
+          "claude-code",
+          "coordinator",
+          "回報審查與結果"
+        ],
+        [
+          "agy",
+          "coordinator",
+          "回報 REPORT.md"
+        ],
+        [
+          "entry",
+          "coordinator",
+          "手機派工"
+        ]
       ]
     },
     "future": {
       "label": "未來",
-      "caption": "Planner 規劃與派工，worker 回報後由 Reviewer 審查，再回報 Operator。",
+      "caption": "harness-loop 只用同級組 tier-flash、tier-mid、tier-sol。混合組修好規則後留給博元手動用。審查與看守驗完證據，再交博元過 G1 關卡。",
       "event_limit": 4,
       "layers": [
-        ["user", "entry"],
-        ["planner"],
-        ["worker-a", "worker-c", "worker-d"],
-        ["reviewer"],
-        ["report"]
+        [
+          "user",
+          "examiner",
+          "grok-bot"
+        ],
+        [
+          "dispatcher"
+        ],
+        [
+          "opencode",
+          "codex",
+          "claude-code",
+          "agy"
+        ],
+        [
+          "reviewer",
+          "watcher"
+        ],
+        [
+          "report"
+        ]
       ],
       "nodes": {
-        "user": {"label": "Operator", "abbr": "Operator", "model": "Human", "role": "需求與驗收", "kind": "actor"},
-        "entry": {"label": "Mobile entry", "abbr": "entry", "model": "Mobile", "role": "手機入口", "kind": "support", "match_keywords": ["entry"]},
-        "planner": {"label": "Planner", "abbr": "Planner", "model": "model-x", "role": "規劃與派工", "kind": "coordinator", "match_keywords": ["planner"]},
-        "worker-a": {"label": "Worker A", "abbr": "Worker A", "model": "model-x", "role": "實作與修正", "kind": "worker", "match_keywords": ["worker-a", "worker a"]},
-        "worker-c": {"label": "Worker C", "abbr": "Worker C", "model": "model-z", "role": "調查與修正", "kind": "worker", "match_keywords": ["worker-c", "worker c"]},
-        "worker-d": {"label": "Worker D", "abbr": "Worker D", "model": "model-v", "role": "獨立實作", "kind": "worker", "match_keywords": ["worker-d", "worker d"]},
-        "reviewer": {"label": "Reviewer", "abbr": "Reviewer", "model": "model-w", "role": "獨立審查", "kind": "coordinator", "match_keywords": ["reviewer"]},
-        "report": {"label": "回報 Operator", "abbr": "回報", "model": "Human", "role": "驗收與決策", "kind": "actor"}
+        "user": {
+          "label": "博元 (Operator)",
+          "abbr": "Operator",
+          "model": "Human (手動用 sub-all-smart / codex-sol-flash)",
+          "role": "定方向、核准 magpie 變更",
+          "kind": "actor",
+          "match_keywords": [
+            "operator",
+            "human"
+          ]
+        },
+        "examiner": {
+          "label": "考官 + 規劃師",
+          "abbr": "Examiner",
+          "model": "model-decision-table.tsv v2",
+          "role": "考 tier-mid 與 tier-sol",
+          "kind": "support",
+          "match_keywords": [
+            "examiner",
+            "planner",
+            "exam",
+            "p1-15",
+            "p1-16",
+            "p1-24"
+          ]
+        },
+        "grok-bot": {
+          "label": "額度管家 (Grok Bot)",
+          "abbr": "Grok Bot",
+          "model": "Grok Bot + magpie quota",
+          "role": "提供 latest.json 與額度",
+          "kind": "support",
+          "match_keywords": [
+            "grok",
+            "quota",
+            "p1-13"
+          ]
+        },
+        "dispatcher": {
+          "label": "專案教練 + night-dispatch",
+          "abbr": "Dispatch",
+          "model": "Grok Bot + 同級組 + 決策表 v2",
+          "role": "查決策表與額度，派同級組",
+          "kind": "coordinator",
+          "match_keywords": [
+            "coordinator",
+            "coach",
+            "dispatcher",
+            "night-dispatch",
+            "night_ops"
+          ]
+        },
+        "opencode": {
+          "label": "OpenCode (tier-flash)",
+          "abbr": "OpenCode",
+          "model": "group/tier-flash (deepseek-v4.1-flash)",
+          "role": "跑 small 任務與文件修改",
+          "kind": "worker",
+          "match_keywords": [
+            "opencode",
+            "tier-flash",
+            "night-flash",
+            "deepseek",
+            "p1-23"
+          ]
+        },
+        "codex": {
+          "label": "Codex (tier-mid / tier-sol)",
+          "abbr": "Codex",
+          "model": "tier-mid (luna/deepseek) → tier-sol (gpt-6.1-sol)",
+          "role": "跑 big 與 design",
+          "kind": "worker",
+          "match_keywords": [
+            "codex",
+            "tier-mid",
+            "tier-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol"
+          ]
+        },
+        "claude-code": {
+          "label": "Claude Code (含 advisor)",
+          "abbr": "Claude",
+          "model": "claude-haiku-5-5 / sonnet-5-5 + advisor opus",
+          "role": "跑 claude 任務與試跑",
+          "kind": "worker",
+          "match_keywords": [
+            "claude",
+            "claude-code",
+            "sonnet",
+            "advisor",
+            "p1-9"
+          ]
+        },
+        "agy": {
+          "label": "agy",
+          "abbr": "agy",
+          "model": "gemini-search / gemini-research",
+          "role": "跑 research 唯讀研究",
+          "kind": "worker",
+          "match_keywords": [
+            "agy",
+            "gemini",
+            "research",
+            "p1-7"
+          ]
+        },
+        "reviewer": {
+          "label": "獨立審查 (Claude / tier-sol / Hermes)",
+          "abbr": "Reviewer",
+          "model": "Claude haiku/sonnet/opus + group/tier-sol",
+          "role": "審 diff、跑 Opus 架構總審",
+          "kind": "coordinator",
+          "match_keywords": [
+            "reviewer",
+            "review",
+            "opus",
+            "hermes",
+            "p1-8"
+          ]
+        },
+        "watcher": {
+          "label": "run-watcher + task-ledger",
+          "abbr": "watcher",
+          "model": "run-watcher.sh + K1",
+          "role": "驗完成證據、記帳、叫醒教練",
+          "kind": "support",
+          "match_keywords": [
+            "watcher",
+            "run-watcher",
+            "ledger"
+          ]
+        },
+        "report": {
+          "label": "博元人工關卡 (G1 / PR 合併)",
+          "abbr": "G1 Gate",
+          "model": "Human",
+          "role": "決定 G1 go/no-go、合併 PR",
+          "kind": "actor",
+          "match_keywords": [
+            "g1",
+            "gate",
+            "report"
+          ]
+        }
       },
       "edges": [
-        ["user", "planner", "需求"],
-        ["entry", "planner", "手機入口"],
-        ["planner", "worker-a", "派工"],
-        ["planner", "worker-c", "派工"],
-        ["planner", "worker-d", "派工"],
-        ["worker-a", "reviewer", "回報"],
-        ["worker-c", "reviewer", "回報"],
-        ["worker-d", "reviewer", "回報"],
-        ["reviewer", "report", "結果"]
+        [
+          "user",
+          "dispatcher",
+          "需求與提案核准"
+        ],
+        [
+          "examiner",
+          "dispatcher",
+          "決策表 v2 與設定 hash"
+        ],
+        [
+          "grok-bot",
+          "dispatcher",
+          "即時額度與 latest.json"
+        ],
+        [
+          "dispatcher",
+          "opencode",
+          "派工 tier-flash"
+        ],
+        [
+          "dispatcher",
+          "codex",
+          "派工 tier-mid / tier-sol"
+        ],
+        [
+          "dispatcher",
+          "claude-code",
+          "派工 haiku / sonnet / opus"
+        ],
+        [
+          "dispatcher",
+          "agy",
+          "派工 research"
+        ],
+        [
+          "opencode",
+          "reviewer",
+          "送審 diff 與測試"
+        ],
+        [
+          "codex",
+          "reviewer",
+          "送審 diff 與測試"
+        ],
+        [
+          "claude-code",
+          "reviewer",
+          "送審 diff 與測試"
+        ],
+        [
+          "opencode",
+          "watcher",
+          "寫 REPORT.md"
+        ],
+        [
+          "codex",
+          "watcher",
+          "寫 REPORT.md"
+        ],
+        [
+          "claude-code",
+          "watcher",
+          "寫 REPORT.md"
+        ],
+        [
+          "agy",
+          "watcher",
+          "寫 REPORT.md"
+        ],
+        [
+          "reviewer",
+          "report",
+          "審查結論與建議"
+        ],
+        [
+          "watcher",
+          "report",
+          "完成證據與 downgrade 紀錄"
+        ]
       ]
     }
   }
