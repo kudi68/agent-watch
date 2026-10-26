@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 3,
+  "series": [
+    {
+      "providerId": "claude",
+      "windowKey": "weekly.v1",
+      "samples": [
+        {"usedPercent": 1.0, "resetAt": 1793096100, "sampledAt": 1793030000, "durationSeconds": 604800}
+      ]
+    },
+    {
+      "providerId": "grok-bot",
+      "windowKey": "weekly.v1",
+      "samples": [
+        {"usedPercent": 10.0, "resetAt": 1793096100, "sampledAt": 1793030000, "durationSeconds": 604800},
+        {"usedPercent": 22.5, "resetAt": 1793096100, "sampledAt": 1793039569, "durationSeconds": 604800}
+      ]
+    }
+  ]
+}
