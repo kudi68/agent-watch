@@ -5886,7 +5886,7 @@ class AgentWatchApp(App):
             return
         row = self._row_widgets.get(self.selected_key)
         if row is not None:
-            self.set_focus(row, scroll_visible=False)
+            self.set_focus(row)
 
     def on_task_row_selected(self, event: TaskRow.Selected) -> None:
         if event.key in self._row_widgets:

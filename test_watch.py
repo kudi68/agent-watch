@@ -1979,6 +1979,28 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.focused, watch.TaskRow)
             self.assertFalse(app.ui_error)
 
+    async def test_tab_return_scrolls_selected_row_back_into_view(self):
+        """Switching back to 工作 must scroll a scrolled-away selection into view."""
+        app = self.fixture_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            scroll = app.query_one("#work-scroll")
+            row = next(iter(app._row_widgets.values()))
+            app.selected_key = row.agent.key
+            app.update_selection()
+            scroll.scroll_end(animate=False)
+            await pilot.pause()
+            await pilot.pause()
+            self.assertFalse(app.screen.can_view_entire(row))
+            app.action_switch_tab("tab-arch")
+            await pilot.pause()
+            app.action_switch_tab("tab-work")
+            for _ in range(3):
+                await pilot.pause()
+            self.assertTrue(app.screen.can_view_entire(row))
+            self.assertIs(app.focused, row)
+            self.assertFalse(app.ui_error)
+
     async def test_background_result_after_shutdown_ignores_cancelled_callback(self):
         app = self.fixture_app([])
         with patch.object(app, "call_from_thread", side_effect=watch.CancelledError()):
