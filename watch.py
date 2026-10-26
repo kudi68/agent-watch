@@ -5873,10 +5873,20 @@ class AgentWatchApp(App):
 
     def restore_selection(self, restore_focus: bool) -> None:
         self.update_selection()
-        if restore_focus and self.query_one("#main-tabs", TabbedContent).active == "tab-work":
-            row = self._row_widgets.get(self.selected_key)
-            if row is not None:
-                row.focus(scroll_visible=False)
+        if restore_focus:
+            # Widget.focus() applies the focus in a later callback, so a tab
+            # switch can land in between; the focus then hits a row inside the
+            # hidden work pane and TabbedContent comes back to it. Decide the
+            # focus at the moment it is applied, in the same tick as the check.
+            self.call_later(self.focus_selected_row)
+
+    def focus_selected_row(self) -> None:
+        """Focus the selected row, but only while the work tab is the visible one."""
+        if self.query_one("#main-tabs", TabbedContent).active != "tab-work":
+            return
+        row = self._row_widgets.get(self.selected_key)
+        if row is not None:
+            self.set_focus(row)
 
     def on_task_row_selected(self, event: TaskRow.Selected) -> None:
         if event.key in self._row_widgets:
