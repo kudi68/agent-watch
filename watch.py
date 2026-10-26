@@ -167,6 +167,18 @@ STALE_ATTENTION_SECONDS = _stale_attention_seconds_from_env()
 STATE_TASK_RETENTION_SECONDS = 30 * 24 * 60 * 60
 QUESTION_FILENAME = "QUESTION.md"
 ANSWER_FILENAME = "ANSWER.md"
+# Handing a question to an upper agent is a reserved choice, so a normal option
+# code (A/B/C…) can never mean the same thing.
+ESCALATE_CHOICE = "ESCALATE"
+ESCALATE_FIELD = "escalate_to"
+ESCALATE_OPTION_PREFIX = "escalate-"
+DEFAULT_ESCALATE_TARGET = "coach"
+ESCALATE_TARGETS = ("coach", "claude-code")
+# 待回答 gets its own color, apart from the other needs-attention items; an
+# overdue question keeps the existing red rule.
+QUESTION_PENDING_COLOR = "#2ac3de"
+QUESTION_OVERDUE_COLOR = "#f7768e"
+ESCALATED_COLOR = "#bb9af7"
 TERMINAL_TAIL_LINES = 400
 TERMINAL_TAIL_BYTES = 512 * 1024
 QUOTA_PROVIDER_NAMES = {
@@ -710,7 +722,9 @@ def parse_question(text: str) -> Dict[str, Any]:
 
 def parse_answer(text: str) -> Dict[str, Any]:
     """Parse ANSWER.md; a mismatched id is treated as no answer."""
-    answer: Dict[str, Any] = dict(id="", choice="", note="", answered_at="", error="")
+    answer: Dict[str, Any] = dict(
+        id="", choice="", note="", answered_at="", escalate_to="", error="",
+    )
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines or not lines[0].strip().upper().startswith("# ANSWER"):
         answer["error"] = "缺少 # ANSWER 標題"
@@ -722,7 +736,7 @@ def parse_answer(text: str) -> Dict[str, Any]:
         if pair is None:
             continue
         key, value = pair
-        if key in ("id", "choice", "note", "answered_at"):
+        if key in ("id", "choice", "note", "answered_at", ESCALATE_FIELD):
             answer[key] = value
     if not answer["id"]:
         answer["error"] = "缺少 id"
@@ -760,6 +774,14 @@ def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
         question["id"] and answer is not None and not answer["error"]
         and answer["id"] == question["id"]
     )
+    choice = (answer or {}).get("choice", "").strip().upper()
+    question["escalated"] = bool(question["answered"] and choice == ESCALATE_CHOICE)
+    question["escalate_to"] = ""
+    if question["escalated"]:
+        target = str((answer or {}).get(ESCALATE_FIELD) or "").strip().casefold()
+        question["escalate_to"] = (
+            target if target in ESCALATE_TARGETS else DEFAULT_ESCALATE_TARGET
+        )
     return question
 
 
@@ -771,6 +793,17 @@ def question_is_active(question: Optional[Dict[str, Any]],
     asked = question.get("asked_at_ts") or question.get("mtime") or 0
     if completion_time is not None and asked <= completion_time:
         # A leftover question older than the finished run belongs to an older run.
+        return False
+    return True
+
+
+def question_escalated(question: Optional[Dict[str, Any]],
+                       completion_time: Optional[float] = None) -> bool:
+    """An escalated question left Bo-Yuan's queue and now waits for an upper agent."""
+    if not question or not question.get("escalated"):
+        return False
+    asked = question.get("asked_at_ts") or question.get("mtime") or 0
+    if completion_time is not None and asked <= completion_time:
         return False
     return True
 
@@ -791,24 +824,39 @@ def format_question_wait(seconds: int) -> str:
 
 
 def write_answer_file(directory: Path, question: Dict[str, Any], choice: str,
-                      note: str = "", now: Optional[float] = None) -> Tuple[bool, str]:
-    """Write ANSWER.md atomically with the question's id (SPEC §3.3)."""
+                      note: str = "", now: Optional[float] = None,
+                      escalate_to: str = "") -> Tuple[bool, str]:
+    """Write ANSWER.md atomically with the question's id (SPEC §3.3).
+
+    `choice=ESCALATE` records a hand-off instead of an answer; the reserved
+    `escalate_to` field names the upper agent that now owns the question.
+    """
     if question.get("error"):
         return False, "問題格式錯誤，不能回答"
-    codes = [code for code, _ in question.get("options", [])]
-    if not choice or choice not in codes:
-        return False, "選項不存在"
+    escalating = str(choice or "").strip().upper() == ESCALATE_CHOICE
+    escalate_target = ""
+    if escalating:
+        escalate_target = str(escalate_to or "").strip().casefold() or DEFAULT_ESCALATE_TARGET
+        if escalate_target not in ESCALATE_TARGETS:
+            return False, "轉介對象只能是 %s" % "／".join(ESCALATE_TARGETS)
+    else:
+        codes = [code for code, _ in question.get("options", [])]
+        if not choice or choice not in codes:
+            return False, "選項不存在"
     if not question.get("id"):
         return False, "問題缺少 id，不能回答"
     stamp = datetime.fromtimestamp(now if now is not None else time.time()).astimezone()
     clean_note = " ".join(str(note or "").splitlines()).strip()
-    content = (
-        "# ANSWER\n"
-        "id: %s\n"
-        "answered_at: %s\n"
-        "choice: %s\n"
-        "note: %s\n"
-    ) % (question["id"], stamp.isoformat(timespec="seconds"), choice, clean_note)
+    lines = [
+        "# ANSWER",
+        "id: %s" % question["id"],
+        "answered_at: %s" % stamp.isoformat(timespec="seconds"),
+        "choice: %s" % (ESCALATE_CHOICE if escalating else choice),
+    ]
+    if escalating:
+        lines.append("%s: %s" % (ESCALATE_FIELD, escalate_target))
+    lines.append("note: %s" % clean_note)
+    content = "\n".join(lines) + "\n"
     target = Path(directory) / ANSWER_FILENAME
     temporary = None
     try:
@@ -1557,6 +1605,13 @@ def build_agent(
         # SPEC §3.3: an unanswered question is a needs-attention task even while
         # its PID is alive, so it must leave the running bucket.
         status = "question"
+    elif (
+        question is not None
+        and question_escalated(question, completion_time)
+        and status not in {"complete", "reported", "partial"}
+    ):
+        # Handed to an upper agent: still needs watching, but no longer Bo-Yuan's answer.
+        status = "escalated"
     elapsed = format_elapsed(elapsed_start, completion_time if completion_time is not None else now)
     estimated = start_source == "log" and elapsed_start is not None
     if estimated:
@@ -3264,6 +3319,8 @@ STATUS_BADGE_MARKUP = {
     "no_report": "[bold #0f1117 on #ff9e3b] [無報告] [/]",
     "unconfirmed": "[#c0caf5 on #565f89] [結果未確認] [/]",
     "error": "[#c0caf5 on #565f89] [異常] [/]",
+    "question": "[bold #0f1117 on #2ac3de] [等回答] [/]",
+    "escalated": "[bold #0f1117 on #bb9af7] [已轉介] [/]",
 }
 
 
@@ -3430,8 +3487,13 @@ BOARD_STATUS_LABELS = {
     "running": "進行中", "waiting": "等候中", "blocked": "卡住",
     "failed": "失敗", "no_report": "無報告", "unconfirmed": "待確認",
     "error": "資料錯誤", "complete": "剛完成", "reported": "已回報",
-    "partial": "部分完成", "question": "等回答",
+    "partial": "部分完成", "question": "等回答", "escalated": "已轉介",
 }
+# Shown above the needs-attention rows so the colors explain themselves.
+ATTENTION_LEGEND = (
+    "[#2ac3de]● 等博元回答[/]  [#f7768e]● 逾時未答[/]  "
+    "[#bb9af7]● 已轉介等上層[/]  [#f7768e]● 其他需處理[/]"
+)
 WIDE_BOARD_COLUMNS = 120
 
 
@@ -3540,6 +3602,36 @@ class WatchState:
             return False
         asked = question.get("asked_at_ts") or question.get("mtime") or 0
         return bool(asked and now - asked > STALE_ATTENTION_SECONDS)
+
+    def remember_escalation(self, agent: AgentInfo, question: Optional[Dict[str, Any]] = None,
+                            target: str = "") -> bool:
+        """Remember the hand-off so a later normal answer can name who answered."""
+        question = question or agent.question or {}
+        question_id = question.get("id") or ""
+        to = str(target or question.get("escalate_to") or DEFAULT_ESCALATE_TARGET).strip().casefold()
+        if not question_id or to not in ESCALATE_TARGETS:
+            return False
+        entry = self.task(agent.key)
+        if entry.get("escalate_qid") == question_id and entry.get("escalate_to") == to:
+            return True
+        return self.update_task(
+            agent.key, escalate_qid=question_id, escalate_to=to,
+            escalated_at=self.stamp(), run_start=agent.start_time,
+        )
+
+    def answered_by(self, agent: AgentInfo) -> str:
+        """Name the upper agent that answered a question this dashboard escalated."""
+        question = agent.question or {}
+        if not question.get("answered") or question.get("escalated"):
+            return ""
+        answer = question.get("answer") or {}
+        target = str(answer.get(ESCALATE_FIELD) or "").strip().casefold()
+        if target in ESCALATE_TARGETS:
+            return target
+        entry = self.task(agent.key)
+        if entry.get("escalate_qid") and entry.get("escalate_qid") == question.get("id"):
+            return str(entry.get("escalate_to") or "")
+        return ""
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the history label for a dismissed, expired, or replaced task."""
@@ -3655,7 +3747,21 @@ class WatchState:
                 )
                 if rerun:
                     entry.update(hidden=False, done_manual=False, restored=False, read=False,
-                                 dismissed=False, run_start=agent.start_time, updated_at=self.stamp())
+                                 dismissed=False, escalate_qid="", escalate_to="",
+                                 run_start=agent.start_time, updated_at=self.stamp())
+                    changed = True
+            question = agent.question or {}
+            if question.get("escalated"):
+                record = data["tasks"].setdefault(agent.key, {})
+                target = question.get("escalate_to") or DEFAULT_ESCALATE_TARGET
+                if (record.get("escalate_qid") != (question.get("id") or "")
+                        or record.get("escalate_to") != target):
+                    # The ANSWER.md may later be overwritten with a real choice;
+                    # keep the hand-off here so the board can still attribute it.
+                    record.update(
+                        escalate_qid=question.get("id") or "", escalate_to=target,
+                        escalated_at=self.stamp(), updated_at=self.stamp(),
+                    )
                     changed = True
             project = data["projects"].get(agent.project, {})
             if project.get("collapsed") and self.bucket(agent, now) in ("running", "attention"):
@@ -3782,11 +3888,22 @@ def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
 
 
 def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False,
-                    bucket: Optional[str] = None, history_label: str = "") -> Text:
+                    bucket: Optional[str] = None, history_label: str = "",
+                    answered_by: str = "") -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
     bucket = bucket or board_bucket(agent, now)
     color = BOARD_COLORS[bucket]
+    wait_seconds = 0
+    if agent.question and agent.status == "question":
+        wait_seconds = question_wait_seconds(agent.question, now)
+    if bucket not in ("history", "hidden"):
+        if agent.status == "question":
+            # Bo-Yuan's answer queue owns its own color; overdue keeps the red rule.
+            color = QUESTION_OVERDUE_COLOR if wait_seconds >= QUESTION_OVERDUE_SECONDS \
+                else QUESTION_PENDING_COLOR
+        elif agent.status == "escalated":
+            color = ESCALATED_COLOR
     marker = "› " if selected else "  "
     status = BOARD_STATUS_LABELS.get(agent.status, "待確認")
     if bucket in ("history", "hidden"):
@@ -3823,16 +3940,21 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     if agent.question:
         if agent.question.get("error"):
             detail = "問題格式錯誤：" + agent.question["error"]
+        elif agent.status == "escalated":
+            detail = "已轉介給 %s，等上層回答：%s" % (
+                agent.question.get("escalate_to") or DEFAULT_ESCALATE_TARGET,
+                agent.question.get("question") or detail,
+            )
         else:
             detail = agent.question.get("question") or detail
         if agent.status == "question" and not agent.question.get("answered"):
-            wait_text = "  " + format_question_wait(
-                question_wait_seconds(agent.question, now)
-            )
+            wait_text = "  " + format_question_wait(wait_seconds)
+        if answered_by and agent.status != "escalated":
+            detail = "由 %s 回答 · %s" % (answered_by, detail)
     detail_width = max(1, width - display_width(wait_text))
     result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
     if wait_text:
-        overdue = question_wait_seconds(agent.question, now) >= QUESTION_OVERDUE_SECONDS
+        overdue = wait_seconds >= QUESTION_OVERDUE_SECONDS
         result.append(wait_text, style="bold #f7768e" if overdue else "bold #e0af68")
     return result
 
@@ -4237,6 +4359,10 @@ TabPane {
     height: 1;
     color: #737b91;
 }
+.attention-legend {
+    height: 1;
+    color: #737b91;
+}
 .task-row {
     height: auto;
     min-height: 1;
@@ -4514,6 +4640,7 @@ class TaskRow(Static, can_focus=True):
         return render_task_row(
             agent, self.content_size.width, self.now, self.selected, bucket,
             self.app.state.stale_info(agent, self.now),
+            self.app.state.answered_by(agent),
         )
 
     def on_focus(self) -> None:
@@ -4581,7 +4708,7 @@ class HelpScreen(ModalScreen):
                 "  Tab / Shift+Tab  移動焦點\n"
                 "  滑鼠點選      選中任務並預覽\n"
                 "  Enter        深入畫面：全螢幕唯讀終端機（Esc 返回）\n"
-                "               有 QUESTION.md 時開選項彈窗\n"
+                "               有 QUESTION.md 時開選項彈窗；最下方可轉給上層 agent\n"
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  x            清除所選需處理項目；不會刪除問題檔\n"
@@ -4715,7 +4842,11 @@ class TerminalScreen(ModalScreen):
 
 
 class QuestionScreen(ModalScreen):
-    """SPEC §3.3 options popup; malformed questions only show their raw text."""
+    """SPEC §3.3 options popup; malformed questions only show their raw text.
+
+    Below the question's own options the popup offers a hand-off to an upper
+    agent (`ESCALATE` + `escalate_to`) instead of an answer.
+    """
 
     BINDINGS = [("escape", "dismiss(None)", "取消")]
 
@@ -4723,6 +4854,21 @@ class QuestionScreen(ModalScreen):
         super().__init__()
         self.agent = agent
         self.question = question
+        self.entries = [
+            (str(code), str(label)) for code, label in question.get("options", [])
+        ]
+        self.entries.extend(
+            (ESCALATE_OPTION_PREFIX + target,
+             "↗ 轉給上層 agent：%s%s" % (
+                 target, "（預設）" if target == DEFAULT_ESCALATE_TARGET else "",
+             ))
+            for target in ESCALATE_TARGETS
+        )
+        self.prompts = [
+            label if code.startswith(ESCALATE_OPTION_PREFIX)
+            else "%s  %s" % (code, label)
+            for code, label in self.entries
+        ]
 
     def compose(self) -> ComposeResult:
         question = self.question
@@ -4746,8 +4892,8 @@ class QuestionScreen(ModalScreen):
             else:
                 yield Static(question.get("question", ""), id="question-text", markup=False)
                 yield OptionList(
-                    *[Option("%s  %s" % (code, label), id=code)
-                      for code, label in question.get("options", [])],
+                    *[Option(prompt, id=code) for (code, _), prompt
+                      in zip(self.entries, self.prompts)],
                     id="question-options",
                 )
                 yield Input(
@@ -4755,7 +4901,7 @@ class QuestionScreen(ModalScreen):
                     id="question-note",
                 )
             yield Static(
-                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · Esc 取消",
+                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · 最下面兩列轉給上層 · Esc 取消",
                 id="question-hint",
             )
 
@@ -4764,7 +4910,12 @@ class QuestionScreen(ModalScreen):
         if options:
             options.first().focus()
     def _dismiss_with(self, choice: str, note: str = "") -> None:
-        self.dismiss(dict(choice=choice, note=note))
+        escalate_to = ""
+        if choice.startswith(ESCALATE_OPTION_PREFIX):
+            target = choice[len(ESCALATE_OPTION_PREFIX):]
+            if target in ESCALATE_TARGETS:
+                escalate_to, choice = target, ESCALATE_CHOICE
+        self.dismiss(dict(choice=choice, note=note, escalate_to=escalate_to))
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -4775,11 +4926,10 @@ class QuestionScreen(ModalScreen):
             return
         event.stop()
         options = self.query("#question-options")
-        codes = [code for code, _ in self.question.get("options", [])]
-        if not options or not codes:
+        if not options or not self.entries:
             return
         index = options.first().highlighted
-        choice = codes[index if index is not None else 0]
+        choice = self.entries[index if index is not None else 0][0]
         self._dismiss_with(choice, event.value)
 
 
@@ -5052,11 +5202,12 @@ class AgentWatchApp(App):
             return widget
 
         attention_list.mount(*(
-            [row(a) for a in attention] if attention
+            [Static(ATTENTION_LEGEND, classes="attention-legend"), *[row(a) for a in attention]]
+            if attention
             else [Static("目前沒有需處理任務", classes="empty-row")]
         ))
         self.query_one("#attention-box").border_title = (
-            f"需處理 · {len(attention)} · 等回答／卡住／失敗／無報告"
+            f"需處理 · {len(attention)} · 等回答／已轉介／卡住／失敗／無報告"
         )
         pinned_box.mount(*([row(a) for a in pinned] if pinned else [
             Static("尚無可顯示的釘選", classes="empty-row"),
@@ -5446,13 +5597,22 @@ class AgentWatchApp(App):
     def answer_question(self, agent: AgentInfo, result: Optional[Dict[str, Any]]) -> None:
         if not result:
             return
+        choice = str(result.get("choice", ""))
+        escalate_to = str(result.get("escalate_to", "") or "")
         ok, message = write_answer_file(
-            agent.log_path.parent, agent.question or {}, result.get("choice", ""),
-            result.get("note", ""), now=time.time(),
+            agent.log_path.parent, agent.question or {}, choice,
+            result.get("note", ""), now=time.time(), escalate_to=escalate_to,
         )
         if ok:
+            if choice.strip().upper() == ESCALATE_CHOICE:
+                question = read_task_question(agent.log_path.parent) or agent.question or {}
+                target = question.get("escalate_to") or DEFAULT_ESCALATE_TARGET
+                self.state.remember_escalation(agent, question, target)
+                message = "已轉介給 %s，等上層回答（已寫 ANSWER.md）" % target
+            else:
+                message = "已寫入 ANSWER.md：" + choice
             self.state.update_task(agent.key, read=True, run_start=agent.start_time)
-            self.show_state_message("已寫入 ANSWER.md：" + result.get("choice", ""))
+            self.show_state_message(message)
             self.last_snapshot = None
             self.update_data()
         else:

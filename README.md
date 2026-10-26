@@ -99,7 +99,7 @@ Start the full-screen dashboard in an interactive terminal:
 | `4` | Architecture tab |
 | `5` | Decision-tree tab (架構樹) |
 | `j` / `k`, arrows | Select next / previous task |
-| `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup |
+| `Enter` | Work: open the full-screen read-only terminal; with `QUESTION.md` opens the options popup (its last two rows hand the question to an upper agent) |
 | `e` | Work: expand / collapse recent completions |
 | `h` / `d` | Hide / move to completed history (ended tasks without attention only) |
 | `x` | Work: clear the selected needs-attention item; question files stay unchanged |
@@ -146,7 +146,8 @@ Start the full-screen dashboard in an interactive terminal:
 另指定檔案。格式為 version 1，`tasks` 以既有的 `name::log::result` 為 key，保存
 hidden、done_manual、read、pinned、tags、updated_at；`projects` 保存 collapsed／collapsed_at。
 額外的 `restored`、`dismissed`、`dismissed_at`、`dismissed_sig` 與 `run_start` 用於撈回主頁、
-清除需處理項目與辨認重跑。清除簽章會隨狀態、問題 id 或完成時間改變而失效。寫入先建立同目錄暫存檔、flush／fsync，
+清除需處理項目與辨認重跑；`escalate_qid`、`escalate_to`、`escalated_at` 記住問題轉給哪個
+上層 agent（見下面「需處理顏色與轉介」）。清除簽章會隨狀態、問題 id 或完成時間改變而失效。寫入先建立同目錄暫存檔、flush／fsync，
 再 atomic rename；寫入失敗時保留原檔與記憶體狀態。不存在或格式損壞時使用空狀態，
 畫面只保留一則提示，不會反覆跳通知。第一次成功操作才建立／替換 state 檔。
 本版不處理多個看板同時寫入的鎖定，最後寫入者覆蓋較早的狀態。
@@ -173,6 +174,44 @@ Esc 先清除搜尋，再按一次 Esc 回工作頁）。
 任務隔一次輪詢就離開需處理區。看板不會叫醒或重啟 agent，也不會替人選答案。
 若舊的 `QUESTION.md` 比已完成的報告還舊，視為上一輪留下的檔案，不會讓完成的任務
 卡在需處理。
+
+#### 需處理顏色與轉介（v10 問答延伸）
+
+需處理區最上面一行是顏色圖例，四種顏色分別是：
+
+| 顏色 | 意思 |
+| --- | --- |
+| 青色 `#2ac3de` | 等博元回答：有未回答的 `QUESTION.md`，還沒超過 30 分鐘 |
+| 紅色 `#f7768e` | 逾時未答（超過 30 分鐘），以及卡住／失敗／無報告等其他需處理項目 |
+| 紫色 `#bb9af7` | 已轉介、等上層 agent 回答 |
+
+逾期未答沿用原本規則：`已等` 字樣轉紅、桌面通知＋聲音只跳一次；待回答本身是青色，
+跟其他需處理的紅字分開，一眼看得出哪幾筆在等博元。
+
+回答彈窗最下面兩列是「↗ 轉給上層 agent：coach（預設）」和
+「↗ 轉給上層 agent：claude-code」。選它不會回答原本的 A／B／C，而是在同一個資料夾寫：
+
+```markdown
+# ANSWER
+id: q1
+answered_at: 2026-10-27T00:35:00+08:00
+choice: ESCALATE
+escalate_to: coach
+note: （備註照留，可空）
+```
+
+`choice` 用保留值 `ESCALATE`，不會跟問題自己的選項代號撞號；`escalate_to` 只接受
+`coach` 或 `claude-code`，留空預設 `coach`，其他值直接拒絕、不寫檔。寫入後該列變成
+「已轉介」、紫色，內容顯示「已轉介給 coach，等上層回答：…」，不再算博元待答、
+不再顯示「已等 Xm」、也不會再發 30 分鐘通知。
+
+看板會把這次轉介記在 state 的任務項目（`escalate_qid`、`escalate_to`、`escalated_at`）。
+上層 agent 之後把同一個 `id` 的 `ANSWER.md` 覆寫成一般 choice（A／B／C…）時，
+該列改顯示「由 coach 回答 · …」；上層若自己在 ANSWER.md 留了 `escalate_to:`，看板也認得。
+同一個任務重跑時，舊的轉介記錄會一併清掉。
+
+`x` 清除、`X` 清除過期／被取代、通知只跳一次、格式錯誤只顯示原文、Esc 取消與備註流程
+都跟原本一樣，沒有改動 SPEC §3.3 的檔案格式。
 
 ### 架構樹頁（decisions 決策節點）
 
