@@ -153,6 +153,18 @@ QUOTA_BURN_AHEAD_PERCENT = 15
 QUOTA_CRITICAL_PERCENT = 85
 # SPEC §3.3: a question left unanswered for 30 minutes turns red and notifies.
 QUESTION_OVERDUE_SECONDS = 30 * 60
+def _stale_attention_seconds_from_env() -> int:
+    try:
+        hours = float(os.environ.get("AGENT_WATCH_STALE_HOURS", "24"))
+    except (TypeError, ValueError):
+        return 24 * 60 * 60
+    seconds = hours * 60 * 60
+    if not math.isfinite(seconds) or seconds <= 0:
+        return 24 * 60 * 60
+    return max(1, int(seconds))
+
+STALE_ATTENTION_SECONDS = _stale_attention_seconds_from_env()
+STATE_TASK_RETENTION_SECONDS = 30 * 24 * 60 * 60
 QUESTION_FILENAME = "QUESTION.md"
 ANSWER_FILENAME = "ANSWER.md"
 TERMINAL_TAIL_LINES = 400
@@ -886,6 +898,9 @@ class AgentInfo:
     start_source: str = ""
     elapsed_estimated: bool = False
     question: Optional[Dict[str, Any]] = None
+    note: str = ""
+    superseded_hint: str = ""
+    process_alive: Optional[bool] = None
 
 
 # Sentinel so an injected reader and the built-in `ps` reader stay distinct:
@@ -1270,19 +1285,34 @@ def last_status_from_content(content: str) -> Optional[str]:
     return None
 
 
-def is_pid_alive(pid: int) -> Optional[bool]:
-    """None means inspection failed, not that the process has ended."""
-    if pid <= 0:
-        return None
+_PID_CACHE_UNSET = object()
+
+
+def running_pid_set() -> Optional[Set[int]]:
+    """Read the process inventory once; None means inspection failed."""
     try:
         result = subprocess.run(
             ["pgrep", "-l", "."], capture_output=True, text=True, timeout=3, check=False,
         )
-        if result.returncode not in (0, 1):
-            return None
-        return any(line.split(maxsplit=1)[0] == str(pid) for line in result.stdout.splitlines() if line.strip())
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode not in (0, 1):
+        return None
+    pids = set()
+    for line in result.stdout.splitlines():
+        try:
+            pids.add(int(line.split(maxsplit=1)[0]))
+        except (IndexError, ValueError):
+            continue
+    return pids
+
+
+def is_pid_alive(pid: int) -> Optional[bool]:
+    """None means inspection failed, not that the process has ended."""
+    if pid <= 0:
+        return None
+    pids = running_pid_set()
+    return None if pids is None else pid in pids
 
 
 def parse_process_lstart(text: str) -> Optional[float]:
@@ -1422,6 +1452,8 @@ def build_agent(
     model: Optional[str] = None,
     project: Optional[str] = None,
     started_at: Optional[float] = None,
+    note: str = "",
+    pid_alive_override: Any = _PID_CACHE_UNSET,
 ) -> AgentInfo:
     log_path = Path(log_str).expanduser()
     if not log_path.is_absolute():
@@ -1440,7 +1472,12 @@ def build_agent(
     if not is_null_log and not log_path.exists():
         data_err = f"log 檔案不存在：{log_path}"
     last_status = last_status_from_content(last_content) if last_valid else None
-    pid_alive = is_pid_alive(pid) if pid is not None else None
+    if pid is None:
+        pid_alive = None
+    elif pid_alive_override is _PID_CACHE_UNSET:
+        pid_alive = is_pid_alive(pid)
+    else:
+        pid_alive = pid_alive_override
     resolved_harness, resolved_model = resolve_run_identity(
         log_path,
         pid,
@@ -1571,7 +1608,18 @@ def build_agent(
         start_source=start_source,
         elapsed_estimated=estimated,
         question=question,
+        note=note,
+        superseded_hint=parse_superseded_hint(note),
+        process_alive=pid_alive,
     )
+
+
+def parse_superseded_hint(note: str) -> str:
+    """Extract the named replacement from a SUPERSEDED note."""
+    if not note.startswith("SUPERSEDED("):
+        return ""
+    match = re.match(r"SUPERSEDED\(by\s+(.+?)(?:;|\))", note)
+    return match.group(1).strip() if match else ""
 
 
 def load_tsv_agents(
@@ -1579,6 +1627,7 @@ def load_tsv_agents(
     is_done_file: bool,
     log_parser: LogParser,
     now: float,
+    process_pids: Any = _PID_CACHE_UNSET,
 ) -> Tuple[List[AgentInfo], List[str]]:
     agents = []
     errors = []
@@ -1596,8 +1645,8 @@ def load_tsv_agents(
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split("\t")
-        if not 3 <= len(parts) <= 8:
-            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 8 欄）")
+        if not 3 <= len(parts) <= 9:
+            errors.append(f"{tsv_path.name} 第 {line_num} 行格式錯誤（需 3 至 9 欄）")
             continue
         name, log_p, last_p = parts[0].strip(), parts[1].strip(), parts[2].strip()
         if not name or not log_p or not last_p:
@@ -1618,6 +1667,7 @@ def load_tsv_agents(
         harness = parts[4].strip() or None if len(parts) >= 5 else None
         model = parts[5].strip() or None if len(parts) >= 6 else None
         project = parts[6].strip() or None if len(parts) >= 7 else None
+        note = parts[8].strip() if len(parts) >= 9 else ""
         started_at = None
         if len(parts) >= 8 and parts[7].strip():
             raw_start = parts[7].strip()
@@ -1629,6 +1679,11 @@ def load_tsv_agents(
             except (ValueError, OverflowError, OSError):
                 errors.append(f"{tsv_path.name} 第 {line_num} 行 started_at 格式錯誤（需 ISO 8601 含時區）")
 
+        pid_alive_override = _PID_CACHE_UNSET
+        if is_done_file:
+            pid_alive_override = False
+        elif pid is not None and process_pids is not _PID_CACHE_UNSET:
+            pid_alive_override = None if process_pids is None else pid in process_pids
         agents.append(
             build_agent(
                 name,
@@ -1644,6 +1699,8 @@ def load_tsv_agents(
                 model=model,
                 project=project,
                 started_at=started_at,
+                note=note,
+                pid_alive_override=pid_alive_override,
             )
         )
 
@@ -1662,8 +1719,13 @@ def load_all_agents(
     if now is None:
         now = time.time()
 
-    running_agents, err1 = load_tsv_agents(runs_path, False, log_parser, now)
-    done_agents, err2 = load_tsv_agents(done_path, True, log_parser, now)
+    process_pids = running_pid_set()
+    running_agents, err1 = load_tsv_agents(
+        runs_path, False, log_parser, now, process_pids=process_pids,
+    )
+    done_agents, err2 = load_tsv_agents(
+        done_path, True, log_parser, now, process_pids=process_pids,
+    )
 
     active_keys = {a.key for a in running_agents}
     archived_only = [a for a in done_agents if a.key not in active_keys]
@@ -2819,6 +2881,77 @@ def render_history_summary(agents: List[AgentInfo], now: float) -> str:
     return f"歷史 {len(history)} 筆" + (f"（{counts}）" if counts else "")
 
 
+ATTENTION_FAILURE_STATUSES = frozenset({
+    "waiting", "blocked", "failed", "no_report", "unconfirmed", "error",
+})
+SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
+SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+SUPERSEDED_SUFFIX_RE = re.compile(r"(?:-retry|-claude|-rerun|-redo|-fix|-v\d+|-?\d+)$", re.IGNORECASE)
+
+
+def _normalized_task_name(name: str) -> str:
+    return SUPERSEDED_SUFFIX_RE.sub("", name.casefold())
+
+
+def _replacement_time(agent: AgentInfo) -> float:
+    if agent.completion_time is not None:
+        return agent.completion_time
+    return agent.start_time or agent.log_mtime or 0.0
+
+
+def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
+    """Map an actionable old task key to a successful or running replacement key."""
+    result: Dict[str, str] = {}
+    replaceable = [
+        agent for agent in agents
+        if agent.status in ATTENTION_FAILURE_STATUSES or agent.status == "question"
+    ]
+    replacements = [
+        agent for agent in agents
+        if agent.status in SUPERSEDED_REPLACEMENT_STATUSES
+    ]
+
+    for old in replaceable:
+        target = None
+        hint = old.superseded_hint.casefold()
+        if hint:
+            matches = [
+                agent for agent in replacements
+                if agent.key != old.key and agent.name.casefold() == hint
+            ]
+            if matches:
+                target = max(matches, key=_replacement_time)
+
+        if target is None:
+            matches = [
+                agent for agent in replacements
+                if agent.key != old.key
+                and agent.name.casefold() == old.name.casefold()
+                and agent.start_time is not None
+                and (old.start_time is None or agent.start_time > old.start_time)
+            ]
+            if matches:
+                target = max(matches, key=lambda agent: agent.start_time or 0.0)
+
+        if target is None and old.completion_time is not None:
+            old_family = _normalized_task_name(old.name)
+            matches = [
+                agent for agent in agents
+                if agent.key != old.key
+                and agent.status in SUPERSEDED_SUCCESS_STATUSES
+                and agent.completion_time is not None
+                and agent.completion_time > old.completion_time
+                and _normalized_task_name(agent.name) == old_family
+                and agent.name.casefold() != old.name.casefold()
+            ]
+            if matches:
+                target = max(matches, key=lambda agent: agent.completion_time or 0.0)
+
+        if target is not None:
+            result[old.key] = target.key
+    return result
+
+
 BOARD_COLORS = {
     "running": "#e0af68",
     "recent": "#9ece6a",
@@ -2835,15 +2968,14 @@ WIDE_BOARD_COLUMNS = 120
 
 
 def board_bucket(agent: AgentInfo, now: float) -> str:
-    # Issues remain actionable even after the recent-completion window ends.
-    # Stage 5 may supply question tasks without adding file I/O to the UI.
-    if agent.status in {"question", "waiting", "blocked", "failed", "no_report", "unconfirmed", "error"}:
+    # Keep this stateless helper for callers and legacy tests.
+    if agent.status in {"question", *ATTENTION_FAILURE_STATUSES}:
         return "attention"
     return task_bucket(agent, now)
 
 
 class WatchState:
-    """Dashboard-owned state. Registry files are never modified."""
+    """Dashboard-owned state. Registry and question files are never modified."""
 
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path) if path is not None else _env_path(
@@ -2853,6 +2985,7 @@ class WatchState:
         self.warning = ""
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
+        self._superseded: Dict[str, str] = {}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self._validate(data)
@@ -2872,7 +3005,7 @@ class WatchState:
             for entry in data[section].values():
                 if not isinstance(entry, dict):
                     raise ValueError("invalid entry")
-                for name in ("hidden", "done_manual", "read", "pinned", "restored", "collapsed"):
+                for name in ("hidden", "done_manual", "read", "pinned", "restored", "collapsed", "dismissed"):
                     if name in entry and type(entry[name]) is not bool:
                         raise ValueError("invalid flag")
                 if "tags" in entry and (
@@ -2918,16 +3051,120 @@ class WatchState:
     def stamp() -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
 
+    @staticmethod
+    def dismissed_signature(agent: AgentInfo) -> str:
+        question_id = (agent.question or {}).get("id") or ""
+        completion = agent.completion_time or ""
+        return f"{agent.status}|{question_id}|{completion}"
+
+    def _dismissed(self, agent: AgentInfo) -> bool:
+        entry = self.task(agent.key)
+        return bool(
+            entry.get("dismissed")
+            and entry.get("dismissed_sig") == self.dismissed_signature(agent)
+        )
+
+    def _question_is_stale(self, agent: AgentInfo, now: float) -> bool:
+        question = agent.question
+        if not question_is_active(question, agent.completion_time):
+            return False
+        if agent.process_alive is True:
+            return False
+        asked = question.get("asked_at_ts") or question.get("mtime") or 0
+        return bool(asked and now - asked > STALE_ATTENTION_SECONDS)
+
+    def stale_info(self, agent: AgentInfo, now: float) -> str:
+        """Return the history label for a dismissed, expired, or replaced task."""
+        if agent.status == "running":
+            return ""
+        if self._dismissed(agent):
+            return "已清除"
+        if agent.key in self._superseded:
+            return "已被取代"
+        if self._question_is_stale(agent, now):
+            return "已過期"
+        if agent.status in ATTENTION_FAILURE_STATUSES:
+            timestamp = agent.completion_time or agent.log_mtime
+            if timestamp and now - timestamp > STALE_ATTENTION_SECONDS:
+                return "已過期"
+        return ""
+
     def update_task(self, key: str, **values: Any) -> bool:
         data = copy.deepcopy(self.data)
         entry = data["tasks"].setdefault(key, {})
         entry.update(values, updated_at=self.stamp())
         return self.save(data)
 
-    def reconcile(self, agents: List[AgentInfo], now: float) -> None:
-        """A rerun keeps user tags/pins but drops the previous run's disposition."""
+    def _prune_old_tasks(
+        self, data: Dict[str, Any], current_keys: Set[str], now: float,
+    ) -> Tuple[bool, str]:
+        expired = []
+        for key, entry in data["tasks"].items():
+            if key in current_keys:
+                continue
+            updated_at = entry.get("updated_at")
+            if not isinstance(updated_at, str):
+                continue
+            try:
+                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    continue
+                updated_ts = updated.timestamp()
+            except (ValueError, OverflowError, OSError):
+                continue
+            if now - updated_ts > STATE_TASK_RETENTION_SECONDS:
+                expired.append(key)
+        if not expired:
+            return False, ""
+
+        try:
+            source_mode = stat.S_IMODE(self.path.stat().st_mode)
+            original = self.path.read_bytes()
+            on_disk = json.loads(original)
+            self._validate(on_disk)
+        except (OSError, ValueError, TypeError, UnicodeError) as exc:
+            return False, "state 清理略過，原檔不可讀：" + str(exc)
+        if on_disk != self.data:
+            return False, "state 清理略過：檔案在本次載入後已變更"
+
+        backup_path = self.path.with_name(
+            self.path.name + ".bak-" + datetime.fromtimestamp(now).astimezone().strftime("%Y%m%d")
+        )
+        fd = -1
+        try:
+            fd = os.open(
+                str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode,
+            )
+            os.fchmod(fd, source_mode)
+            with os.fdopen(fd, "wb") as backup:
+                fd = -1
+                backup.write(original)
+                backup.flush()
+                os.fsync(backup.fileno())
+        except FileExistsError:
+            return False, "state 清理略過：當日備份已存在"
+        except OSError as exc:
+            return False, "state 清理略過，無法建立備份：" + str(exc)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+        for key in expired:
+            data["tasks"].pop(key, None)
+        return True, ""
+
+    def reconcile(
+        self, agents: List[AgentInfo], now: float, *, registry_complete: bool = False,
+    ) -> None:
+        """Reconcile run state after a complete registry snapshot."""
+        self._superseded = compute_superseded(agents)
         data = copy.deepcopy(self.data)
         changed = False
+        cleanup_warning = ""
+        if registry_complete:
+            changed, cleanup_warning = self._prune_old_tasks(
+                data, {agent.key for agent in agents}, now,
+            )
         observed = dict(self._observed)
         for agent in agents:
             previous = self._observed.get(agent.key)
@@ -2936,7 +3173,9 @@ class WatchState:
             if entry is not None:
                 rerun = (
                     agent.status == "running"
-                    and any(entry.get(flag) for flag in ("hidden", "done_manual", "restored", "read"))
+                    and any(entry.get(flag) for flag in (
+                        "hidden", "done_manual", "restored", "read", "dismissed",
+                    ))
                 ) or (
                     previous is not None and (
                         (previous[0] == "running" and agent.status != "running")
@@ -2948,16 +3187,31 @@ class WatchState:
                 )
                 if rerun:
                     entry.update(hidden=False, done_manual=False, restored=False, read=False,
-                                 run_start=agent.start_time, updated_at=self.stamp())
+                                 dismissed=False, run_start=agent.start_time, updated_at=self.stamp())
                     changed = True
             project = data["projects"].get(agent.project, {})
-            if project.get("collapsed") and board_bucket(agent, now) in ("running", "attention"):
+            if project.get("collapsed") and self.bucket(agent, now) in ("running", "attention"):
                 project.update(collapsed=False, collapsed_at=self.stamp())
                 changed = True
-        if not changed or self.save(data):
+        saved = not changed or self.save(data)
+        if saved:
             self._observed = observed
+            if cleanup_warning:
+                self.warning = cleanup_warning
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
+        if agent.status == "running":
+            return "running"
+        active_question = question_is_active(agent.question, agent.completion_time)
+        if (
+            active_question and not self._dismissed(agent)
+            and agent.key not in self._superseded
+            and not self._question_is_stale(agent, now)
+        ):
+            return "attention"
+        disposition = self.stale_info(agent, now)
+        if disposition:
+            return "history"
         bucket = board_bucket(agent, now)
         if bucket in ("attention", "running"):
             return bucket
@@ -2971,10 +3225,30 @@ class WatchState:
     def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
               tags: Optional[List[str]] = None) -> Tuple[bool, str]:
         entry = self.task(agent.key)
-        if operation in ("hide", "done") and board_bucket(agent, now) in ("running", "attention"):
+        bucket = self.bucket(agent, now)
+        disposition = self.stale_info(agent, now)
+        if operation == "dismiss":
+            if agent.status == "running" or bucket == "running":
+                return False, "進行中的任務不能清除"
+            if bucket != "attention" and disposition not in ("已過期", "已被取代"):
+                return False, "目前項目不在需處理區，也不是已過期或被取代項目"
+            if disposition == "已清除":
+                return False, "此項目已清除"
+            ok = self.update_task(
+                agent.key,
+                dismissed=True,
+                dismissed_at=self.stamp(),
+                dismissed_sig=self.dismissed_signature(agent),
+                run_start=agent.start_time,
+            )
+            if ok and agent.question:
+                return True, "已清除；不會刪除或修改 QUESTION.md／ANSWER.md"
+            return ok, "已清除" if ok else self.warning
+
+        if operation in ("hide", "done") and bucket in ("running", "attention"):
             return False, "進行中或需處理的任務不能隱藏／歸到已完成"
         if operation == "collapse":
-            if any(a.project == agent.project and board_bucket(a, now) in ("running", "attention") for a in agents):
+            if any(a.project == agent.project and self.bucket(a, now) in ("running", "attention") for a in agents):
                 return False, "專案仍有進行中或需處理的任務，不能收起"
             data = copy.deepcopy(self.data)
             data["projects"][agent.project] = dict(collapsed=True, collapsed_at=self.stamp())
@@ -2986,14 +3260,15 @@ class WatchState:
             changes: Dict[str, Any] = {
                 "hide": dict(hidden=True, restored=False),
                 "done": dict(done_manual=True, restored=False),
-                "restore": dict(hidden=False, done_manual=False, restored=True),
+                "restore": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
+                "undismiss": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
                 "read": dict(read=not entry.get("read", False)),
                 "pin": dict(pinned=not entry.get("pinned", False)),
                 "tags": dict(tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip()))),
             }.get(operation, {})
             if not changes:
                 return False, "未知操作"
-            if operation == "restore":
+            if operation in ("restore", "undismiss"):
                 data = copy.deepcopy(self.data)
                 data["tasks"].setdefault(agent.key, {}).update(
                     changes, updated_at=self.stamp(), run_start=agent.start_time,
@@ -3004,6 +3279,15 @@ class WatchState:
                 ok = self.update_task(agent.key, run_start=agent.start_time, **changes)
         return ok, "已儲存" if ok else self.warning
 
+    def dismiss_stale(self, agents: List[AgentInfo], now: float) -> int:
+        """Clear only expired or superseded tasks after the caller confirms."""
+        count = 0
+        for agent in agents:
+            if self.stale_info(agent, now) not in ("已過期", "已被取代"):
+                continue
+            ok, _ = self.apply("dismiss", agent, agents, now)
+            count += int(ok)
+        return count
 
 def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
                   query: str = "", project: str = "", tag: str = "",
@@ -3029,15 +3313,16 @@ def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
     return sorted(result, key=lambda a: (-(done_timestamp(a) or 0), a.key))
 
 
-def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False) -> Text:
+def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False,
+                    bucket: Optional[str] = None, history_label: str = "") -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
-    bucket = board_bucket(agent, now)
+    bucket = bucket or board_bucket(agent, now)
     color = BOARD_COLORS[bucket]
     marker = "› " if selected else "  "
     status = BOARD_STATUS_LABELS.get(agent.status, "待確認")
-    if bucket == "history":
-        status = "已完成"
+    if bucket in ("history", "hidden"):
+        status = history_label or "已完成"
     if bucket in ("recent", "history"):
         line = "{}{} {} │ {} │ {}".format(
             marker, format_completion_time(agent.completion_time),
@@ -3643,6 +3928,21 @@ QuestionScreen {
     height: 1;
     color: #737b91;
 }
+DismissConfirmScreen {
+    align: center middle;
+    background: #101216;
+}
+#dismiss-confirm-panel {
+    width: 72;
+    max-width: 100%;
+    height: auto;
+    border: solid #e0af68;
+    background: #101216;
+    padding: 0 1;
+}
+#dismiss-confirm-text {
+    height: auto;
+}
 """
 
 
@@ -3670,6 +3970,7 @@ class RunDataService:
         self.parser = parser
         self._lock = threading.Lock()
         self._fetching = False
+        self._has_snapshot = False
         self._snapshot: Tuple[List[AgentInfo], List[str]] = ([], [])
         self.on_ready: Optional[Callable[[], None]] = None
 
@@ -3677,6 +3978,11 @@ class RunDataService:
         with self._lock:
             agents, errors = self._snapshot
             return [copy.copy(agent) for agent in agents], list(errors)
+
+    @property
+    def has_snapshot(self) -> bool:
+        with self._lock:
+            return self._has_snapshot
 
     def refresh_in_background(self) -> bool:
         with self._lock:
@@ -3691,6 +3997,7 @@ class RunDataService:
                 result = ([], [f"讀取工作資料失敗：{exc}"])
             with self._lock:
                 self._snapshot = result
+                self._has_snapshot = True
                 self._fetching = False
             if self.on_ready is not None:
                 self.on_ready()
@@ -3728,11 +4035,15 @@ class TaskRow(Static, can_focus=True):
     def render(self) -> Text:
         agent = copy.copy(self.agent)
         entry = self.app.state.task(agent.key)
-        if board_bucket(agent, self.now) not in ("running", "attention") and not entry.get("read"):
+        bucket = self.app.state.bucket(agent, self.now)
+        if bucket not in ("running", "attention") and not entry.get("read"):
             agent.name = "● " + agent.name
         if entry.get("tags"):
             agent.name += " [" + ", ".join(entry["tags"]) + "]"
-        return render_task_row(agent, self.content_size.width, self.now, self.selected)
+        return render_task_row(
+            agent, self.content_size.width, self.now, self.selected, bucket,
+            self.app.state.stale_info(agent, self.now),
+        )
 
     def on_focus(self) -> None:
         self.post_message(self.Selected(self.agent.key))
@@ -3753,8 +4064,9 @@ HELP_BLOCKED_ACTIONS = frozenset({
     "show_architecture_now",    # n
     "show_architecture_future",  # f
     "hide_task", "finish_task", "collapse_project", "toggle_pin", "toggle_read",
-    "edit_tags", "restore_task", "toggle_history_mode", "toggle_history_group",
-    "search_history", "next_task", "previous_task", "open_task",
+    "edit_tags", "restore_task", "dismiss_task", "dismiss_stale",
+    "toggle_history_mode", "toggle_history_group", "search_history",
+    "next_task", "previous_task", "open_task",
 })
 
 
@@ -3801,6 +4113,8 @@ class HelpScreen(ModalScreen):
                 "               有 QUESTION.md 時開選項彈窗\n"
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
+                "  x            清除所選需處理項目；不會刪除問題檔\n"
+                "  X            確認後清除已過期／已被取代項目\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
                 "  i            釘選／取消釘選（最多 5 個）\n"
                 "  t            編輯自訂標籤（逗號分隔）\n"
@@ -3811,7 +4125,7 @@ class HelpScreen(ModalScreen):
                 "  g            切換表格／依專案分組\n"
                 "  Space / Enter  收合／展開選中的專案組\n"
                 "  j / k / ↑ / ↓  選取列\n"
-                "  r            撈回主頁（取消隱藏與手動完成）\n"
+                "  r            撈回主頁（含已清除任務）\n"
                 "  i / t / u    釘選／標籤／已讀切換\n\n"
                 "[bold]架構頁[/]\n"
                 "  p            切換專案\n"
@@ -4020,6 +4334,27 @@ def render_terminal_text(lines: List[str], query: str = "") -> Text:
     return text
 
 
+class DismissConfirmScreen(ModalScreen):
+    BINDINGS = [("enter", "confirm", "確認"), ("escape", "cancel", "取消")]
+
+    def __init__(self, count: int):
+        super().__init__()
+        self.count = count
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dismiss-confirm-panel"):
+            yield Static(
+                f"清除 {self.count} 筆已過期／已被取代任務？\nEnter 確認；Esc 取消。",
+                id="dismiss-confirm-text", markup=False,
+            )
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class AgentWatchApp(App):
     """Textual terminal dashboard for monitoring agents with tabs and flicker-free updates."""
 
@@ -4042,6 +4377,8 @@ class AgentWatchApp(App):
         ("f", "show_architecture_future", "未來 (F)"),
         ("h", "hide_task", "隱藏"),
         ("d", "finish_task", "歸到已完成"),
+        ("x", "dismiss_task", "清除需處理項目"),
+        ("shift+x", "dismiss_stale", "清除過期／取代項目"),
         ("c", "collapse_project", "收起專案"),
         ("i", "toggle_pin", "釘選"),
         ("t", "edit_tags", "標籤"),
@@ -4249,7 +4586,7 @@ class AgentWatchApp(App):
                     f"  … 另 {extra} 筆  [e] 展開", markup=False, classes="more-recent",
                 ))
             section = Vertical(*children, classes="project-section")
-            running_count = sum(board_bucket(a, now) == "running" for a in tasks)
+            running_count = sum(self.state.bucket(a, now) == "running" for a in tasks)
             section.border_title = (
                 f"{project_label(project)} · 進行中 {running_count} · 剛完成 {recent_count}"
             )
@@ -4323,7 +4660,7 @@ class AgentWatchApp(App):
         content.update("\n".join(lines[-limit:]) if lines else followed.latest or "尚無即時日誌")
         if (
             self.query_one("#main-tabs", TabbedContent).active == "tab-work"
-            and board_bucket(followed, self._now) not in ("running", "attention")
+            and self.state.bucket(followed, self._now) not in ("running", "attention")
             and self._preview_read_key != followed.key
             and not self.state.task(followed.key).get("read")
         ):
@@ -4377,6 +4714,31 @@ class AgentWatchApp(App):
     def action_finish_task(self) -> None:
         self.operate("done")
 
+    def action_dismiss_task(self) -> None:
+        self.operate("dismiss")
+
+    def action_dismiss_stale(self) -> None:
+        if self.query_one("#main-tabs", TabbedContent).active != "tab-work":
+            return
+        candidates = [
+            agent for agent in self.current_agents
+            if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
+        ]
+        if not candidates:
+            self.show_state_message("目前沒有已過期或已被取代的項目")
+            return
+
+        def confirmed(accepted: Optional[bool]) -> None:
+            if not accepted:
+                self.show_state_message("已取消清除")
+                return
+            count = self.state.dismiss_stale(self.current_agents, self._now)
+            self.show_state_message(f"已清除 {count} 筆已過期／已被取代任務")
+            self.last_snapshot = None
+            self.update_data()
+
+        self.push_screen(DismissConfirmScreen(len(candidates)), confirmed)
+
     def action_collapse_project(self) -> None:
         self.operate("collapse")
 
@@ -4423,6 +4785,7 @@ class AgentWatchApp(App):
             self.history_grouped, tuple(sorted(self.history_collapsed)), self.size.width,
             self.history_query, tuple(self.history_filters.items()),
             tuple((a.key, a.completion_time, a.latest, a.status, a.project,
+                   self.state.stale_info(a, self._now),
                    json.dumps(self.state.task(a.key), sort_keys=True)) for a in tasks),
         )
         if snapshot == self._history_snapshot:
@@ -4440,7 +4803,9 @@ class AgentWatchApp(App):
             entry = self.state.task(agent.key)
             timestamp = done_timestamp(agent)
             stamp = datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M") if timestamp else "時間未知"
-            status = "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
+            status = self.state.stale_info(agent, self._now) or (
+                "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
+            )
             disposition = "隱藏 · " if entry.get("hidden") else ""
             cells = (stamp, project_label(agent.project), ", ".join(entry.get("tags", [])),
                      agent.name, disposition + status + " · " + agent.latest,
@@ -4735,7 +5100,7 @@ class AgentWatchApp(App):
                 a.stage,
                 a.project,
                 a.start_time,
-                board_bucket(a, current),
+                self.state.bucket(a, current),
             )
             for a in agents
         )
@@ -4767,8 +5132,10 @@ class AgentWatchApp(App):
                 time.strftime("%H:%M:%S", time.localtime(now))
             )
 
+        registry_complete = False
         try:
             if self._ui_ready:
+                registry_complete = self.data_svc.has_snapshot
                 agents, errors = self.data_svc.snapshot()
                 for agent in agents:
                     if agent.completion_time is None:
@@ -4777,15 +5144,17 @@ class AgentWatchApp(App):
                             agent.elapsed = "~" + agent.elapsed
             else:
                 agents, errors = load_all_agents(self.runs_path, self.done_path, self.log_parser, now)
+                registry_complete = True
         except Exception as e:
             agents, errors = [], [f"讀取工作資料失敗：{e}"]
+            registry_complete = False
         quota_summary, quota_raw, quota_stale, quota_error = self.quota_svc.snapshot()
         if quota_stale and not quota_raw:
             quota_summary = "額度：讀取失敗"
         error_snapshot = tuple(errors) + ((quota_error,) if quota_stale and quota_error else ())
         if self.ui_error:
             error_snapshot += (self.ui_error,)
-        self.state.reconcile(agents, now)
+        self.state.reconcile(agents, now, registry_complete=registry_complete and not errors)
         if self.state.warning and self.state.warning != self.state_message:
             self.show_state_message(self.state.warning)
 
@@ -4810,7 +5179,7 @@ class AgentWatchApp(App):
 
         overdue_questions: Dict[str, AgentInfo] = {}
         for a in agents:
-            if a.status != "question" or not a.question:
+            if a.status != "question" or not a.question or self.state.bucket(a, now) != "attention":
                 continue
             if question_wait_seconds(a.question, now) < QUESTION_OVERDUE_SECONDS:
                 continue
@@ -4824,7 +5193,7 @@ class AgentWatchApp(App):
                     self.notified_questions.add(token)
 
         self.previous_status = {a.key: a.status for a in agents}
-        active = [a for a in agents if board_bucket(a, now) in ("attention", "running")]
+        active = [a for a in agents if self.state.bucket(a, now) in ("attention", "running")]
         self.current_agents = agents
         self.current_active_agents = active
         timer_snapshot = tuple((a.key, a.elapsed) for a in active)
