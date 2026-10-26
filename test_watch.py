@@ -2390,6 +2390,116 @@ class TestQuestionFiles(unittest.TestCase):
         self.assertNotEqual(agents[0].status, "question")
         self.assertTrue(agents[0].question["answered"])
 
+    def test_escalation_writes_reserved_choice_and_target(self):
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        question = watch.read_task_question(self.root)
+        self.assertFalse(question["escalated"])
+
+        ok, _ = watch.write_answer_file(
+            self.root, question, "ESCALATE", "交給教練", now=1792922400,
+        )
+        self.assertTrue(ok)
+        content = (self.root / "ANSWER.md").read_text()
+        self.assertEqual(
+            content.splitlines()[:5],
+            ["# ANSWER", "id: q1", "answered_at: 2026-10-25T18:00:00+08:00",
+             "choice: ESCALATE", "escalate_to: coach"],
+        )
+        self.assertIn("note: 交給教練", content)
+
+        question = watch.read_task_question(self.root)
+        self.assertTrue(question["answered"])
+        self.assertTrue(question["escalated"])
+        self.assertEqual(question["escalate_to"], "coach")
+        self.assertFalse(watch.question_is_active(question), "an escalation is not Bo-Yuan's queue")
+        self.assertTrue(watch.question_escalated(question))
+
+        ok, _ = watch.write_answer_file(
+            self.root, question, "ESCALATE", "", now=1792922400, escalate_to="claude-code",
+        )
+        self.assertTrue(ok)
+        self.assertIn("escalate_to: claude-code", (self.root / "ANSWER.md").read_text())
+
+        before = (self.root / "ANSWER.md").read_text()
+        ok, message = watch.write_answer_file(
+            self.root, question, "ESCALATE", "", escalate_to="bob",
+        )
+        self.assertFalse(ok)
+        self.assertIn("轉介對象", message)
+        self.assertEqual((self.root / "ANSWER.md").read_text(), before)
+
+    def test_tsv_escalated_status_leaves_the_question_queue(self):
+        now = parse_timestamp("2026-10-25T10:10:00Z")
+        log = self.root / "run.log"
+        write_log(log, now - 600, "等回答中")
+        (self.root / "QUESTION.md").write_text(self.QUESTION)
+        set_mtime(self.root / "QUESTION.md", now - 120)
+        runs, done = self.root / "runs.tsv", self.root / "done.tsv"
+        runs.write_text("ask-task\t%s\t%s\t\tClaude\tmodel-q\taw\n" % (log, self.root / "REPORT.md"))
+        done.write_text("")
+        agents, _ = load_all_agents(runs, done, LogParser(process_start_reader=None), now)
+        self.assertEqual(agents[0].status, "question")
+        self.assertTrue(watch.write_answer_file(
+            self.root, agents[0].question, "ESCALATE", now=now, escalate_to="coach",
+        )[0])
+
+        agents, _ = load_all_agents(runs, done, LogParser(process_start_reader=None), now + 60)
+        self.assertEqual(agents[0].status, "escalated")
+        self.assertFalse(watch.question_is_active(agents[0].question))
+        self.assertTrue(watch.question_escalated(agents[0].question))
+        self.assertEqual(watch.task_bucket(agents[0], now + 60), "attention")
+
+        # The upper agent answers with a real choice: the run leaves the queue.
+        (self.root / "ANSWER.md").write_text(
+            "# ANSWER\nid: q1\nanswered_at: 2026-10-25T10:20:00Z\n" "choice: B\nnote: 上層決定\n"
+        )
+        agents, _ = load_all_agents(runs, done, LogParser(process_start_reader=None), now + 90)
+        self.assertNotIn(agents[0].status, ("question", "escalated"))
+
+
+class TestEscalationState(IsolatedState, unittest.TestCase):
+    """The dashboard remembers a hand-off even after ANSWER.md is overwritten."""
+
+    def make_state(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-escalate-state-")
+        self.addCleanup(directory.cleanup)
+        return watch.WatchState(Path(directory.name) / "state.json")
+
+    def make_agent(self, status="escalated", question=None):
+        agent = AgentInfo(
+            "esc-task", Path("/dev/null"), Path("/dev/null"), status,
+            "fixture", None, "00:00:00", "等上層", key="esc-task::/dev/null::/dev/null",
+        )
+        agent.question = question
+        return agent
+
+    def test_state_remembers_escalation_for_attribution(self):
+        state = self.make_state()
+        question = dict(id="q1", answered=True, escalated=True, escalate_to="claude-code")
+        agent = self.make_agent(question=question)
+        self.assertTrue(state.remember_escalation(agent, question))
+        self.assertEqual(state.task(agent.key)["escalate_qid"], "q1")
+        self.assertEqual(state.task(agent.key)["escalate_to"], "claude-code")
+        self.assertEqual(state.answered_by(agent), "", "still 已轉介, not answered yet")
+
+        # The upper agent overwrote ANSWER.md with a normal choice.
+        agent.question = dict(id="q1", answered=True, escalated=False)
+        self.assertEqual(state.answered_by(agent), "claude-code")
+
+        # Reloading the state file keeps the attribution.
+        self.assertEqual(watch.WatchState(state.path).answered_by(agent), "claude-code")
+
+        # A different question id is not attributed to the old hand-off.
+        agent.question = dict(id="q2", answered=True, escalated=False)
+        self.assertEqual(state.answered_by(agent), "")
+
+    def test_answer_file_can_carry_the_upper_agent_itself(self):
+        state = self.make_state()
+        agent = self.make_agent(status="blocked", question=dict(
+            id="q1", answered=True, escalated=False, answer=dict(escalate_to="coach"),
+        ))
+        self.assertEqual(state.answered_by(agent), "coach")
+
 
 class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
     """SPEC §2.4 / §3.3: read-only terminal, question popup, ANSWER.md, 30m alert."""
@@ -2604,6 +2714,116 @@ class V10DeepViewTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
                 app.update_data(now=self.now + 30)
                 self.assertEqual(notify.call_count, 1, "one alert per question id")
             self.assertIn("已等 31m", self.screen_text(app))
+
+    def test_question_and_escalation_colors_stay_distinct(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 60)
+        pending = self.question_agent(root, log)
+        row = watch.render_task_row(pending, 100, self.now)
+        self.assertEqual(row.style, watch.QUESTION_PENDING_COLOR)
+        self.assertIn("等回答", row.plain)
+        self.assertIn("已等 1m", row.plain)
+
+        (root / "ANSWER.md").write_text(
+            "# ANSWER\nid: q1\nanswered_at: 2026-10-25T09:59:30Z\n"
+            "choice: ESCALATE\nescalate_to: claude-code\nnote: 交給上層\n"
+        )
+        escalated = self.question_agent(root, log, status="escalated",
+                                        question=watch.read_task_question(root))
+        row = watch.render_task_row(escalated, 100, self.now)
+        self.assertEqual(row.style, watch.ESCALATED_COLOR)
+        self.assertIn("已轉介", row.plain)
+        self.assertIn("已轉介給 claude-code，等上層回答", row.plain)
+        self.assertNotIn("已等", row.plain)
+
+        # Other needs-attention items keep the old red; an overdue question does too.
+        failed = AgentInfo("failed-task", Path("/dev/null"), Path("/dev/null"), "failed",
+                           "fixture", self.now - 60, "00:01:00", "失敗", key="failed")
+        self.assertEqual(watch.render_task_row(failed, 100, self.now).style, "#f7768e")
+        old_root, old_log = self.deep_dir()
+        self.write_question(old_root, self.now - 31 * 60)
+        overdue = self.question_agent(old_root, old_log)
+        self.assertEqual(watch.render_task_row(overdue, 100, self.now).style,
+                         watch.QUESTION_OVERDUE_COLOR)
+
+        answered = self.question_agent(root, log, status="blocked",
+                                       question=watch.read_task_question(root))
+        answered_text = watch.render_task_row(answered, 100, self.now, answered_by="claude-code")
+        self.assertIn("由 claude-code 回答", answered_text.plain)
+
+    async def test_question_popup_escalates_with_reserved_choice(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 60)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.QuestionScreen)
+            options = app.screen.query_one("#question-options", watch.OptionList)
+            self.assertEqual(options.option_count, 5)
+            self.assertIn("轉給上層", self.screen_text(app))
+            options.highlighted = 3  # escalate-coach
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            answer = (root / "ANSWER.md").read_text()
+            self.assertIn("id: q1", answer)
+            self.assertIn("choice: ESCALATE", answer)
+            self.assertIn("escalate_to: coach", answer)
+            self.assertIn("已轉介給 coach", app.state_message)
+            self.assertEqual(app.state.task(agent.key)["escalate_to"], "coach")
+            self.assertFalse(app.ui_error)
+
+    async def test_board_names_the_upper_agent_that_answered(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 60)
+        agent = self.question_agent(root, log)
+        app = self.fixture_app([agent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            state_path = app.state.path
+            self.assertTrue(app.state.remember_escalation(
+                agent, watch.read_task_question(root), "claude-code",
+            ))
+        (root / "ANSWER.md").write_text(
+            "# ANSWER\nid: q1\nanswered_at: 2026-10-25T09:59:30Z\nchoice: A\nnote: 上層決定\n"
+        )
+        answered = self.question_agent(root, log, status="blocked",
+                                       question=watch.read_task_question(root))
+        app = self.fixture_app([answered])
+        app.state = watch.WatchState(state_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            text = self.screen_text(app)
+            self.assertIn("由 claude-code 回答", text)
+            self.assertNotIn("已轉介給", text)
+            self.assertFalse(app.ui_error)
+
+    async def test_escalated_question_stops_notifications_and_shows_legend(self):
+        root, log = self.deep_dir()
+        self.write_question(root, self.now - 31 * 60)
+        question = watch.read_task_question(root)
+        self.assertTrue(watch.write_answer_file(
+            root, question, "ESCALATE", "交給上層", now=self.now - 31 * 60,
+        )[0])
+        escalated = self.question_agent(root, log, status="escalated",
+                                        question=watch.read_task_question(root))
+        app = self.fixture_app([escalated])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.is_first_load = False
+            app.notified_questions.clear()
+            with patch("watch.notify_question_overdue") as notify:
+                app.update_data(now=self.now)
+                app.update_data(now=self.now + 60)
+                notify.assert_not_called()
+            text = self.screen_text(app)
+            self.assertIn("已轉介", text)
+            self.assertIn("等博元回答", text, "the legend explains the colors")
+            self.assertIn("已轉介等上層", text)
+            self.assertFalse(app.ui_error)
 
     async def test_s5_fixture_snapshots_and_registry_mtimes(self):
         with tempfile.TemporaryDirectory() as tmp:
