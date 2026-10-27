@@ -254,20 +254,22 @@ If neither `magpie` nor a Codex sessions directory is available, the quota line
 shows `無資料` (no data). That is expected and not an error; every other part of
 the dashboard keeps working.
 
-### 額度頁的 Grok Bot 與 Cursor
+### 額度頁的 X Super（Grok Bot＋Cursor）
 
-額度頁除了 magpie 的服務，還讀兩個本機檔。兩個檔都只讀，不執行任何外部指令。
+X Super 訂閱把 Grok Bot 和 Cursor 算進同一個每週額度池，所以額度頁只顯示一列
+「X Super（Grok Bot＋Cursor）」。兩個來源的 `resetAt` 對得上，畫面取樣本時間較新的
+那一筆，另一筆的原值列在下面，**兩邊不相加**。只讀下面兩個本機檔，皆為唯讀：
 
 - **Grok Bot**：`~/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json`。
   看板只取 `series` 裡 `providerId` 是 `grok-bot` 的那一筆，用最後一個 sample 的
-  `usedPercent`、`resetAt`、`sampledAt`、`durationSeconds`。畫面顯示「Grok Bot · 7 天」
-  窗口與讀取時間。帳號欄位不讀、不顯示、不記錄。這個檔約 2 MB，所以看板在背景執行緒
-  讀，並快取至少 60 秒；mtime 沒變就不重讀。
+  `usedPercent`、`resetAt`、`sampledAt`、`durationSeconds`。帳號欄位不讀、不顯示、不記錄。
+  這個檔約 2 MB，所以看板在背景執行緒讀，並快取至少 60 秒；mtime 沒變就不重讀。
 - **Cursor**：`~/Projects/status/quota-codexbar.json`（已去識別化的匯出檔）。只取
   `providers` 裡 `provider` 是 `cursor` 的 `windows[].label`、`usedPercent`、
   `resetsAt` 與 `updatedAt`。
 
-任一個檔讀不到、JSON 壞掉或沒有對應區塊時，該服務就顯示「無資料」。看板不猜數字。
+任一個檔讀不到、JSON 壞掉或沒有對應區塊時，另一個來源照常顯示，並註明只有一邊有數字。
+兩個都讀不到才顯示「無資料」。看板不猜數字。
 時間進度（時間過了多少 vs 用量多少）跟其他服務用同一套規則。
 
 ### 完成時間
