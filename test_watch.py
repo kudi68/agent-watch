@@ -1979,6 +1979,22 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.focused, watch.TaskRow)
             self.assertFalse(app.ui_error)
 
+    async def test_queued_row_focus_does_not_steal_an_explicit_tab(self):
+        app = self.fixture_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            row = app._row_widgets[app.selected_key]
+            for tab_id in ("tab-arch", "tab-quota", "tab-tree"):
+                with self.subTest(tab=tab_id):
+                    app.action_switch_tab("tab-work")
+                    await pilot.pause()
+                    app.set_focus(None)
+                    app.set_focus(row)  # Focus event is delivered a tick later
+                    app.action_switch_tab(tab_id)
+                    for _ in range(3):
+                        await pilot.pause()
+                    self.assertEqual(app.query_one("#main-tabs").active, tab_id)
+
     async def test_tab_return_scrolls_selected_row_back_into_view(self):
         """Switching back to 工作 must scroll a scrolled-away selection into view."""
         app = self.fixture_app()

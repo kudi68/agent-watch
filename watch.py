@@ -5237,6 +5237,15 @@ class NavTab(Static):
         self.app.action_switch_tab(self.tab_id)
 
 
+class MainTabs(TabbedContent):
+    def on_tab_pane_focused(self, event: TabPane.Focused) -> None:
+        # A queued Focus outlives a tab switch. prevent_default() also skips
+        # Textual's own handler, which an override calling super() would run.
+        focused = self.screen.focused
+        if focused is None or event.tab_pane not in focused.ancestors:
+            event.prevent_default()
+
+
 class HistoryTable(DataTable):
     # ScrollView otherwise consumes Space before it reaches the App binding.
     BINDINGS = [("space", "app.toggle_history_group", "收合專案組")]
@@ -5703,7 +5712,7 @@ class AgentWatchApp(App):
         yield Static("額度：載入中...", id="compact-quota-line")
         yield Static(self.state_message, id="state-message", markup=False)
 
-        with TabbedContent(initial="tab-work", id="main-tabs"):
+        with MainTabs(initial="tab-work", id="main-tabs"):
             with TabPane("[1] 工作", id="tab-work"):
                 with Vertical(id="work-page"):
                     with VerticalScroll(id="work-scroll"):
