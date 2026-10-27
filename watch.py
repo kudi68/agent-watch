@@ -229,9 +229,11 @@ QUOTA_PROVIDER_NAMES = {
     "claude": "Claude",
     "opencode-go": "OpenCode Go",
     "openrouter": "OpenRouter",
-    "grok-bot": "Grok Bot",
-    "cursor": "Cursor",
+    "x-super": "X Super（Grok Bot＋Cursor）",
 }
+X_SUPER_PROVIDER = "x-super"
+X_SUPER_NAME = "X Super（Grok Bot＋Cursor）"
+X_SUPER_SOURCE_PROVIDERS = ("grok-bot", "cursor")
 
 
 def keyword_matches(keyword: str, text: str) -> bool:
@@ -2722,6 +2724,63 @@ def read_cursor_quota_item(path: Optional[Path] = None) -> Dict[str, Any]:
     }
 
 
+def _x_super_snapshot(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One readable window from a local source; None when it has no usable number."""
+    windows = valid_quota_windows(item) if quota_item_has_data(item) else []
+    if not windows:
+        return None
+    label, used, window = windows[0]
+    return {
+        "name": str(item.get("name") or item.get("provider") or ""),
+        "label": label,
+        "used": used,
+        "asOf": item.get("asOf"),
+        "window": window,
+    }
+
+
+def merge_x_super_quota_items(
+    grok_item: Dict[str, Any], cursor_item: Dict[str, Any],
+) -> Dict[str, Any]:
+    """One X Super row for the shared pool: the newer reading, never a sum."""
+    snapshots = [
+        snapshot for snapshot in (
+            _x_super_snapshot(grok_item), _x_super_snapshot(cursor_item),
+        ) if snapshot is not None
+    ]
+    if not snapshots:
+        return _quota_item_without_data(
+            X_SUPER_PROVIDER, X_SUPER_NAME,
+            "無資料（Grok Bot 歷史檔與 Cursor 匯出檔都沒有可用數字）",
+        )
+    # On a timestamp tie, Cursor (the aggregated export) wins over the raw sample.
+    newest = max(reversed(snapshots), key=lambda s: quota_epoch(s["asOf"]) or float("-inf"))
+    keys = ("name", "label", "used", "asOf")
+    return {
+        "provider": X_SUPER_PROVIDER,
+        "name": X_SUPER_NAME,
+        "asOf": newest["asOf"],
+        "windows": [copy.deepcopy(newest["window"])],
+        "sources": [{key: snapshot[key] for key in keys} for snapshot in snapshots],
+    }
+
+
+def x_super_source_notes(item: Dict[str, Any], now: Optional[float] = None) -> List[str]:
+    """Explain the shared pool and list both readings without adding them."""
+    sources = item.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return []
+    if len(sources) == 1:
+        return [f"只讀到 {sources[0]['name']}；另一個來源沒有可用數字"]
+    if len({round(float(source["used"]), 1) for source in sources}) == 1:
+        return ["Grok Bot 與 Cursor 同值，同一個 X Super 額度池"]
+    return ["同一個 X Super 額度池；顯示較新一筆，兩邊不相加"] + [
+        f"{source['name']} {source['label']} {source['used']:g}%"
+        f"（{format_reset_time(source['asOf'], now)}）"
+        for source in sources
+    ]
+
+
 class QuotaService:
     """Fetches Codex session quota and optional non-Codex magpie quota."""
 
@@ -2825,14 +2884,16 @@ class QuotaService:
                 items = [item for item in items if str(item.get("provider", "")).lower() != "codex"]
                 items.insert(0, codex_item)
                 providers.add("codex")
-        for local_item in (read_grok_quota_item(), read_cursor_quota_item()):
-            provider = local_item["provider"]
+        for provider in X_SUPER_SOURCE_PROVIDERS:
             items = [
                 item for item in items
                 if str(item.get("provider", "")).casefold() != provider
             ]
-            items.append(local_item)
-            providers.add(provider)
+            providers.discard(provider)
+        items.append(merge_x_super_quota_items(
+            read_grok_quota_item(), read_cursor_quota_item(),
+        ))
+        providers.add(X_SUPER_PROVIDER)
         for provider in QUOTA_PROVIDER_NAMES:
             if provider not in providers:
                 items.append({
@@ -2995,6 +3056,10 @@ def render_full_quota_view(
                 lines.append("    [#a9b1bd]" + stamp + "[/]")
             rendered = True
 
+        if provider == X_SUPER_PROVIDER:
+            for note in x_super_source_notes(item, now):
+                lines.append(f"  [#a9b1bd]{escape(note)}[/]")
+
     if not rendered:
         lines.append("[#ff9e3b]無資料[/#ff9e3b]")
 
@@ -3021,6 +3086,9 @@ def render_plain_quota_details(quota_data: list) -> List[str]:
                 f"  * {name} {label}: {int(round(used))}%"
                 f"（重置 {reset}，資料時間：{source_time}）"
             )
+        if str(item.get("provider") or "").casefold() == X_SUPER_PROVIDER:
+            for note in x_super_source_notes(item):
+                lines.append(f"  · {note}")
     return lines or ["  * 無資料"]
 
 

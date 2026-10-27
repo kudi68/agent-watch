@@ -690,9 +690,8 @@ class QuotaRegressions(unittest.TestCase):
             self.assertIn(name, summary)
         self.assertIn("Claude：無資料", summary)
         self.assertIn("OpenRouter $0.00", summary)
-        self.assertIn("Grok Bot：無資料", summary)
-        self.assertIn("Cursor：無資料", summary)
-        self.assertEqual(len(raw), 6)
+        self.assertIn("X Super（Grok Bot＋Cursor）：無資料", summary)
+        self.assertEqual(len(raw), 5)
 
     def test_magpie_fixture_parses_every_provider_window(self):
         payload = self.FIXTURE.read_text(encoding="utf-8")
@@ -707,7 +706,7 @@ class QuotaRegressions(unittest.TestCase):
         providers = [item["provider"] for item in raw]
         self.assertEqual(
             providers,
-            ["claude", "codex", "opencode-go", "openrouter", "grok-bot", "cursor"],
+            ["claude", "codex", "opencode-go", "openrouter", "x-super"],
         )
         self.assertIn("Claude 5h 50%", summary)
         self.assertIn("7d 46%", summary)
@@ -722,8 +721,9 @@ class QuotaRegressions(unittest.TestCase):
         openrouter = [item for item in raw if item["provider"] == "openrouter"][0]
         self.assertEqual(openrouter["kind"], "balance")
         self.assertEqual(openrouter["balance"], "$19.58")
-        self.assertIn("Grok Bot 7d 22%", summary)
-        self.assertIn("Cursor 7d 21%", summary)
+        self.assertIn("X Super（Grok Bot＋Cursor） 7d 22%", summary)
+        self.assertNotIn("Grok Bot 7d 22%", summary)
+        self.assertNotIn("Cursor 7d 21%", summary)
         details = watch.render_full_quota_view(raw)
         self.assertIn("帳戶餘額 $19.58", details)
         self.assertIn("資料時間：2026-10-25 15:00:54", details)
@@ -779,7 +779,7 @@ class QuotaRegressions(unittest.TestCase):
                     summary, raw = service.fetch(force=True)
                 self.assertIn("Claude：magpie 讀取失敗", summary)
                 self.assertIn("OpenRouter：magpie 讀取失敗", summary)
-                self.assertEqual(len(raw), 6)
+                self.assertEqual(len(raw), 5)
                 self.assertTrue(service.stale)
 
     def test_magpie_timeout_shows_no_data(self):
@@ -787,7 +787,7 @@ class QuotaRegressions(unittest.TestCase):
         with patch("watch.subprocess.run", side_effect=watch.subprocess.TimeoutExpired("magpie", 10)):
             summary, raw = service.fetch(force=True)
         self.assertIn("magpie 讀取失敗", summary)
-        self.assertEqual(len(raw), 6)
+        self.assertEqual(len(raw), 5)
         self.assertIn("逾時", service.last_error)
 
     def test_codex_session_limits_used_when_magpie_omits_codex(self):
@@ -1059,6 +1059,42 @@ class LocalQuotaSourceTests(unittest.TestCase):
                          encoding="utf-8")
         self.assertIn("無資料", watch.read_cursor_quota_item(other)["reason"])
 
+    def test_merge_uses_the_newer_snapshot_without_adding_values(self):
+        grok = watch.read_grok_quota_item(self.FIXTURES / "grok_pace.json", now=self.NOW)
+        cursor = watch.read_cursor_quota_item(self.FIXTURES / "cursor_quota.json")
+        item = watch.merge_x_super_quota_items(grok, cursor)
+        self.assertEqual(item["provider"], "x-super")
+        self.assertEqual(item["name"], "X Super（Grok Bot＋Cursor）")
+        # Fixture Grok sample 02:32:49 is newer than Cursor's 02:12:40.
+        self.assertEqual([window["used"] for window in item["windows"]], [22.5])
+        self.assertEqual([source["used"] for source in item["sources"]], [22.5, 21.1])
+        notes = watch.x_super_source_notes(item, now=self.NOW)
+        self.assertIn("兩邊不相加", notes[0])
+        self.assertIn("Grok Bot 7 天 22.5%（02:32）", notes)
+        self.assertIn("Cursor 7 天 21.1%（02:12）", notes)
+
+    def test_merge_prefers_cursor_when_its_export_is_newer(self):
+        grok = watch.read_grok_quota_item(self.FIXTURES / "grok_pace.json", now=self.NOW)
+        newer = self.root / "cursor-newer.json"
+        newer.write_text(json.dumps({"providers": [{
+            "provider": "cursor",
+            "updatedAt": "2026-10-27T03:00:00+08:00",
+            "windows": [{"label": "Weekly", "usedPercent": 30.0,
+                         "resetsAt": "2026-10-27T18:16:46+08:00", "windowMinutes": 10080}],
+        }]}), encoding="utf-8")
+        item = watch.merge_x_super_quota_items(grok, watch.read_cursor_quota_item(newer))
+        self.assertEqual([window["used"] for window in item["windows"]], [30.0])
+        self.assertEqual(item["asOf"], "2026-10-27T03:00:00+08:00")
+
+    def test_merge_without_any_source_keeps_one_no_data_row(self):
+        item = watch.merge_x_super_quota_items(
+            watch.read_grok_quota_item(self.root / "absent.json", now=self.NOW),
+            watch.read_cursor_quota_item(self.root / "absent.json"),
+        )
+        self.assertEqual(item["provider"], "x-super")
+        self.assertEqual(item["windows"], [])
+        self.assertIn("無資料", item["reason"])
+
     def test_service_adds_both_local_sources_to_the_quota_page(self):
         service = watch.QuotaService(sessions_path=self.root / "sessions")
         with patch.dict(os.environ, {
@@ -1067,19 +1103,20 @@ class LocalQuotaSourceTests(unittest.TestCase):
         }):
             with patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout="[]")):
                 summary, raw = service.fetch(force=True)
-        self.assertEqual(len(raw), 6)
+        self.assertEqual(len(raw), 5)
         self.assertEqual(
             [item["provider"] for item in watch.ordered_quota_items(raw)],
-            ["codex", "claude", "opencode-go", "openrouter", "grok-bot", "cursor"],
+            ["codex", "claude", "opencode-go", "openrouter", "x-super"],
         )
-        self.assertIn("Grok Bot 7d 22%", summary)
-        self.assertIn("Cursor 7d 21%", summary)
+        self.assertIn("X Super（Grok Bot＋Cursor） 7d 22%", summary)
         page = "\n".join(Text.from_markup(line).plain
                          for line in watch.render_full_quota_view(raw, 100, now=self.NOW).splitlines())
-        self.assertIn("Grok Bot", page)
+        self.assertIn("X Super（Grok Bot＋Cursor）", page)
         self.assertIn("7d", page)
-        self.assertIn("Cursor", page)
-        self.assertIn("資料時間：2026-10-27 02:12:40", page)
+        self.assertIn("Grok Bot 7 天 22.5%（02:32）", page)
+        self.assertIn("Cursor 7 天 21.1%（02:12）", page)
+        self.assertIn("兩邊不相加", page)
+        self.assertIn("資料時間：2026-10-27 02:32:49", page)
 
 
 class QuotaSnapshotTests(unittest.IsolatedAsyncioTestCase):
