@@ -1954,6 +1954,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.ui_error)
 
     async def test_deferred_row_focus_does_not_steal_an_explicit_tab(self):
+        """A pending restore_selection focus must not pull the view back to 工作."""
         app = self.fixture_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
@@ -1966,6 +1967,17 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
                     for _ in range(3):
                         await pilot.pause()
                     self.assertEqual(app.query_one("#main-tabs").active, tab_id)
+            # Staying on the work tab must still focus the selected row.
+            app.action_switch_tab("tab-work")
+            await pilot.pause()
+            app.set_focus(None)
+            await pilot.pause()
+            self.assertIsNone(app.focused)
+            app.restore_selection(True)
+            for _ in range(3):
+                await pilot.pause()
+            self.assertIsInstance(app.focused, watch.TaskRow)
+            self.assertFalse(app.ui_error)
 
     async def test_queued_row_focus_does_not_steal_an_explicit_tab(self):
         app = self.fixture_app()
