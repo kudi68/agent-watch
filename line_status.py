@@ -17,6 +17,19 @@ CODE_RE = re.compile(
 SUMMARY_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z]{1,3}\d{1,4}(?:-\d{1,3})?|tier-(?:flash|mid|sol)"
     r"|hl-[a-z0-9-]+|aw-[a-z0-9-]+|p\d+-\d+)(?![A-Za-z0-9])")
+# A code is only cut where it really is a code. Anything a person would copy out and
+# use — a URL, an absolute or relative path, a file name, a long hyphenated branch name
+# — stays byte-for-byte, even when a step-code pattern matches inside it
+# (/tmp/R2.md, /tmp/aw-genkyo-c1c2-fix/REPORT.md, aw-genkyo-c1c2-fix).
+KEEP_AS_WRITTEN_RE = re.compile(
+    r"(?:[a-z][a-z0-9+.-]*://[^\s，。；：、！？（）「」『』【】《》]+"
+    r"|(?:~|\.{0,2})/[^\s，。；：、！？（）「」『』【】《》]*"
+    r"|[A-Za-z0-9_.-]*[A-Za-z0-9_-]\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])"
+    r"|[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,})")
+# Letter+digit tokens that are product/standard names (USB3, S3) rather than board
+# steps; a three-or-more-letter prefix is a name far more often than a step id.
+READABLE_NAMES = {"usb2", "usb3", "usb4", "s3", "h2", "h3", "ipv4", "ipv6", "pcie"}
+GAP = "\x00"  # the hole a removed code left; only such holes get tidied
 # Severity words are vocabulary people actually write ("三個 P1"), so they become words
 # instead of disappearing; only P1-13 style step ids are removed outright.
 SEVERITY_WORDS = (("P0", "最高優先"), ("P1", "必修"), ("P2", "次要"), ("P3", "低度"))
@@ -49,19 +62,67 @@ def one_sentence(text: str, limit: int = 90) -> str:
     return flat[:limit].rstrip() + "…" if len(flat) > limit else flat
 
 
+def _is_step_code(token: str) -> bool:
+    """Whether a matched token is a board step id and not a readable name."""
+    if token.casefold() in READABLE_NAMES:
+        return False
+    prefix = re.match(r"([A-Z]+)\d+$", token)
+    return not (prefix and len(prefix.group(1)) > 2)  # USB3, RTX are names; K1, WP6 are steps
+
+
+def _cut_codes(text: str) -> str:
+    """Blank out step codes; every other character keeps its place and its slashes."""
+    untouched = [match.span() for match in KEEP_AS_WRITTEN_RE.finditer(text)]
+    pieces, cut_at = [], 0
+    for match in SUMMARY_CODE_RE.finditer(text):
+        start, end = match.span()
+        if not _is_step_code(match.group(0)):
+            continue
+        if any(left <= start and end <= right for left, right in untouched):
+            continue
+        pieces.append(text[cut_at:start])
+        pieces.append(GAP)
+        cut_at = end
+    pieces.append(text[cut_at:])
+    return "".join(pieces)
+
+
+def _close_gaps(text: str) -> str:
+    """Tidy the seams a removed code left; nothing else in the sentence moves."""
+    separator = r"[＋／、/&]"
+    # Two codes joined by a conjunction leave nothing to join.
+    text = re.sub(rf"{GAP}\s*[與及和或]\s*{GAP}", GAP, text)
+    # An item that was nothing but a code: take its separator, keep the list readable.
+    text = re.sub(rf"{GAP}\s*{separator}", "", text)
+    text = re.sub(rf"{separator}\s*{GAP}", "", text)
+    # A code straight before closing punctuation, or at either end of the sentence.
+    text = re.sub(rf"{GAP}\s*(?=[，。；：！？）」』】》。])", "", text)
+    text = re.sub(rf"^{GAP}\s*", "", text)
+    text = re.sub(rf"\s*{GAP}\s*$", "", text)
+    # A conjunction whose only object was a code must not dangle.
+    text = re.sub(r"[與及和或]\s*(?=[，。；：！？）」』】》。])", "", text)
+    return text
+
+
 def _tidy(text: str) -> str:
-    """Undo the gaps that removing a code leaves behind (double spaces, stray marks)."""
+    """Undo the gaps that removing a code leaves behind (double spaces, stray marks).
+
+    Everything else — the leading slash of /tmp/report.md, a 、 before a path — is
+    evidence and stays exactly as written, so the tidying only runs where a code
+    was actually cut.
+    """
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\s+([，。、；：！？）」』】》（「『【《(,.;:!?])", r"\1", text)
     text = re.sub(r"([（「『【《(])\s+", r"\1", text)
     text = re.sub(r"([（(])\s*([）)])", "", text)
     text = re.sub(r"「\s*」", "", text)
     text = re.sub(r"[，、；：]{2,}", "，", text)
-    # A list whose items were all codes leaves separators with nothing between them.
-    text = re.sub(r"(?:[＋／、/&]\s*){2,}", "", text)
-    text = re.sub(r"([（(：:])\s*[＋／、/&]\s*", r"\1", text)
-    text = re.sub(r"\s*[＋／、/&]\s*([）)。！？])", r"\1", text)
-    text = re.sub(r"[＋／、/&]\s*$", "", text)
+    if GAP in text:
+        text = _close_gaps(text)
+        text = re.sub(r"([（(])\s*([）)])", "", text)  # （K1） leaves an empty pair
+        text = text.replace(GAP, " ")
+        text = re.sub(r"([（「『【《(])\s+", r"\1", text)  # （K1 14:09） keeps （14:09
+    text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\s+([，。、；：！？）」』】》（「『【《(,.;:!?])", r"\1", text)
     text = re.sub(r"，([。！？])", r"\1", text)
     text = re.sub(r"([，。、；：！？])\s+", r"\1", text)
@@ -73,13 +134,13 @@ def human_text(text: str, limit: int = 90) -> str:
     """A one-sentence summary a person can read: no step codes, evidence kept.
 
     `PR #14` becomes `PR 14` instead of disappearing, and paths, hashes,
-    percentages and product names are left alone.
+    percentages, product names and branch names are left exactly as written.
     """
     kept = re.sub(r"(?<![A-Za-z0-9])PR\s*#(\d+)", r"PR \1", str(text or ""))
     kept = re.sub(r"(?<![A-Za-z0-9])#(\d+)", r"PR \1", kept)
     for code, word in SEVERITY_WORDS:
         kept = re.sub(rf"(?<![A-Za-z0-9-]){code}(?![A-Za-z0-9-])", word, kept)
-    cleaned = _tidy(SUMMARY_CODE_RE.sub(" ", kept))
+    cleaned = _tidy(_cut_codes(kept))
     if not re.search(r"[^\s，。、；：！？（）「」『』【】《》·\-—,.;:!?]", cleaned):
         cleaned = ""  # the sentence was nothing but codes and punctuation
     return one_sentence(cleaned, limit)

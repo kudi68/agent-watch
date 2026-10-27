@@ -145,6 +145,38 @@ class LineStatusTests(unittest.TestCase):
         self.assertEqual({r.name: r for r in self.build()}["c"].doing,
                          line_status.FALLBACK_DOING[line_status.ACTIVE])
 
+    def test_summaries_keep_paths_and_readable_names(self):
+        """The code cleaner must not eat characters out of real paths or product names."""
+        for text in ("請看 /tmp/R2.md。",
+                     "請看 /tmp/aw-genkyo-c1c2-fix/REPORT.md。",
+                     "下一步驗證 USB3 與 S3。",
+                     "換到 RTX4090 跑 GPT5。",
+                     "分支 agent/aw-genkyo-c2-20261027 已 commit。"):
+            self.assertEqual(line_status.human_text(text), text)
+        # Removing a code still tidies the hole it left, and only that hole.
+        self.assertEqual(line_status.human_text("K1、WP6、G7 都好了。"), "都好了。")
+        self.assertEqual(line_status.human_text("P1-13 交給 tier-flash，K1 驗證。"), "交給，驗證。")
+
+    def test_absolute_paths_survive_colon_bracket_and_list_separators(self):
+        for text in ("請看：/tmp/report.md。",
+                     "證據（/tmp/report.md）",
+                     "4.88%、/tmp/report.md。"):
+            self.assertEqual(line_status.human_text(text), text)
+        self.assertEqual(line_status.human_text("PR #14、/tmp/report.md。"),
+                         "PR 14、/tmp/report.md。")  # the # still goes, the 、 and / stay
+
+    def test_paths_survive_the_whole_card(self):
+        """Fidelity has to hold through build_snapshots, not only in the helper."""
+        self.write(self.status, "a.md",
+                   status_text("甲線", next_step="照 /tmp/aw-genkyo-c1c2-fix/REPORT.md 收尾。"))
+        self.write(self.decisions, "a.md", decisions(
+            row("n1", status="running", summary="K1 已修，證據 /tmp/R2.md。",
+                evidence="/tmp/R2.md")))
+        record = {item.name: item for item in self.build()}["a"]
+        self.assertEqual(record.doing, "已修，證據 /tmp/R2.md。")
+        self.assertEqual(record.next_step, "照 /tmp/aw-genkyo-c1c2-fix/REPORT.md 收尾。")
+        self.assertEqual(record.report, "/tmp/R2.md")
+
     @unittest.skipUnless((Path.home() / "Projects" / "status").is_dir(), "no real status")
     def test_real_status_and_decisions_produce_one_record_per_line(self):
         folder = Path.home() / "Projects" / "status"
