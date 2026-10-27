@@ -177,6 +177,57 @@ class LineStatusTests(unittest.TestCase):
         self.assertEqual(record.next_step, "照 /tmp/aw-genkyo-c1c2-fix/REPORT.md 收尾。")
         self.assertEqual(record.report, "/tmp/R2.md")
 
+    def test_code_beside_an_absolute_path_keeps_the_leading_slash(self):
+        """A cut code must not take the first / of the path that follows it."""
+        self.assertEqual(line_status.human_text("證據 K1 /tmp/report.md。"),
+                         "證據 /tmp/report.md。")
+        self.assertEqual(line_status.human_text("K1 /tmp/R2.md"), "/tmp/R2.md")
+        self.assertEqual(line_status.human_text("K1、/tmp/R2.md"), "/tmp/R2.md")
+        self.assertEqual(line_status.human_text("看 /tmp/R2.md K1。"), "看 /tmp/R2.md。")
+        self.assertEqual(line_status.human_text("K1 ~/R2.md 與 ./P2.txt。"),
+                         "~/R2.md 與 ./P2.txt。")
+        # A real list separator between two codes is still tidied.
+        self.assertEqual(line_status.human_text("K1＋G7 都好了。"), "都好了。")
+
+    def test_conjunction_cleanup_only_touches_the_hole(self):
+        """A 與／及／和／或 inside a URL or path is evidence, not a dangling conjunction."""
+        self.assertEqual(line_status.human_text("證據 K1 與 https://example.org/和。"),
+                         "證據 與 https://example.org/和。")
+        self.assertEqual(line_status.human_text("K1 看 /tmp/與。"), "看 /tmp/與。")
+        self.assertEqual(line_status.human_text("K1 看 https://example.org/或，再說。"),
+                         "看 https://example.org/或，再說。")
+        # A conjunction that really did lose its only object still goes.
+        self.assertEqual(line_status.human_text("修好 A 與 K1。"), "修好 A。")
+        self.assertEqual(line_status.human_text("修好 A 和 K1，再驗證。"), "修好 A，再驗證。")
+
+    def test_paths_before_pr_and_severity_rewrites_stay_as_written(self):
+        self.assertEqual(line_status.human_text("K1 已修，請看 /tmp/P1.md。"),
+                         "已修，請看 /tmp/P1.md。")
+        self.assertEqual(line_status.human_text("看 ./P2.txt 與 #14。"), "看 ./P2.txt 與 PR 14。")
+
+    def test_slash_path_and_url_survive_the_whole_card(self):
+        self.write(self.status, "a.md", status_text(
+            "甲線", waiting_on="K1 /tmp/blocked.md", next_step="K1 /tmp/next.md。"))
+        self.write(self.decisions, "a.md", decisions(
+            row("n1", status="running", summary="證據 K1 /tmp/report.md。")))
+        record = {item.name: item for item in self.build()}["a"]
+        self.assertEqual(record.doing, "證據 /tmp/report.md。")
+        self.assertEqual(record.blocked_on, "/tmp/blocked.md")
+        self.assertEqual(record.next_step, "/tmp/next.md。")
+        self.write(self.status, "b.md", status_text(
+            "乙線", next_step="證據 K1 與 https://example.org/和。"))
+        record = {item.name: item for item in self.build()}["b"]
+        self.assertEqual(record.next_step, "證據 與 https://example.org/和。")
+
+    def test_leftover_code_check_ignores_protected_evidence(self):
+        """The live-data check must not call a kept path or product name a leftover code."""
+        def leftover(value):
+            bare = line_status.KEEP_AS_WRITTEN_RE.sub("", value)
+            return [token.group(0) for token in line_status.CODE_RE.finditer(bare)
+                    if line_status._is_step_code(token.group(0))]
+        self.assertEqual(leftover(line_status.human_text("K1 看 /tmp/R2.md 與 USB3。")), [])
+        self.assertEqual(leftover("獨立的 K1 沒清掉"), ["K1"])
+
     @unittest.skipUnless((Path.home() / "Projects" / "status").is_dir(), "no real status")
     def test_real_status_and_decisions_produce_one_record_per_line(self):
         folder = Path.home() / "Projects" / "status"
@@ -194,7 +245,10 @@ class LineStatusTests(unittest.TestCase):
             self.assertIsNone(line_status.CODE_RE.search(record.title), record.title)
             for field_name in ("doing", "blocked_on", "next_step"):
                 value = getattr(record, field_name)
-                self.assertIsNone(line_status.CODE_RE.search(value),
-                                  f"{record.name}.{field_name}: {value}")
+                # Paths, URLs and product names are kept on purpose (/tmp/R2.md, USB3).
+                bare = line_status.KEEP_AS_WRITTEN_RE.sub("", value)
+                left = [token.group(0) for token in line_status.CODE_RE.finditer(bare)
+                        if line_status._is_step_code(token.group(0))]
+                self.assertEqual(left, [], f"{record.name}.{field_name}: {value}")
             self.assertTrue(record.doing and record.blocked_on and record.next_step)
             self.assertNotIn("\n", record.doing + record.blocked_on + record.next_step)

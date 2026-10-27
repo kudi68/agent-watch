@@ -30,6 +30,7 @@ KEEP_AS_WRITTEN_RE = re.compile(
 # steps; a three-or-more-letter prefix is a name far more often than a step id.
 READABLE_NAMES = {"usb2", "usb3", "usb4", "s3", "h2", "h3", "ipv4", "ipv6", "pcie"}
 GAP = "\x00"  # the hole a removed code left; only such holes get tidied
+PLACEHOLDER_OPEN, PLACEHOLDER_CLOSE = "\x01", "\x02"  # stands in for a protected string
 # Severity words are vocabulary people actually write ("三個 P1"), so they become words
 # instead of disappearing; only P1-13 style step ids are removed outright.
 SEVERITY_WORDS = (("P0", "最高優先"), ("P1", "必修"), ("P2", "次要"), ("P3", "低度"))
@@ -90,17 +91,18 @@ def _cut_codes(text: str) -> str:
 def _close_gaps(text: str) -> str:
     """Tidy the seams a removed code left; nothing else in the sentence moves."""
     separator = r"[＋／、/&]"
+    closing = r"[，。；：！？）」』】》。]"
     # Two codes joined by a conjunction leave nothing to join.
     text = re.sub(rf"{GAP}\s*[與及和或]\s*{GAP}", GAP, text)
+    # A conjunction whose only object was this code must not dangle; it has to touch the hole.
+    text = re.sub(rf"[與及和或]\s*{GAP}\s*(?={closing}|$)", GAP, text)
     # An item that was nothing but a code: take its separator, keep the list readable.
     text = re.sub(rf"{GAP}\s*{separator}", "", text)
     text = re.sub(rf"{separator}\s*{GAP}", "", text)
     # A code straight before closing punctuation, or at either end of the sentence.
-    text = re.sub(rf"{GAP}\s*(?=[，。；：！？）」』】》。])", "", text)
+    text = re.sub(rf"{GAP}\s*(?={closing})", "", text)
     text = re.sub(rf"^{GAP}\s*", "", text)
     text = re.sub(rf"\s*{GAP}\s*$", "", text)
-    # A conjunction whose only object was a code must not dangle.
-    text = re.sub(r"[與及和或]\s*(?=[，。；：！？）」』】》。])", "", text)
     return text
 
 
@@ -136,11 +138,23 @@ def human_text(text: str, limit: int = 90) -> str:
     `PR #14` becomes `PR 14` instead of disappearing, and paths, hashes,
     percentages, product names and branch names are left exactly as written.
     """
-    kept = re.sub(r"(?<![A-Za-z0-9])PR\s*#(\d+)", r"PR \1", str(text or ""))
+    # Protected strings leave the text first and come back last, so no rewrite or tidy
+    # step in between can touch a single character of them.
+    protected: List[str] = []
+
+    def stash(match):
+        protected.append(match.group(0))
+        return f"{PLACEHOLDER_OPEN}{len(protected) - 1}{PLACEHOLDER_CLOSE}"
+
+    source = re.sub(f"[{GAP}{PLACEHOLDER_OPEN}{PLACEHOLDER_CLOSE}]", "", str(text or ""))
+    kept = KEEP_AS_WRITTEN_RE.sub(stash, source)
+    kept = re.sub(r"(?<![A-Za-z0-9])PR\s*#(\d+)", r"PR \1", kept)
     kept = re.sub(r"(?<![A-Za-z0-9])#(\d+)", r"PR \1", kept)
     for code, word in SEVERITY_WORDS:
         kept = re.sub(rf"(?<![A-Za-z0-9-]){code}(?![A-Za-z0-9-])", word, kept)
     cleaned = _tidy(_cut_codes(kept))
+    cleaned = re.sub(f"{PLACEHOLDER_OPEN}(\\d+){PLACEHOLDER_CLOSE}",
+                     lambda match: protected[int(match.group(1))], cleaned)
     if not re.search(r"[^\s，。、；：！？（）「」『』【】《》·\-—,.;:!?]", cleaned):
         cleaned = ""  # the sentence was nothing but codes and punctuation
     return one_sentence(cleaned, limit)
