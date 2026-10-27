@@ -1181,10 +1181,24 @@ def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
     return question
 
 
+def question_is_malformed(question: Optional[Dict[str, Any]]) -> bool:
+    """True when QUESTION.md cannot be answered until someone fixes the file."""
+    return bool(question and question.get("error"))
+
+
 def question_is_active(question: Optional[Dict[str, Any]],
                        completion_time: Optional[float] = None) -> bool:
-    """An unanswered question is attention until a matching ANSWER.md exists."""
-    return bool(question and not question.get("answered"))
+    """An unanswered, well-formed question is attention until a matching ANSWER.md exists.
+
+    A malformed question (parse error: missing id/question/options, bad option
+    syntax) can never be answered, so it must not pin the card to attention
+    forever: the card falls back to its own status, the board labels it
+    `malformed`, and `x` clears it. `completion_time` is kept for call
+    compatibility; SPEC §3.3 never expires a question by time, so it is unused.
+    """
+    if question is None or question.get("error"):
+        return False
+    return not question.get("answered")
 
 
 def question_escalated(question: Optional[Dict[str, Any]],
@@ -4060,18 +4074,28 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+SUPERSEDED_HANDOFF_WORD = (
+    r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
+)
+# SPEC §A name rule: only an explicit hand-off suffix links an old card to a
+# newer one. A bare trailing number stays part of the card's identity, so
+# numbered siblings (`na2-n3`/`na2-n6`, `wp6`/`wp7`) never supersede each other.
 SUPERSEDED_SUFFIX_RE = re.compile(
-    r"(?:-(?:retry|claude|rerun|redo|fix|p\d+|v\d+)|-?\d+)$",
+    r"(?:"
+    r"-" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?"     # -fix, -fix2, -retry-3
+    r"|-[pv]\d+(?:" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?)?"  # -p2, -p2fix2
+    r")$",
     re.IGNORECASE,
 )
 
 
 def _normalized_task_name(name: str) -> str:
+    """Strip repeated hand-off suffixes; a name without one is its own family."""
     normalized = name.casefold()
     while True:
         stripped = SUPERSEDED_SUFFIX_RE.sub("", normalized)
         if stripped == normalized:
-            return normalized
+            return normalized.strip()
         normalized = stripped
 
 
@@ -4129,7 +4153,8 @@ def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
 
         if target is None and old.completion_time is not None:
             old_family = _normalized_task_name(old.name)
-            matches = [
+            # A name that normalizes to nothing never identifies a family.
+            matches = [] if not old_family else [
                 agent for agent in replacements
                 if agent.key != old.key
                 and _same_known_project(old, agent)
@@ -4481,6 +4506,8 @@ class WatchState:
                 dismissed_sig=self.dismissed_signature(agent),
                 run_start=agent.start_time,
             )
+            if ok and question_is_malformed(agent.question):
+                return True, "已清除 malformed 問題卡；不會刪除或修改 QUESTION.md"
             if ok and agent.question:
                 return True, "已清除；不會刪除或修改 QUESTION.md／ANSWER.md"
             return ok, "已清除" if ok else self.warning
@@ -4607,7 +4634,9 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     wait_text = ""
     if agent.question:
         if agent.question.get("error"):
-            detail = "問題格式錯誤：" + agent.question["error"]
+            detail = "malformed · 問題格式錯誤：%s · 補好 QUESTION.md 或按 x 清除" % (
+                agent.question["error"],
+            )
         elif agent.status == "escalated":
             detail = "已轉介給 %s，等上層回答：%s" % (
                 agent.question.get("escalate_to") or DEFAULT_ESCALATE_TARGET,
@@ -5617,7 +5646,10 @@ class QuestionScreen(ModalScreen):
                     id="question-note",
                 )
             yield Static(
-                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · 最下面兩列轉給上層 · Esc 取消",
+                ("malformed：問題格式錯誤，不能回答 · 補好 QUESTION.md 後重開，"
+                 "或 Esc 回看板按 x 清除（不會刪檔）"
+                 if question.get("error") else
+                 "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · 最下面兩列轉給上層 · Esc 取消"),
                 id="question-hint",
             )
 

@@ -1832,6 +1832,34 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
 
+    async def test_x_clears_malformed_question_after_showing_why(self):
+        question_dir = tempfile.TemporaryDirectory(prefix="aw-question-malformed-")
+        self.addCleanup(question_dir.cleanup)
+        question_root = Path(question_dir.name)
+        question_path = question_root / "QUESTION.md"
+        question_path.write_text("# QUESTION\nid: q1\n", encoding="utf-8")
+        agent = self.fixture_agents()[0]
+        agent.status = "failed"
+        agent.completion_time = self.now - 60
+        agent.question = watch.read_task_question(question_root)
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertFalse(
+                watch.question_is_active(agent.question, agent.completion_time),
+                "a malformed question can never be answered, so it cannot gate x",
+            )
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertIn("malformed", self.screen_text(app))
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertEqual(app.state.bucket(agent, self.now), "history")
+            self.assertEqual(
+                question_path.read_text(encoding="utf-8"), "# QUESTION\nid: q1\n",
+                "clearing the card never edits QUESTION.md",
+            )
+
     async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
         agents = self.fixture_agents()[5:7]
         agents[0].log_lines = [
@@ -2461,6 +2489,59 @@ class SupersessionTests(unittest.TestCase):
             "claude-perm",
         )
 
+    def test_suffix_normalization_keeps_bare_numbers_as_identity(self):
+        for name in ("na2-n3", "wp6", "awv10-s5", "na2-n3-2", "1"):
+            with self.subTest(name=name):
+                self.assertEqual(watch._normalized_task_name(name), name)
+
+    def test_handoff_suffix_variants_share_one_family(self):
+        for old_name, new_name in (
+            ("claude-perm-p2-fix", "claude-perm-p2-fix2"),
+            ("task", "task-fix"),
+            ("task", "task-p2fix"),
+            ("task", "task-rereview"),
+            ("task-fix", "task-fix2-retry-3"),
+        ):
+            with self.subTest(old=old_name, new=new_name):
+                self.assertEqual(
+                    watch._normalized_task_name(old_name),
+                    watch._normalized_task_name(new_name),
+                )
+
+    def test_numbered_sibling_cards_keep_their_own_status(self):
+        for old_name, new_name in (
+            ("na2-n3", "na2-n6"), ("wp6", "wp7"), ("awv10-s5", "awv10-s6"),
+        ):
+            with self.subTest(old=old_name, new=new_name):
+                old = self.make_agent(old_name, "failed", start=100, completion=200)
+                sibling = self.make_agent(new_name, "running", start=300)
+                state = self.make_state()
+                state.reconcile([old, sibling], 310)
+                self.assertNotIn(
+                    old.key, watch.compute_superseded([old, sibling]),
+                    "a numbered sibling is not a fix card",
+                )
+                self.assertEqual(state.bucket(old, 310), "attention")
+                self.assertEqual(state.stale_info(old, 310), "")
+
+    def test_bare_number_suffix_is_not_a_handoff(self):
+        old = self.make_agent("na2-n3", "failed", start=100, completion=200)
+        renamed = self.make_agent("na2-n3-2", "running", start=300)
+        self.assertNotIn(old.key, watch.compute_superseded([old, renamed]))
+
+    def test_spec_example_hands_off_inside_the_claude_perm_project(self):
+        old = self.make_agent(
+            "claude-perm-p2-fix", "failed", project="claude-perm",
+            start=100, completion=200,
+        )
+        replacement = self.make_agent(
+            "claude-perm-p2-fix2", "running", project="claude-perm", start=300,
+        )
+        self.assertEqual(
+            watch.compute_superseded([old, replacement]),
+            {old.key: replacement.key},
+        )
+
     def test_running_fix2_hands_off_old_failed_card(self):
         old = self.make_agent(
             "claude-perm-p2-fix", "failed", start=100, completion=200,
@@ -2531,8 +2612,9 @@ class SupersessionTests(unittest.TestCase):
 
     def test_unanswered_question_is_neither_source_nor_replacement(self):
         pending = dict(id="q1", answered=False, asked_at_ts=150)
+        # A failed card that still asks a question cannot be handed off either.
         old_question = self.make_agent(
-            "claude-perm-p2-fix", "question", start=100, completion=200,
+            "claude-perm-p2-fix", "failed", start=100, completion=200,
             question=pending,
         )
         running = self.make_agent(
@@ -2543,12 +2625,13 @@ class SupersessionTests(unittest.TestCase):
             watch.compute_superseded([old_question, running]),
         )
 
+        # Neither can a still-running fix card that is itself waiting for an
+        # answer supersede the card it is supposed to replace.
         failed = self.make_agent(
             "other-task-fix", "failed", start=100, completion=200,
         )
         pending_replacement = self.make_agent(
-            "other-task-fix2", "complete", start=201, completion=300,
-            question=pending,
+            "other-task-fix2", "running", start=201, question=pending,
         )
         self.assertNotIn(
             failed.key,
@@ -2600,7 +2683,52 @@ class TestQuestionFiles(unittest.TestCase):
         ):
             with self.subTest(body=body):
                 self.assertIn(expected, watch.parse_question(body)["error"])
-        self.assertTrue(watch.question_is_active(watch.parse_question("# QUESTION\nid: q1\n")))
+        self.assertTrue(watch.question_is_malformed(watch.parse_question("# QUESTION\nid: q1\n")))
+        self.assertFalse(
+            watch.question_is_active(watch.parse_question("# QUESTION\nid: q1\n")),
+            "a malformed question cannot be answered, so it must not block the card",
+        )
+
+    def test_malformed_question_is_marked_and_has_a_clear_exit(self):
+        (self.root / "QUESTION.md").write_text("# QUESTION\nid: q1\n", encoding="utf-8")
+        question = watch.read_task_question(self.root)
+        self.assertTrue(watch.question_is_malformed(question))
+        self.assertFalse(watch.question_is_active(question))
+        self.assertIn("缺少 question", question["error"])
+        self.assertFalse(watch.write_answer_file(self.root, question, "A")[0])
+        self.assertFalse((self.root / "ANSWER.md").exists())
+
+        agent = AgentInfo(
+            name="malformed-task", log_path=Path("/dev/null"),
+            last_path=Path("/dev/null"), status="failed", model="fixture",
+            start_time=100, elapsed="00:01:00", latest="失敗", key="malformed",
+            completion_time=200, question=question,
+        )
+        row = watch.render_task_row(agent, 120, 210).plain
+        self.assertIn("malformed", row)
+        self.assertIn("按 x 清除", row)
+        self.assertEqual(
+            (self.root / "QUESTION.md").read_text(encoding="utf-8"),
+            "# QUESTION\nid: q1\n",
+            "showing a malformed question never rewrites the file",
+        )
+
+    def test_malformed_question_keeps_the_task_status(self):
+        now = parse_timestamp("2026-10-25T10:10:00Z")
+        log = self.root / "run.log"
+        write_log(log, now - 600, "等回答中")
+        (self.root / "QUESTION.md").write_text("# QUESTION\nid: q1\n", encoding="utf-8")
+        runs, done = self.root / "runs.tsv", self.root / "done.tsv"
+        runs.write_text(
+            "bad-question\t%s\t%s\t\tClaude\tmodel-q\taw\n" % (log, self.root / "REPORT.md")
+        )
+        done.write_text("")
+        agents, errors = load_all_agents(
+            runs, done, LogParser(process_start_reader=None), now,
+        )
+        self.assertEqual(errors, [])
+        self.assertNotEqual(agents[0].status, "question")
+        self.assertTrue(watch.question_is_malformed(agents[0].question))
 
     def test_answer_requires_matching_id_and_choice(self):
         (self.root / "QUESTION.md").write_text(self.QUESTION)

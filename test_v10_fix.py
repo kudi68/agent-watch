@@ -274,6 +274,22 @@ class AttentionStateTests(unittest.TestCase):
         self.state.reconcile([agent], self.now)
         self.assertEqual(self.state.bucket(agent, self.now), "attention")
 
+    def test_malformed_question_card_is_attention_but_can_be_dismissed(self):
+        question = {"id": "q-bad", "asked_at_ts": self.now - 60, "answered": False,
+                    "error": "缺少 options 或沒有可用選項"}
+        self.assertTrue(watch.question_is_malformed(question))
+        self.assertFalse(watch.question_is_active(question, self.now - 60))
+        agent = self.agent("malformed", "malformed-task", "failed",
+                           completion=self.now - 60, question=question)
+        self.state.reconcile([agent], self.now)
+        self.assertEqual(self.state.bucket(agent, self.now), "attention")
+        self.assertEqual(self.state.stale_info(agent, self.now), "")
+
+        ok, message = self.state.apply("dismiss", agent, [agent], self.now)
+        self.assertTrue(ok, "a malformed question must not be unclearable")
+        self.assertIn("malformed", message)
+        self.assertEqual(self.state.bucket(agent, self.now), "history")
+
     def test_running_rerun_clears_dismissal_and_running_cannot_be_dismissed(self):
         agent = self.agent("rerun", "rerun-task", "failed", start=self.now - 500,
                            completion=self.now - 400)
