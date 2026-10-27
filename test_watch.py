@@ -2486,19 +2486,24 @@ class SupersessionTests(unittest.TestCase):
     def test_suffix_normalization_strips_multiple_layers(self):
         self.assertEqual(
             watch._normalized_task_name("claude-perm-p2-fix2-retry-3"),
-            "claude-perm",
+            "claude-perm-p2",
         )
 
     def test_suffix_normalization_keeps_bare_numbers_as_identity(self):
-        for name in ("na2-n3", "wp6", "awv10-s5", "na2-n3-2", "1"):
+        for name in (
+            "na2-n3", "wp6", "awv10-s5", "na2-n3-2", "1",
+            "awv10-p1", "awv10-p2", "xxx-v1", "xxx-v2",
+        ):
             with self.subTest(name=name):
                 self.assertEqual(watch._normalized_task_name(name), name)
 
     def test_handoff_suffix_variants_share_one_family(self):
         for old_name, new_name in (
             ("claude-perm-p2-fix", "claude-perm-p2-fix2"),
+            ("claude-perm-p2", "claude-perm-p2-fix2"),
+            ("awv10-p2", "awv10-p2fix"),
             ("task", "task-fix"),
-            ("task", "task-p2fix"),
+            ("task-p2", "task-p2fix"),
             ("task", "task-rereview"),
             ("task-fix", "task-fix2-retry-3"),
         ):
@@ -2523,6 +2528,53 @@ class SupersessionTests(unittest.TestCase):
                 )
                 self.assertEqual(state.bucket(old, 310), "attention")
                 self.assertEqual(state.stale_info(old, 310), "")
+
+    def test_phase_and_version_siblings_keep_their_own_status(self):
+        for old_name, new_name in (
+            ("awv10-p1", "awv10-p2"),
+            ("xxx-v1", "xxx-v2"),
+        ):
+            with self.subTest(old=old_name, new=new_name):
+                old = self.make_agent(old_name, "failed", start=100, completion=200)
+                sibling = self.make_agent(new_name, "running", start=300)
+                state = self.make_state()
+                state.reconcile([old, sibling], 310)
+                self.assertNotIn(old.key, watch.compute_superseded([old, sibling]))
+                self.assertEqual(state.bucket(old, 310), "attention")
+                self.assertEqual(state.stale_info(old, 310), "")
+
+    def test_same_phase_repair_suffix_hands_off_failed_card(self):
+        old = self.make_agent("awv10-p1", "failed", start=100, completion=200)
+        replacement = self.make_agent("awv10-p1-fix", "running", start=300)
+        state = self.make_state()
+        state.reconcile([old, replacement], 310)
+        self.assertEqual(
+            watch.compute_superseded([old, replacement]),
+            {old.key: replacement.key},
+        )
+        self.assertEqual(state.bucket(old, 310), "history")
+
+    def test_phase_versioned_fix2_hands_off_matching_failed_card(self):
+        old = self.make_agent(
+            "claude-perm-p2", "failed", project="claude-perm",
+            start=100, completion=200,
+        )
+        replacement = self.make_agent(
+            "claude-perm-p2-fix2", "running", project="claude-perm", start=300,
+        )
+        self.assertEqual(
+            watch.compute_superseded([old, replacement]),
+            {old.key: replacement.key},
+        )
+
+    def test_fix_from_different_phase_cannot_handoff(self):
+        old = self.make_agent("awv10-p1", "failed", start=100, completion=200)
+        replacement = self.make_agent("awv10-p2-fix", "running", start=300)
+        state = self.make_state()
+        state.reconcile([old, replacement], 310)
+        self.assertNotIn(old.key, watch.compute_superseded([old, replacement]))
+        self.assertEqual(state.bucket(old, 310), "attention")
+        self.assertEqual(state.stale_info(old, 310), "")
 
     def test_bare_number_suffix_is_not_a_handoff(self):
         old = self.make_agent("na2-n3", "failed", start=100, completion=200)
@@ -2636,6 +2688,20 @@ class SupersessionTests(unittest.TestCase):
         self.assertNotIn(
             failed.key,
             watch.compute_superseded([failed, pending_replacement]),
+        )
+
+    def test_completed_unanswered_question_is_not_a_replacement(self):
+        pending = dict(id="q1", answered=False, asked_at_ts=250)
+        failed = self.make_agent(
+            "complete-task", "failed", start=100, completion=200,
+        )
+        completed_replacement = self.make_agent(
+            "complete-task-fix", "complete", start=201, completion=300,
+            question=pending,
+        )
+        self.assertNotIn(
+            failed.key,
+            watch.compute_superseded([failed, completed_replacement]),
         )
 
 

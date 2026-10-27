@@ -4078,12 +4078,12 @@ SUPERSEDED_HANDOFF_WORD = (
     r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
 )
 # SPEC §A name rule: only an explicit hand-off suffix links an old card to a
-# newer one. A bare trailing number stays part of the card's identity, so
-# numbered siblings (`na2-n3`/`na2-n6`, `wp6`/`wp7`) never supersede each other.
+# newer one. Phase/version markers stay part of the card's identity; a repair
+# word attached to one can still be stripped (`awv10-p2fix` -> `awv10-p2`).
 SUPERSEDED_SUFFIX_RE = re.compile(
     r"(?:"
     r"-" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?"     # -fix, -fix2, -retry-3
-    r"|-[pv]\d+(?:" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?)?"  # -p2, -p2fix2
+    r"|(?<=[pv]\d)" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?"  # p2fix2; keep -p2
     r")$",
     re.IGNORECASE,
 )
