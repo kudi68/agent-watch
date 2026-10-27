@@ -1,6 +1,8 @@
 """現況頁渲染測試：45 欄、等你／被擋在前、空閒時只有一行。"""
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import line_status
 import now_render
@@ -31,6 +33,20 @@ class TestQuietBoard(unittest.TestCase):
         self.assertEqual(text, now_render.QUIET_LINE)
         self.assertNotIn("[完成]", text)
         self.assertNotIn("[空閒]", text)
+
+    def test_quiet_board_fits_every_supported_width(self):
+        """One honest line, but it has to fit 36/30/24 too, not just 45."""
+        boards = ([], [snap("已完成的事", DONE)], [snap("閒著", IDLE)],
+                  [snap("完成甲", DONE), snap("閒著", IDLE)])
+        for width in (45, 36, 30, 24):
+            for records in boards:
+                text = now_render.render_now(records, width)
+                self.assertNotIn("\n", text)
+                self.assertIn("沒事", text)
+                self.assertLessEqual(watch.display_width(text), width,
+                                     f"{width}: {text!r}")
+        self.assertEqual(now_render.render_now([], 45), now_render.QUIET_LINE)
+        self.assertNotEqual(now_render.render_now([], 24), now_render.QUIET_LINE)
 
 
 class TestOrdering(unittest.TestCase):
@@ -119,10 +135,67 @@ class TestPlainLanguage(unittest.TestCase):
             self.assertEqual(text.count(title), 1)
 
 
+HEADER = ("| date | id | parent | kind | spec | summary | decision | evidence "
+          "| status | agent | merge_target |")
+SEPARATOR = "| --- | " * 10 + "--- |"
+
+
+def status_text(name, status="進行中", waiting_on="", next_step="把下一件事做完。",
+                updated="2026-10-27"):
+    return (f'<!-- dashboard:v1\nname: "{name}"\nproject: "pai"\nstatus: "{status}"\n'
+            f'last_updated: "{updated}"\nnext_step: "{next_step}"\n'
+            f'waiting_on: "{waiting_on}"\n-->\n# 內文不該被讀成表頭\n')
+
+
+def decision_row(node_id="n1", status="done", summary="完成一件小事",
+                 evidence="/tmp/REPORT.md", date="2026-10-27"):
+    cells = [date, node_id, "-", "branch", "s§1", summary, "決定", evidence,
+             status, "-", "-"]
+    return "| " + " | ".join(cells) + " |"
+
+
+class TestFixtureBoard(unittest.TestCase):
+    """End to end on fixture files, so the test never depends on this Mac's status."""
+
+    def test_fixture_board_keeps_attention_first_and_fits_45_columns(self):
+        long_note = ("這是一段很長的中文說明，裡面還有 line_status.py 這種路徑與 "
+                     "commit ac52b4d 這種代號，最後用 END 收尾。")
+        with tempfile.TemporaryDirectory(prefix="aw-now-status-") as status, \
+                tempfile.TemporaryDirectory(prefix="aw-now-board-") as board:
+            status_path, board_path = Path(status), Path(board)
+            # A stale 完成 header with a newer 等你 node: must still show a card.
+            (status_path / "stale.md").write_text(
+                status_text("表頭已寫完成的一條", status="完成", next_step=long_note),
+                encoding="utf-8")
+            (board_path / "stale.md").write_text(
+                "\n".join(["# stale", "", HEADER, SEPARATOR,
+                           decision_row("wait1", status="waiting",
+                                        summary="等你選 A 或 B。"), ""]),
+                encoding="utf-8")
+            (status_path / "live.md").write_text(
+                status_text("正在跑的一條", status="進行中"), encoding="utf-8")
+            (status_path / "old.md").write_text(
+                status_text("早就完成的一條", status="告一段落"), encoding="utf-8")
+            records = line_status.build_snapshots(status_path, board_path)
+            self.assertEqual(len(records), 3)
+            text = now_render.render_now(records, 45)
+            self.assertNotEqual(text, now_render.QUIET_LINE)
+            self.assertIn("[等你]", text)
+            self.assertIn("[進行中]", text)
+            self.assertLess(text.index("[等你]"), text.index("[進行中]"))
+            self.assertLessEqual(max(widths(text)), 45)
+            self.assertIn("已完成 1 條", text)
+            for width in (36, 30):
+                narrow = now_render.render_now(records, width)
+                self.assertLessEqual(max(widths(narrow)), width)
+
+
 class TestRealData(unittest.TestCase):
+    @unittest.skipUnless((Path.home() / "Projects" / "status").is_dir(), "no real status data")
     def test_real_status_and_decisions_render_within_45_columns(self):
         records = line_status.build_snapshots()
-        self.assertTrue(records)
+        if not records:
+            self.skipTest("this machine has no status records")
         text = now_render.render_now(records, 45)
         self.assertLessEqual(max(widths(text)), 45)
         live = [item for item in records

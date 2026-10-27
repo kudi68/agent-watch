@@ -18,7 +18,16 @@ BADGE = {BLOCKED: "[被擋]", WAITING: "[等你]", ACTIVE: "[進行中]", DONE: 
 MIN_WIDTH = 24
 MAX_WIDTH = 45
 INDENT = "  "
-QUIET_LINE = "沒事，現在沒有等你、被擋或進行中的線。"
+# Longest first: the quiet board keeps its full sentence when it fits and falls back
+# to shorter wording on narrow terminals, so the line never exceeds the width asked for.
+QUIET_LINES = (
+    "沒事，現在沒有等你、被擋或進行中的線。",
+    "沒事，沒有等你、被擋或進行中的線。",
+    "沒事：沒有等你或被擋的線。",
+    "沒事，沒有要你處理的。",
+    "沒事。",
+)
+QUIET_LINE = QUIET_LINES[0]
 EMPTY_BLOCKED = "沒有卡點。"
 EMPTY_NEXT = "沒有寫下一步。"
 LIVE_STATES = (BLOCKED, WAITING, ACTIVE)
@@ -130,6 +139,14 @@ def _header(records: Sequence[LineSnapshot], width: int) -> List[str]:
     return _wrap(" · ".join(parts), width)
 
 
+def _quiet_line(width: int) -> str:
+    """The longest "nothing to do" sentence that still fits this terminal."""
+    for candidate in QUIET_LINES:
+        if watch.display_width(candidate) <= width:
+            return candidate
+    return QUIET_LINES[-1]
+
+
 def render_now(records: Iterable[LineSnapshot], width: int = MAX_WIDTH) -> str:
     """Single-column cards, attention first, quiet board collapsed to one line."""
     width = max(MIN_WIDTH, int(width or MAX_WIDTH))
@@ -138,8 +155,8 @@ def render_now(records: Iterable[LineSnapshot], width: int = MAX_WIDTH) -> str:
         records, key=lambda item: STATE_ORDER.get(item.state, len(STATE_ORDER)))
     live = [item for item in ordered if item.state in LIVE_STATES]
     if not live:
-        # Nothing needs a human: no grey cards, just one honest line.
-        return QUIET_LINE
+        # Nothing needs a human: no grey cards, just one honest line that fits.
+        return _quiet_line(width)
     lines = _header(ordered, width)
     lines.append("-" * width)
     for snapshot in live:

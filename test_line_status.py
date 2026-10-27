@@ -85,6 +85,66 @@ class LineStatusTests(unittest.TestCase):
         self.assertEqual(records["a"].report, "/tmp/R2.md")
         self.assertEqual((records["solo"].state, records["solo"].title), ("done", "demo"))
 
+    def test_decision_waiting_or_blocked_overrides_a_done_header(self):
+        """A newer node that still needs someone must not be hidden by a stale 完成."""
+        self.write(self.status, "stale.md", status_text("舊表頭", status="完成", waiting_on=""))
+        self.write(self.decisions, "stale.md", decisions(
+            row("wait1", status="waiting", summary="等你選 A 或 B。")))
+        self.write(self.status, "stuck.md", status_text("卡住的線", status="告一段落"))
+        self.write(self.decisions, "stuck.md", decisions(
+            row("stuck1", status="blocked", summary="找不到憑證。")))
+        self.write(self.status, "agrees.md", status_text("真的完成", status="完成"))
+        self.write(self.decisions, "agrees.md", decisions(
+            row("done1", status="done", summary="已經收尾。")))
+        records = {record.name: record for record in self.build()}
+        self.assertEqual(records["stale"].state, line_status.WAITING)
+        self.assertEqual(records["stale"].decision_id, "wait1")
+        self.assertEqual(records["stuck"].state, line_status.BLOCKED)
+        self.assertEqual(records["agrees"].state, line_status.DONE)
+        # The merged states still sort attention first, so the card is never skipped.
+        self.assertEqual([record.name for record in self.build()][:2], ["stuck", "stale"])
+        # Decision text alone decides when the header says nothing; running never
+        # downgrades an explicitly finished header.
+        self.assertEqual(line_status.classify_state("", "", "waiting"), line_status.WAITING)
+        self.assertEqual(line_status.classify_state("", "", "running"), line_status.ACTIVE)
+        self.assertEqual(line_status.classify_state("完成", "", "running"), line_status.DONE)
+
+    def test_summaries_drop_internal_codes_but_keep_evidence(self):
+        self.write(self.status, "a.md", status_text("甲線"))
+        self.write(self.decisions, "a.md", decisions(
+            row("n1", status="running",
+                summary="P1-13 交給 tier-flash，K1 驗證。後面不用顯示。")))
+        self.write(self.status, "b.md", status_text("乙線", waiting_on="等回覆"))
+        self.write(self.decisions, "b.md", decisions(
+            row("n2", status="running",
+                summary="PR #47、#48 已合併；commit ac52b4d，4.88% 誤判。")))
+        records = {record.name: record for record in self.build()}
+        doing = records["a"].doing
+        self.assertIsNone(line_status.CODE_RE.search(doing), doing)
+        self.assertNotIn("P1-13", doing)
+        self.assertNotIn("tier-flash", doing)
+        self.assertNotIn("K1", doing)
+        self.assertIn("驗證", doing)
+        self.assertNotIn("後面不用顯示", doing)
+        kept = records["b"].doing
+        self.assertIsNone(line_status.CODE_RE.search(kept), kept)
+        self.assertIn("PR 47", kept)  # PR numbers stay, only the # goes
+        self.assertIn("ac52b4d", kept)
+        self.assertIn("4.88%", kept)
+        # Severity words are human vocabulary: they become words, not blanks.
+        self.write(self.status, "d.md", status_text("丁線"))
+        self.write(self.decisions, "d.md", decisions(
+            row("n4", status="running", summary="修完三個 P1，P1-13 留到下包。")))
+        severity = {r.name: r for r in self.build()}["d"].doing
+        self.assertIn("三個 必修", severity)
+        self.assertNotIn("P1-13", severity)
+        self.assertIsNone(line_status.CODE_RE.search(severity), severity)
+        # A summary that was nothing but codes falls back to a readable placeholder.
+        self.write(self.status, "c.md", status_text("丙線"))
+        self.write(self.decisions, "c.md", decisions(row("n3", status="running", summary="K1")))
+        self.assertEqual({r.name: r for r in self.build()}["c"].doing,
+                         line_status.FALLBACK_DOING[line_status.ACTIVE])
+
     @unittest.skipUnless((Path.home() / "Projects" / "status").is_dir(), "no real status")
     def test_real_status_and_decisions_produce_one_record_per_line(self):
         folder = Path.home() / "Projects" / "status"
@@ -100,5 +160,9 @@ class LineStatusTests(unittest.TestCase):
         self.assertEqual(states, sorted(states, key=line_status.STATE_ORDER.__getitem__))
         for record in records:
             self.assertIsNone(line_status.CODE_RE.search(record.title), record.title)
+            for field_name in ("doing", "blocked_on", "next_step"):
+                value = getattr(record, field_name)
+                self.assertIsNone(line_status.CODE_RE.search(value),
+                                  f"{record.name}.{field_name}: {value}")
             self.assertTrue(record.doing and record.blocked_on and record.next_step)
             self.assertNotIn("\n", record.doing + record.blocked_on + record.next_step)
