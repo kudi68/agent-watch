@@ -1,14 +1,38 @@
 """Tests for the 現況 data layer: status frontmatter + decisions -> one record per line."""
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import line_status
 
 HEADER = ("| date | id | parent | kind | spec | summary | decision | evidence "
           "| status | agent | merge_target |")
 SEPARATOR = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+# Chinese text and full-width punctuation: neither belongs to a path or a URL.
+CJK = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff01-\uff60]")
+
+
+def leftovers(value):
+    """Split a human field into (片段外的代號, 被保護範圍吃掉的代號).
+
+    The second list is the half the old check could not see: a code that sits right
+    after Chinese text and therefore only looks clean because a protected span grew
+    over the prose around it (看/tmp/R2.md後K1).
+    """
+    bare = line_status.KEEP_AS_WRITTEN_RE.sub("", value)
+    outside = [token.group(0) for token in line_status.CODE_RE.finditer(bare)
+               if line_status._is_step_code(token.group(0))]
+    inside = []
+    for match in line_status.KEEP_AS_WRITTEN_RE.finditer(value):
+        span = match.group(0)
+        for token in line_status.CODE_RE.finditer(span):
+            if (token.start() and CJK.match(span[token.start() - 1])
+                    and line_status._is_step_code(token.group(0))):
+                inside.append(token.group(0))
+    return outside, inside
 
 
 def status_text(name, status="進行中", waiting_on="", next_step="把下一件事做完。",
@@ -228,6 +252,68 @@ class LineStatusTests(unittest.TestCase):
         self.assertEqual(leftover(line_status.human_text("K1 看 /tmp/R2.md 與 USB3。")), [])
         self.assertEqual(leftover("獨立的 K1 沒清掉"), ["K1"])
 
+    def test_protected_path_stops_at_the_chinese_text_around_it(self):
+        """A path glued to Chinese prose keeps the path and still loses the code after it."""
+        self.assertEqual(line_status.human_text("看/tmp/R2.md後K1已修"), "看/tmp/R2.md後已修")
+        self.assertEqual(line_status.human_text("證據/tmp/R2.md與K1"), "證據/tmp/R2.md")
+        self.assertEqual(line_status.human_text("https://x.test/a和K1都好了"),
+                         "https://x.test/a和都好了")
+        self.assertEqual(line_status.human_text("看/tmp/R2.md後 K1 已修"), "看/tmp/R2.md後 已修")
+        # The Chinese in the middle of a path does not break the path that follows it.
+        self.assertEqual(line_status.human_text("K1 看 /tmp/報告/R2.md"), "看 /tmp/報告/R2.md")
+
+    def test_slash_between_two_words_is_not_a_path(self):
+        """`card-C08/repo` and `WP3/WP4` are words, not absolute paths starting at the /."""
+        self.assertEqual(line_status.human_text("card-C08/repo"), "card-repo")
+        self.assertEqual(line_status.human_text("沿用 card-C08/repo 4d5ac3e"),
+                         "沿用 card-repo 4d5ac3e")
+        self.assertEqual(line_status.human_text("WP3/WP4"), "")
+        self.assertEqual(line_status.human_text("base bd406c9＝WP3/WP4 前備份"),
+                         "base bd406c9＝前備份")
+        # A path that really starts a token is still a path, with or without a space.
+        self.assertEqual(line_status.human_text("K1 /tmp/R2.md"), "/tmp/R2.md")
+        self.assertEqual(line_status.human_text("看/tmp/報告/R2.md"), "看/tmp/報告/R2.md")
+        # A lowercase word/word pair is one identifier (not a path, not a code to cut),
+        # and a relative path with two slashes keeps its code-named file.
+        self.assertEqual(line_status.human_text("big 預設 group/tier-mid、白名單"),
+                         "big 預設 group/tier-mid、白名單")
+        self.assertEqual(line_status.human_text("repo/src/R2.md"), "repo/src/R2.md")
+
+    def test_leftover_codes_are_checked_outside_and_inside_protected_spans(self):
+        """Both halves matter: a code outside a span, and a code a span swallowed."""
+        self.assertEqual(leftovers(line_status.human_text("K1 看 /tmp/R2.md 與 USB3。")),
+                         ([], []))
+        self.assertEqual(leftovers("獨立的 K1 沒清掉"), (["K1"], []))
+        self.assertEqual(leftovers("/tmp/R2.md，K1"), (["K1"], []))
+        self.assertEqual(leftovers(line_status.human_text("看/tmp/R2.md後K1已修")), ([], []))
+        # 片段內那一半不是空轉：把保護範圍放寬成 P2-1 那樣，它就紅。
+        greedy = re.compile(r"(?:~|\.{0,2})/[^\s，。；：、！？]*")
+        with mock.patch.object(line_status, "KEEP_AS_WRITTEN_RE", greedy):
+            swallowed = line_status.human_text("看/tmp/R2.md後K1已修")
+            self.assertEqual(swallowed, "看/tmp/R2.md後K1已修")
+            self.assertEqual(leftovers(swallowed), ([], ["K1"]))
+
+    def test_paths_and_codes_through_the_whole_card_at_a_chinese_boundary(self):
+        """The boundary behaves the same when the text comes from a status file."""
+        self.write(self.status, "a.md", status_text(
+            "甲線", waiting_on="卡在/tmp/blocked.md，K1 沒拿掉",
+            next_step="看/tmp/R2.md後K1再說"))
+        self.write(self.decisions, "a.md", decisions(
+            row("n1", status="running", summary="沿用 card-C08/repo，K1 已完成")))
+        record = {item.name: item for item in self.build()}["a"]
+        self.assertEqual(record.doing, "沿用 card-repo，已完成")
+        self.assertEqual(record.blocked_on, "卡在/tmp/blocked.md，沒拿掉")
+        self.assertEqual(record.next_step, "看/tmp/R2.md後再說")
+        for field_name in ("doing", "blocked_on", "next_step"):
+            self.assertEqual(leftovers(getattr(record, field_name)), ([], []),
+                             getattr(record, field_name))
+
+    def test_titles_keep_a_path_whole(self):
+        """now_render calls human_title again, so a path in a title must survive it."""
+        self.assertEqual(line_status.human_title("/tmp/R2.md 的報告"), "/tmp/R2.md 的報告")
+        self.assertEqual(line_status.human_title("看 ./P2.txt 與 #14"), "看 ./P2.txt 與")
+        self.assertEqual(line_status.human_title("K1 單卡驗證"), "單卡驗證")
+
     @unittest.skipUnless((Path.home() / "Projects" / "status").is_dir(), "no real status")
     def test_real_status_and_decisions_produce_one_record_per_line(self):
         folder = Path.home() / "Projects" / "status"
@@ -245,10 +331,10 @@ class LineStatusTests(unittest.TestCase):
             self.assertIsNone(line_status.CODE_RE.search(record.title), record.title)
             for field_name in ("doing", "blocked_on", "next_step"):
                 value = getattr(record, field_name)
-                # Paths, URLs and product names are kept on purpose (/tmp/R2.md, USB3).
-                bare = line_status.KEEP_AS_WRITTEN_RE.sub("", value)
-                left = [token.group(0) for token in line_status.CODE_RE.finditer(bare)
-                        if line_status._is_step_code(token.group(0))]
-                self.assertEqual(left, [], f"{record.name}.{field_name}: {value}")
+                # Paths, URLs and product names are kept on purpose (/tmp/R2.md, USB3),
+                # so a code is looked for outside them and inside them separately: a span
+                # that grew over Chinese text would hide a code without failing either
+                # the old single check or the fidelity check.
+                self.assertEqual(leftovers(value), ([], []), f"{record.name}.{field_name}: {value}")
             self.assertTrue(record.doing and record.blocked_on and record.next_step)
             self.assertNotIn("\n", record.doing + record.blocked_on + record.next_step)

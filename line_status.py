@@ -21,9 +21,18 @@ SUMMARY_CODE_RE = re.compile(
 # use — a URL, an absolute or relative path, a file name, a long hyphenated branch name
 # — stays byte-for-byte, even when a step-code pattern matches inside it
 # (/tmp/R2.md, /tmp/aw-genkyo-c1c2-fix/REPORT.md, aw-genkyo-c1c2-fix).
+# Two boundaries keep such a span from growing over its neighbours:
+#   * a path starts either at a token boundary or at one of two or more `/`, so
+#     `card-C08/repo`, `WP3/WP4` and `4/5` are words (the `/` belongs to a word) while
+#     `K1 /tmp/R2.md` and `repo/src/R2.md` are still paths;
+#   * a span stops at Chinese text, so `/tmp/R2.md後K1` keeps the path and still cuts
+#     `K1` instead of hiding it inside the protected span.
+_STOP = r"\s，。；：、！？（）「」『』【】《》\u2e80-\u9fff\uf900-\ufaff\uff01-\uff60"
 KEEP_AS_WRITTEN_RE = re.compile(
-    r"(?:[a-z][a-z0-9+.-]*://[^\s，。；：、！？（）「」『』【】《》]+"
-    r"|(?:~|\.{0,2})/[^\s，。；：、！？（）「」『』【】《》]*"
+    rf"(?:[a-z][a-z0-9+.-]*://[^{_STOP}]+"
+    rf"|(?:(?<![A-Za-z0-9_-])(?:~|\.{{0,2}})/"
+    rf"|(?:~|\.{{0,2}})/[^{_STOP}\s]*?/)[^{_STOP}]*"
+    r"|[a-z][a-z0-9_-]*/[a-z0-9][a-z0-9_.-]*"
     r"|[A-Za-z0-9_.-]*[A-Za-z0-9_-]\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])"
     r"|[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+){2,})")
 # Letter+digit tokens that are product/standard names (USB3, S3) rather than board
@@ -103,6 +112,11 @@ def _close_gaps(text: str) -> str:
     text = re.sub(rf"{GAP}\s*(?={closing})", "", text)
     text = re.sub(rf"^{GAP}\s*", "", text)
     text = re.sub(rf"\s*{GAP}\s*$", "", text)
+    # A code inside a hyphenated word (card-C08/repo) leaves no gap at all.
+    text = re.sub(rf"(?<=-){GAP}", "", text)
+    # A code wedged between two Chinese characters was not a separate word: no space.
+    text = re.sub(rf"(?<=[\u2e80-\u9fff\uf900-\ufaff\uff01-\uff60]){GAP}\s*"
+                  rf"(?=[\u2e80-\u9fff\uf900-\ufaff\uff01-\uff60])", "", text)
     return text
 
 
@@ -160,10 +174,23 @@ def human_text(text: str, limit: int = 90) -> str:
     return one_sentence(cleaned, limit)
 
 
+def _without_codes(text: str) -> str:
+    """Cut step codes out of a title, but leave a path or branch name whole."""
+    protected: List[str] = []
+
+    def stash(match):
+        protected.append(match.group(0))
+        return f"{PLACEHOLDER_OPEN}{len(protected) - 1}{PLACEHOLDER_CLOSE}"
+
+    kept = CODE_RE.sub(" ", KEEP_AS_WRITTEN_RE.sub(stash, text))
+    return re.sub(f"{PLACEHOLDER_OPEN}(\\d+){PLACEHOLDER_CLOSE}",
+                  lambda match: protected[int(match.group(1))], kept)
+
+
 def human_title(name: str, project: str = "", fallback: str = "") -> str:
     """Never leave an internal code (K1, P1-13) as the title."""
     for candidate in (name, project, fallback):
-        cleaned = " ".join(CODE_RE.sub(" ", candidate or "").split()).strip(" ·-—:：,，")
+        cleaned = " ".join(_without_codes(candidate or "").split()).strip(" ·-—:：,，")
         cleaned = re.sub(r"\s*決策節點$", "", cleaned)
         if cleaned:
             return cleaned
