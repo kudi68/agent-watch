@@ -1184,13 +1184,7 @@ def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
 def question_is_active(question: Optional[Dict[str, Any]],
                        completion_time: Optional[float] = None) -> bool:
     """An unanswered question is attention until a matching ANSWER.md exists."""
-    if not question or question.get("answered"):
-        return False
-    asked = question.get("asked_at_ts") or question.get("mtime") or 0
-    if completion_time is not None and asked <= completion_time:
-        # A leftover question older than the finished run belongs to an older run.
-        return False
-    return True
+    return bool(question and not question.get("answered"))
 
 
 def question_escalated(question: Optional[Dict[str, Any]],
@@ -4066,11 +4060,19 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
-SUPERSEDED_SUFFIX_RE = re.compile(r"(?:-retry|-claude|-rerun|-redo|-fix|-v\d+|-?\d+)$", re.IGNORECASE)
+SUPERSEDED_SUFFIX_RE = re.compile(
+    r"(?:-(?:retry|claude|rerun|redo|fix|p\d+|v\d+)|-?\d+)$",
+    re.IGNORECASE,
+)
 
 
 def _normalized_task_name(name: str) -> str:
-    return SUPERSEDED_SUFFIX_RE.sub("", name.casefold())
+    normalized = name.casefold()
+    while True:
+        stripped = SUPERSEDED_SUFFIX_RE.sub("", normalized)
+        if stripped == normalized:
+            return normalized
+        normalized = stripped
 
 
 def _replacement_time(agent: AgentInfo) -> float:
@@ -4079,16 +4081,27 @@ def _replacement_time(agent: AgentInfo) -> float:
     return agent.start_time or agent.log_mtime or 0.0
 
 
+def _same_known_project(left: AgentInfo, right: AgentInfo) -> bool:
+    return bool(
+        left.project and right.project
+        and left.project != PROJECT_OTHER
+        and right.project != PROJECT_OTHER
+        and left.project == right.project
+    )
+
+
 def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
     """Map an actionable old task key to a successful or running replacement key."""
     result: Dict[str, str] = {}
     replaceable = [
         agent for agent in agents
-        if agent.status in ATTENTION_FAILURE_STATUSES or agent.status == "question"
+        if agent.status in ATTENTION_FAILURE_STATUSES
+        and not question_is_active(agent.question, agent.completion_time)
     ]
     replacements = [
         agent for agent in agents
         if agent.status in SUPERSEDED_REPLACEMENT_STATUSES
+        and not question_is_active(agent.question, agent.completion_time)
     ]
 
     for old in replaceable:
@@ -4106,6 +4119,7 @@ def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
             matches = [
                 agent for agent in replacements
                 if agent.key != old.key
+                and _same_known_project(old, agent)
                 and agent.name.casefold() == old.name.casefold()
                 and agent.start_time is not None
                 and (old.start_time is None or agent.start_time > old.start_time)
@@ -4116,11 +4130,20 @@ def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
         if target is None and old.completion_time is not None:
             old_family = _normalized_task_name(old.name)
             matches = [
-                agent for agent in agents
+                agent for agent in replacements
                 if agent.key != old.key
-                and agent.status in SUPERSEDED_SUCCESS_STATUSES
-                and agent.completion_time is not None
-                and agent.completion_time > old.completion_time
+                and _same_known_project(old, agent)
+                and (
+                    (
+                        agent.status == "running"
+                        and _replacement_time(agent) > old.completion_time
+                    )
+                    or (
+                        agent.status in SUPERSEDED_SUCCESS_STATUSES
+                        and agent.completion_time is not None
+                        and agent.completion_time > old.completion_time
+                    )
+                )
                 and _normalized_task_name(agent.name) == old_family
                 and agent.name.casefold() != old.name.casefold()
             ]
@@ -4249,15 +4272,6 @@ class WatchState:
             and entry.get("dismissed_sig") == self.dismissed_signature(agent)
         )
 
-    def _question_is_stale(self, agent: AgentInfo, now: float) -> bool:
-        question = agent.question
-        if not question_is_active(question, agent.completion_time):
-            return False
-        if agent.process_alive is True:
-            return False
-        asked = question.get("asked_at_ts") or question.get("mtime") or 0
-        return bool(asked and now - asked > STALE_ATTENTION_SECONDS)
-
     def remember_escalation(self, agent: AgentInfo, question: Optional[Dict[str, Any]] = None,
                             target: str = "") -> bool:
         """Remember the hand-off so a later normal answer can name who answered."""
@@ -4290,14 +4304,14 @@ class WatchState:
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the history label for a dismissed, expired, or replaced task."""
+        if question_is_active(agent.question, agent.completion_time):
+            return ""
         if agent.status == "running":
             return ""
         if self._dismissed(agent):
             return "已清除"
         if agent.key in self._superseded:
             return "已被取代"
-        if self._question_is_stale(agent, now):
-            return "已過期"
         if agent.status in ATTENTION_FAILURE_STATUSES:
             timestamp = agent.completion_time or agent.log_mtime
             if timestamp and now - timestamp > STALE_ATTENTION_SECONDS:
@@ -4429,15 +4443,10 @@ class WatchState:
                 self.warning = cleanup_warning
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
+        if question_is_active(agent.question, agent.completion_time):
+            return "attention"
         if agent.status == "running":
             return "running"
-        active_question = question_is_active(agent.question, agent.completion_time)
-        if (
-            active_question and not self._dismissed(agent)
-            and agent.key not in self._superseded
-            and not self._question_is_stale(agent, now)
-        ):
-            return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
             return "history"
@@ -4457,6 +4466,8 @@ class WatchState:
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
+            if question_is_active(agent.question, agent.completion_time):
+                return False, "尚未收到這題的有效 ANSWER.md，不能清除"
             if agent.status == "running" or bucket == "running":
                 return False, "進行中的任務不能清除"
             if bucket != "attention" and disposition not in ("已過期", "已被取代"):
@@ -4512,6 +4523,8 @@ class WatchState:
         """Clear only expired or superseded tasks after the caller confirms."""
         count = 0
         for agent in agents:
+            if question_is_active(agent.question, agent.completion_time):
+                continue
             if self.stale_info(agent, now) not in ("已過期", "已被取代"):
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)

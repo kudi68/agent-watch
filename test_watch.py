@@ -1793,6 +1793,45 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             for agent in agents:
                 self.assertNotIn(agent.name, self.screen_text(app))
 
+    async def test_x_cannot_clear_unanswered_question(self):
+        question_dir = tempfile.TemporaryDirectory(prefix="aw-question-x-")
+        self.addCleanup(question_dir.cleanup)
+        question_root = Path(question_dir.name)
+        (question_root / "QUESTION.md").write_text(
+            "# QUESTION\n"
+            "id: q1\n"
+            "asked_at: 2026-10-24T00:00:00Z\n"
+            "question: 要先修 A 還是 B？\n"
+            "options:\n"
+            "- A: 先修 A\n"
+            "- B: 先修 B\n",
+            encoding="utf-8",
+        )
+        agent = self.fixture_agents()[4]
+        agent.status = "question"
+        agent.completion_time = self.now - 60
+        agent.question = watch.read_task_question(question_root)
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
+            self.assertFalse((question_root / "ANSWER.md").exists())
+
+            self.assertTrue(watch.write_answer_file(
+                question_root, agent.question, "A", now=self.now,
+            )[0])
+            agent.question = watch.read_task_question(question_root)
+            agent.status = "complete"
+            self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
+            self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
+
     async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
         agents = self.fixture_agents()[5:7]
         agents[0].log_lines = [
@@ -2401,6 +2440,122 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             print("v10-s3 fixture state isolated; TSV bytes and mtime_ns UNCHANGED")
 
 
+class SupersessionTests(unittest.TestCase):
+    def make_agent(self, name, status, *, project="agent-watch", start=100,
+                   completion=None, question=None):
+        return AgentInfo(
+            name=name, log_path=Path("/dev/null"), last_path=Path("/dev/null"),
+            status=status, model="fixture", start_time=start, elapsed="00:01:00",
+            latest=name, key=f"{name}::{project}::{status}", project=project,
+            completion_time=completion, question=question,
+        )
+
+    def make_state(self):
+        directory = tempfile.TemporaryDirectory(prefix="aw-superseded-state-")
+        self.addCleanup(directory.cleanup)
+        return watch.WatchState(Path(directory.name) / "state.json")
+
+    def test_suffix_normalization_strips_multiple_layers(self):
+        self.assertEqual(
+            watch._normalized_task_name("claude-perm-p2-fix2-retry-3"),
+            "claude-perm",
+        )
+
+    def test_running_fix2_hands_off_old_failed_card(self):
+        old = self.make_agent(
+            "claude-perm-p2-fix", "failed", start=100, completion=200,
+        )
+        replacement = self.make_agent(
+            "claude-perm-p2-fix2", "running", start=201,
+        )
+        state = self.make_state()
+        state.reconcile([old, replacement], 210)
+        self.assertEqual(watch.compute_superseded([old, replacement]), {
+            old.key: replacement.key,
+        })
+        self.assertEqual(state.stale_info(old, 210), "已被取代")
+        self.assertEqual(state.bucket(old, 210), "history")
+
+    def test_failed_fix2_does_not_hide_old_failed_card(self):
+        old = self.make_agent(
+            "claude-perm-p2-fix", "failed", start=100, completion=200,
+        )
+        replacement = self.make_agent(
+            "claude-perm-p2-fix2", "failed", start=201, completion=300,
+        )
+        state = self.make_state()
+        state.reconcile([old, replacement], 310)
+        self.assertNotIn(old.key, watch.compute_superseded([old, replacement]))
+        self.assertEqual(state.bucket(old, 310), "attention")
+
+    def test_completed_fix2_hands_off_old_failed_card(self):
+        old = self.make_agent(
+            "claude-perm-p2-fix", "failed", start=100, completion=200,
+        )
+        replacement = self.make_agent(
+            "claude-perm-p2-fix2", "complete", start=201, completion=300,
+        )
+        state = self.make_state()
+        state.reconcile([old, replacement], 310)
+        self.assertEqual(state.bucket(old, 310), "history")
+        self.assertEqual(state.stale_info(old, 310), "已被取代")
+
+    def test_name_matching_never_crosses_project_boundary(self):
+        old = self.make_agent(
+            "claude-perm-p2-fix", "failed", start=100, completion=200,
+        )
+        for name in (old.name, "claude-perm-p2-fix2"):
+            with self.subTest(replacement_name=name):
+                replacement = self.make_agent(
+                    name, "running", project="personal-ai-os", start=300,
+                )
+                self.assertNotIn(
+                    old.key, watch.compute_superseded([old, replacement]),
+                )
+
+    def test_name_matching_requires_a_known_project(self):
+        for project in (watch.PROJECT_OTHER, ""):
+            with self.subTest(project=project):
+                old = self.make_agent(
+                    "claude-perm-p2-fix", "failed", project=project,
+                    start=100, completion=200,
+                )
+                replacement = self.make_agent(
+                    "claude-perm-p2-fix2", "running",
+                    project=project, start=300,
+                )
+                self.assertNotIn(
+                    old.key,
+                    watch.compute_superseded([old, replacement]),
+                )
+
+    def test_unanswered_question_is_neither_source_nor_replacement(self):
+        pending = dict(id="q1", answered=False, asked_at_ts=150)
+        old_question = self.make_agent(
+            "claude-perm-p2-fix", "question", start=100, completion=200,
+            question=pending,
+        )
+        running = self.make_agent(
+            "claude-perm-p2-fix2", "running", start=201,
+        )
+        self.assertNotIn(
+            old_question.key,
+            watch.compute_superseded([old_question, running]),
+        )
+
+        failed = self.make_agent(
+            "other-task-fix", "failed", start=100, completion=200,
+        )
+        pending_replacement = self.make_agent(
+            "other-task-fix2", "complete", start=201, completion=300,
+            question=pending,
+        )
+        self.assertNotIn(
+            failed.key,
+            watch.compute_superseded([failed, pending_replacement]),
+        )
+
+
 class TestQuestionFiles(unittest.TestCase):
     """SPEC §3.3: QUESTION.md / ANSWER.md parsing and atomic answering."""
 
@@ -2470,13 +2625,20 @@ class TestQuestionFiles(unittest.TestCase):
         self.assertEqual(list(self.root.glob("*.tmp")), [])
         self.assertTrue(watch.read_task_question(self.root)["answered"])
 
-    def test_stale_question_after_completion_is_not_active(self):
+    def test_question_stays_active_until_matching_answer_even_after_completion(self):
         (self.root / "QUESTION.md").write_text(self.QUESTION)
         question = watch.read_task_question(self.root)
         self.assertTrue(watch.question_is_active(question, completion_time=question["asked_at"] - 60))
-        self.assertFalse(watch.question_is_active(question, completion_time=question["asked_at"] + 60))
-        question["answered"] = True
-        self.assertFalse(watch.question_is_active(question))
+        self.assertTrue(watch.question_is_active(question, completion_time=question["asked_at"] + 60))
+        self.assertTrue(watch.question_is_active(
+            question, completion_time=question["asked_at"] + watch.STALE_ATTENTION_SECONDS + 60,
+        ))
+        (self.root / "ANSWER.md").write_text("# ANSWER\nid: q9\nchoice: B\n")
+        self.assertTrue(watch.question_is_active(
+            watch.read_task_question(self.root), completion_time=question["asked_at"] + 60,
+        ))
+        self.assertTrue(watch.write_answer_file(self.root, question, "B")[0])
+        self.assertFalse(watch.question_is_active(watch.read_task_question(self.root)))
 
     def test_tsv_question_status_and_answer_clears_attention(self):
         now = parse_timestamp("2026-10-25T10:10:00Z")

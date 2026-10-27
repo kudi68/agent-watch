@@ -190,7 +190,8 @@ class AttentionStateTests(unittest.TestCase):
             }):
                 self.assertEqual(watch._stale_attention_seconds_from_env(), expected)
 
-    def agent(self, key, name, status, *, start=None, completion=None, log_mtime=None,
+    def agent(self, key, name, status, *, project=watch.PROJECT_OTHER,
+              start=None, completion=None, log_mtime=None,
               question=None, process_alive=None, superseded_hint=""):
         return watch.AgentInfo(
             name=name,
@@ -207,6 +208,7 @@ class AttentionStateTests(unittest.TestCase):
             question=question,
             process_alive=process_alive,
             superseded_hint=superseded_hint,
+            project=project,
         )
 
     def test_old_failures_expire_but_recent_failures_stay_attention(self):
@@ -233,14 +235,16 @@ class AttentionStateTests(unittest.TestCase):
         self.assertEqual(self.state.stale_info(old, self.now), "已被取代")
 
     def test_retry_suffix_replacement_and_review_number_guard(self):
-        original = self.agent("foo", "foo", "failed", start=self.now - 500,
+        original = self.agent("foo", "foo", "failed", project="agent-watch",
+                              start=self.now - 500,
                               completion=self.now - 400)
-        retry = self.agent("foo-retry", "foo-retry", "complete", start=self.now - 300,
+        retry = self.agent("foo-retry", "foo-retry", "complete",
+                           project="agent-watch", start=self.now - 300,
                            completion=self.now - 100)
         review2 = self.agent("review2", "foo-review2", "complete",
-                             completion=self.now - 50)
+                             project="agent-watch", completion=self.now - 50)
         review = self.agent("review", "foo-review", "complete",
-                            completion=self.now - 20)
+                            project="agent-watch", completion=self.now - 20)
         mapping = watch.compute_superseded([original, retry, review2, review])
         self.assertEqual(mapping, {"foo": "foo-retry"})
 
@@ -263,7 +267,9 @@ class AttentionStateTests(unittest.TestCase):
         question = {"id": "q1", "asked_at_ts": self.now - 60, "answered": False}
         agent = self.agent("question", "question-task", "question", question=question)
         self.state.reconcile([agent], self.now)
-        self.assertTrue(self.state.apply("dismiss", agent, [agent], self.now)[0])
+        ok, message = self.state.apply("dismiss", agent, [agent], self.now)
+        self.assertFalse(ok)
+        self.assertIn("尚未收到這題的有效 ANSWER.md", message)
         agent.question = {"id": "q2", "asked_at_ts": self.now - 30, "answered": False}
         self.state.reconcile([agent], self.now)
         self.assertEqual(self.state.bucket(agent, self.now), "attention")
@@ -282,13 +288,14 @@ class AttentionStateTests(unittest.TestCase):
         ok, _ = self.state.apply("dismiss", agent, [agent], self.now)
         self.assertFalse(ok)
 
-    def test_orphan_question_older_than_24_hours_is_history(self):
+    def test_orphan_question_older_than_24_hours_remains_attention(self):
         question = {"id": "q-orphan", "asked_at_ts": self.now - 25 * 3600,
                     "answered": False}
         agent = self.agent("orphan", "orphan-task", "question", question=question)
         self.state.reconcile([agent], self.now)
-        self.assertEqual(self.state.bucket(agent, self.now), "history")
-        self.assertEqual(self.state.stale_info(agent, self.now), "已過期")
+        self.assertTrue(watch.question_is_active(question, agent.completion_time))
+        self.assertEqual(self.state.bucket(agent, self.now), "attention")
+        self.assertEqual(self.state.stale_info(agent, self.now), "")
 
     def test_old_state_without_dismissed_and_corrupt_state_load_safely(self):
         self.state_path.write_text(
@@ -313,17 +320,19 @@ class AttentionStateTests(unittest.TestCase):
         agent = self.agent("question-files", "question-files", "question", question=question)
         self.state.reconcile([agent], self.now)
         ok, message = self.state.apply("dismiss", agent, [agent], self.now)
-        self.assertTrue(ok)
-        self.assertIn("不會刪除或修改", message)
+        self.assertFalse(ok)
+        self.assertIn("尚未收到這題的有效 ANSWER.md", message)
         self.assertEqual(question_path.read_text(encoding="utf-8"), "question bytes\n")
         self.assertEqual(answer_path.read_text(encoding="utf-8"), "answer bytes\n")
 
     def test_bulk_dismiss_only_targets_stale_or_superseded(self):
         stale = self.agent("stale", "stale-task", "failed",
                            completion=self.now - 48 * 3600)
-        replaced = self.agent("replaced", "foo", "failed", start=self.now - 500,
+        replaced = self.agent("replaced", "foo", "failed", project="agent-watch",
+                              start=self.now - 500,
                               completion=self.now - 400)
-        winner = self.agent("winner", "foo-retry", "complete", start=self.now - 300,
+        winner = self.agent("winner", "foo-retry", "complete",
+                            project="agent-watch", start=self.now - 300,
                             completion=self.now - 100)
         fresh = self.agent("fresh", "fresh-task", "failed",
                            completion=self.now - 23 * 3600)
