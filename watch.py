@@ -5,6 +5,7 @@ import argparse
 import calendar
 import copy
 import json
+import logging
 import math
 import os
 import re
@@ -63,6 +64,11 @@ ARCHITECTURE_PATH = _env_path(
 MAGPIE_COMMAND = os.environ.get("AGENT_WATCH_MAGPIE", "magpie")
 # Daily tok/s per model/tier, long format (see tok_speed.py).
 DEFAULT_TOKS_TSV = _env_path("AGENT_WATCH_TOKS_TSV", ROOT_DIR / "agent-watch-toks.tsv")
+
+
+def daily_stats_path_from_env() -> Path:
+    """Resolve the daily stats path without making tests write to the live root."""
+    return _env_path("AGENT_WATCH_DAILY", ROOT_DIR / "agent-watch-daily.tsv")
 
 
 def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -927,8 +933,10 @@ def write_daily_stats(
     columns = list(DAILY_STATS_COLUMNS)
     preserved: List[str] = []
     today: Dict[str, str] = {}
+    existing_text: Optional[str] = None
     if target.is_file():
-        for line in target.read_text(encoding="utf-8").splitlines():
+        existing_text = target.read_text(encoding="utf-8")
+        for line in existing_text.splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
             parts = line.split("\t")
@@ -950,6 +958,9 @@ def write_daily_stats(
     dated.append((day, "\t".join(today.get(column, "") for column in columns)))
     dated.sort(key=lambda item: item[0])
     body = ["\t".join(columns)] + [line for _, line in dated]
+    content = "\n".join(body) + "\n"
+    if existing_text == content:
+        return target
     try:
         existing_mode: Optional[int] = target.stat().st_mode & 0o777
     except OSError:
@@ -962,7 +973,7 @@ def write_daily_stats(
     temporary = Path(temporary_name)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            stream.write("\n".join(body) + "\n")
+            stream.write(content)
         # `mkstemp` always creates 0600; hand the file the mode a normal write
         # would have used, so a reader that could open the old TSV still can.
         os.chmod(
@@ -6313,6 +6324,7 @@ class AgentWatchApp(App):
         state_path: Optional[Path] = None,
         decisions_path: Optional[Path] = None,
         toks_svc: Optional[tok_speed.TokSpeedService] = None,
+        daily_stats_path: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
@@ -6323,6 +6335,9 @@ class AgentWatchApp(App):
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.decision_svc = DecisionService(decisions_path)
+        self.daily_stats_path = (
+            Path(daily_stats_path) if daily_stats_path is not None else None
+        )
         # tok/s is off unless main() passes a service, so tests never run magpie
         # or write the live daily TSV by accident.
         self.toks_svc = toks_svc
@@ -7247,6 +7262,23 @@ class AgentWatchApp(App):
             now,
         )
         data_changed = current_snapshot != self.last_snapshot
+        counts = {key: 0 for key in ("attention", "handoff", "running", "recent", "history", "hidden")}
+        for agent in agents:
+            counts[self.state.bucket(agent, now)] += 1
+        if self.daily_stats_path is not None:
+            try:
+                row = daily_attention_row(agents, self.state, now)
+                write_daily_stats(
+                    self.daily_stats_path,
+                    agents,
+                    now=now,
+                    row=row,
+                    owned_columns=N7_DAILY_STATS_COLUMNS,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "daily stats update failed: %s", exc
+                )
         if not data_changed:
             if self._ui_ready:
                 self.update_quota_charts(quota_raw, quota_stale, now)
@@ -7260,9 +7292,6 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        counts = {key: 0 for key in ("attention", "handoff", "running", "recent", "history", "hidden")}
-        for agent in agents:
-            counts[self.state.bucket(agent, now)] += 1
         stats_str = (
             f"需處理 {counts['attention']} │ 已接手 {counts['handoff']} │ 進行中 {counts['running']} │ "
             f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
@@ -7322,6 +7351,7 @@ def main():
     app = AgentWatchApp(
         runs_path=runs_p, done_path=done_p,
         toks_svc=tok_speed.TokSpeedService(tsv_path=DEFAULT_TOKS_TSV),
+        daily_stats_path=daily_stats_path_from_env(),
     )
     app.run()
     return 0

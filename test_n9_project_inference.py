@@ -570,5 +570,129 @@ class DailyStatsTests(unittest.TestCase):
             self.assertTrue(target.is_file())
 
 
+class DailyStatsIntegrationTests(unittest.TestCase):
+    def day_start(self, year=2026, month=10, day=28):
+        return time.mktime((year, month, day, 0, 0, 0, 0, 0, -1))
+
+    def agent(self, now, status="complete", key="today"):
+        return watch.AgentInfo(
+            name=key,
+            log_path=Path("/tmp") / key / "run.log",
+            last_path=Path("/tmp") / key / "REPORT.md",
+            status=status,
+            model="test",
+            start_time=now - 60,
+            elapsed="1m",
+            latest=status,
+            log_mtime=now,
+            key=key,
+            completion_time=now - 30 if status == "complete" else None,
+            project="other",
+            project_source="未判斷",
+            start_source="tsv",
+        )
+
+    def test_daily_path_uses_env_override_and_root_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            override = Path(tmp) / "override.tsv"
+            with patch.object(watch, "ROOT_DIR", root), patch.dict(
+                os.environ, {"AGENT_WATCH_DAILY": str(override)}
+            ):
+                self.assertEqual(watch.daily_stats_path_from_env(), override)
+            with patch.object(watch, "ROOT_DIR", root), patch.dict(os.environ):
+                os.environ.pop("AGENT_WATCH_DAILY", None)
+                self.assertEqual(
+                    watch.daily_stats_path_from_env(),
+                    root / "agent-watch-daily.tsv",
+                )
+
+    def test_update_data_writes_changed_today_once_and_preserves_other_columns(self):
+        day = self.day_start()
+        older_day = day - 86400
+        now = day + 8 * 3600
+        older_agent = self.agent(older_day + 3600, key="older")
+        today_agent = self.agent(now)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "agent-watch-daily.tsv"
+            watch.write_daily_stats(
+                target, [older_agent], day_start=older_day, now=older_day + 86400,
+            )
+            watch.write_daily_stats(
+                target, [today_agent], day_start=day, now=now,
+            )
+            old_date = time.strftime("%Y-%m-%d", time.localtime(older_day))
+            old_line = next(
+                line for line in target.read_text(encoding="utf-8").splitlines()
+                if line.startswith(old_date + "\t")
+            )
+            current_agents = [today_agent]
+            app = watch.AgentWatchApp(
+                runs_path=root / "runs.tsv",
+                done_path=root / "done.tsv",
+                state_path=root / "state.json",
+                decisions_path=root / "decisions",
+                daily_stats_path=target,
+            )
+            with patch.object(
+                watch, "load_all_agents",
+                side_effect=lambda *args: (current_agents, []),
+            ), patch.object(
+                watch, "notify_completion",
+            ):
+                self.assertTrue(app.update_data(now=now))
+                first_text = target.read_text(encoding="utf-8")
+                first_stat = target.stat()
+
+                self.assertFalse(app.update_data(now=now + 1))
+                self.assertEqual(target.read_text(encoding="utf-8"), first_text)
+                self.assertEqual(target.stat().st_mtime_ns, first_stat.st_mtime_ns)
+
+                today_agent.status = "blocked"
+                today_agent.latest = "blocked"
+                self.assertTrue(app.update_data(now=now + 2))
+
+            lines = target.read_text(encoding="utf-8").splitlines()
+            header = lines[0].split("\t")
+            today_date = time.strftime("%Y-%m-%d", time.localtime(now))
+            today_lines = [
+                line for line in lines[1:]
+                if line.split("\t", 1)[0] == today_date
+            ]
+            self.assertEqual(len(today_lines), 1)
+            values = dict(zip(header, today_lines[0].split("\t")))
+            self.assertEqual(values["other_count"], "1")
+            self.assertEqual(values["basis_未判斷"], "1")
+            self.assertEqual(values["blocked"], "1")
+            self.assertTrue(set(watch.N7_DAILY_STATS_COLUMNS) <= set(header))
+            self.assertTrue(set(watch.DAILY_STATS_COLUMNS) <= set(header))
+            self.assertEqual(
+                next(line for line in lines[1:] if line.startswith(old_date + "\t")),
+                old_line,
+            )
+            self.assertNotEqual(target.read_text(encoding="utf-8"), first_text)
+
+    def test_update_data_logs_writer_failure_and_continues(self):
+        now = self.day_start() + 8 * 3600
+        agent = self.agent(now)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = watch.AgentWatchApp(
+                runs_path=root / "runs.tsv",
+                done_path=root / "done.tsv",
+                state_path=root / "state.json",
+                decisions_path=root / "decisions",
+                daily_stats_path=root / "agent-watch-daily.tsv",
+            )
+            with patch.object(
+                watch, "load_all_agents", return_value=([agent], [])
+            ), patch.object(
+                watch, "write_daily_stats", side_effect=OSError("write blocked")
+            ), self.assertLogs("watch", level="WARNING") as logged:
+                self.assertTrue(app.update_data(now=now))
+            self.assertIn("daily stats update failed", logged.output[0])
+
+
 if __name__ == "__main__":
     unittest.main()
