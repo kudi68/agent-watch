@@ -160,6 +160,24 @@
       "repo_names": [],
       "default_view": "now"
     },
+    "hermes-webui": {
+      "label": "hermes-webui",
+      "aliases": [],
+      "match_keywords": [
+        "hermes-webui",
+        "hermes webui"
+      ],
+      "path_keywords": [
+        "hermes-webui"
+      ],
+      "repo_paths": [
+        "Projects/hermes-webui"
+      ],
+      "repo_names": [
+        "hermes-webui"
+      ],
+      "default_view": "now"
+    },
     "hermes": {
       "label": "Hermes",
       "aliases": [
@@ -174,6 +192,165 @@
       "repo_paths": [],
       "repo_names": [
         "hermes"
+      ],
+      "default_view": "now"
+    },
+    "medical-tools": {
+      "label": "medical-tools",
+      "aliases": [],
+      "match_keywords": [
+        "medical-tools",
+        "medtool",
+        "medreader"
+      ],
+      "path_keywords": [
+        "medical-tools"
+      ],
+      "repo_paths": [
+        "Projects/medical-tools"
+      ],
+      "repo_names": [
+        "medical-tools"
+      ],
+      "default_view": "now"
+    },
+    "medknowledge": {
+      "label": "MedKnowledge",
+      "aliases": [],
+      "match_keywords": [
+        "medknowledge"
+      ],
+      "path_keywords": [
+        "MedKnowledge"
+      ],
+      "repo_paths": [
+        "Projects/MedKnowledge"
+      ],
+      "repo_names": [
+        "MedKnowledge"
+      ],
+      "default_view": "now"
+    },
+    "clinical-notes": {
+      "label": "clinical-notes",
+      "aliases": [],
+      "match_keywords": [
+        "clinical-notes"
+      ],
+      "path_keywords": [
+        "clinical-notes"
+      ],
+      "repo_paths": [
+        "Projects/clinical-notes"
+      ],
+      "repo_names": [
+        "clinical-notes"
+      ],
+      "default_view": "now"
+    },
+    "textbook-to-note": {
+      "label": "textbook-to-note",
+      "aliases": [],
+      "match_keywords": [
+        "textbook-to-note"
+      ],
+      "path_keywords": [
+        "textbook-to-note"
+      ],
+      "repo_paths": [
+        "Projects/textbook-to-note"
+      ],
+      "repo_names": [
+        "textbook-to-note"
+      ],
+      "default_view": "now"
+    },
+    "namerun": {
+      "label": "namerun",
+      "aliases": [],
+      "match_keywords": [
+        "namerun"
+      ],
+      "path_keywords": [
+        "namerun"
+      ],
+      "repo_paths": [
+        "Projects/namerun"
+      ],
+      "repo_names": [
+        "namerun"
+      ],
+      "default_view": "now"
+    },
+    "ai-status": {
+      "label": "ai-status",
+      "aliases": [],
+      "match_keywords": [
+        "ai-status"
+      ],
+      "path_keywords": [
+        "ai-status"
+      ],
+      "repo_paths": [
+        "Projects/ai-status"
+      ],
+      "repo_names": [
+        "ai-status"
+      ],
+      "default_view": "now"
+    },
+    "personal-capture": {
+      "label": "personal-capture",
+      "aliases": [],
+      "match_keywords": [
+        "personal-capture",
+        "personal_capture"
+      ],
+      "path_keywords": [
+        "personal_capture"
+      ],
+      "repo_paths": [
+        "Projects/personal_capture"
+      ],
+      "repo_names": [
+        "personal_capture",
+        "personal-capture"
+      ],
+      "default_view": "now"
+    },
+    "kudi68-domain-infra": {
+      "label": "kudi68-domain-infra",
+      "aliases": [],
+      "match_keywords": [
+        "kudi68-domain-infra"
+      ],
+      "path_keywords": [
+        "kudi68-domain-infra"
+      ],
+      "repo_paths": [
+        "Projects/kudi68-domain-infra"
+      ],
+      "repo_names": [
+        "kudi68-domain-infra"
+      ],
+      "default_view": "now"
+    },
+    "agent-ops-pinned": {
+      "label": "agent-ops-pinned",
+      "aliases": [],
+      "match_keywords": [
+        "agent-ops-pinned",
+        "agent-ops-host-pinned"
+      ],
+      "path_keywords": [
+        "agent-ops-host-pinned-bb7a091"
+      ],
+      "repo_paths": [
+        "Projects/agent-ops-host-pinned-bb7a091"
+      ],
+      "repo_names": [
+        "agent-ops-host-pinned-bb7a091",
+        "agent-ops-pinned"
       ],
       "default_view": "now"
     },

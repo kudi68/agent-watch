@@ -1372,7 +1372,9 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set(data["projects"]),
             {"personal-ai-os", "agent-watch", "ios-shortcuts", "c1-runtime",
              "m5-coding-canary", "M5-setup", "agentq-canary", "K1", "hermes",
-             "night", "other"},
+             "hermes-webui", "medical-tools", "medknowledge", "clinical-notes",
+             "textbook-to-note", "namerun", "ai-status", "personal-capture",
+             "kudi68-domain-infra", "agent-ops-pinned", "night", "other"},
         )
         self.assertEqual(
             set(data["projects"]["night"]),
@@ -2712,6 +2714,58 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         old, _, _, _, state = self.review_case(review="FAIL\n")
         self.assertEqual(state.bucket(old, self.now), "attention")
         self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_review_fail_can_be_dismissed_without_clearing_another_failure(self):
+        old, _, reviewer, agents, state = self.review_case(review="FAIL\n")
+        other_old = self.agent("independent-task-fix", "failed",
+                               completion_time=self.now - 600)
+        other_fix = self.agent("independent-task-fix2", "complete",
+                               start_time=self.now - 300, completion_time=self.now - 10)
+        directory = tempfile.TemporaryDirectory(prefix="aw-review-card-")
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        (folder / "REVIEW.md").write_text("FAIL\n", encoding="utf-8")
+        other_review = self.agent(
+            other_fix.name + "-review", "complete", last_path=folder / "task.log",
+            completion_time=self.now - 5,
+        )
+        agents.extend((other_old, other_fix, other_review))
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(other_old, self.now), "attention")
+        self.assertEqual(state.stale_info(other_old, self.now), "修正卡審查 FAIL")
+
+        self.assertEqual(state.apply("dismiss", old, agents, self.now), (True, "已清除"))
+        self.assertTrue(state.task(old.key)["dismissed"])
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.stale_info(old, self.now), "已清除")
+        row = watch.render_task_row(
+            old, 100, self.now, bucket=state.bucket(old, self.now),
+            history_label=state.stale_info(old, self.now),
+        )
+        self.assertIn("已清除", row.plain)
+        self.assertEqual(state.bucket(other_old, self.now), "attention")
+        self.assertEqual(state.stale_info(other_old, self.now), "修正卡審查 FAIL")
+
+        (reviewer.last_path.parent / "REVIEW.md").write_text(
+            "FAIL\nreview details changed\n", encoding="utf-8",
+        )
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.stale_info(old, self.now), "已清除")
+
+    async def test_shift_x_confirms_and_clears_review_fail(self):
+        old, _, _, agents, _ = self.review_case(review="FAIL\n")
+        app = self.handoff_app(agents)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.action_dismiss_stale()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissConfirmScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.state.task(old.key)["dismissed"])
+            self.assertEqual(app.state.bucket(old, self.now), "history")
+            self.assertEqual(app.state.stale_info(old, self.now), "已清除")
 
     def test_running_review_keeps_old_card_in_handoff(self):
         old, _, _, _, state = self.review_case(status="running", review="PASS\n")
