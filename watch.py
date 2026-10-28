@@ -816,6 +816,17 @@ def daily_stats_row(
     return row
 
 
+def _default_file_mode() -> int:
+    """Mode a plain `open(..., "w")` gives a new file: 0o666 minus the umask.
+
+    Reading the umask means setting it for a moment; the dashboard is a
+    single-process CLI/TUI, so the window is not observable by another writer.
+    """
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
 def write_daily_stats(
     path: Path,
     agents: List["AgentInfo"],
@@ -826,6 +837,12 @@ def write_daily_stats(
 
     The caller owns the path so tests (and alternate runs roots) never touch the
     live `~/Projects/night/agent-watch-daily.tsv`.
+
+    Rows keep their date order across schema changes: an older column set is
+    written back verbatim, but a row for a day that also has a current-schema
+    row is dropped, because the current-schema row was just recomputed from the
+    same cards (PAST-REVIEW P3-2). The replaced file keeps its previous mode, so
+    an atomic rewrite does not silently turn a 0644 TSV into 0600 (P3-3).
     """
     target = Path(path)
     current = time.time() if now is None else now
@@ -851,10 +868,21 @@ def write_daily_stats(
                 continue
             rows[parts[0]] = parts
     rows[row["date"]] = [row[column] for column in DAILY_STATS_COLUMNS]
+    # A legacy row for a day the current schema just wrote would put the same
+    # date in the file twice, so it is superseded rather than kept (P3-2).
+    legacy = [line for line in legacy if line.split("\t")[0] not in rows]
     target.parent.mkdir(parents=True, exist_ok=True)
+    dated: List[Tuple[str, str]] = [
+        (day, "\t".join(rows[day])) for day in rows
+    ]
+    dated += [(line.split("\t")[0], line) for line in legacy]
+    dated.sort(key=lambda item: item[0])
     body = ["\t".join(DAILY_STATS_COLUMNS)]
-    body += ["\t".join(rows[day]) for day in sorted(rows)]
-    body += legacy
+    body += [line for _, line in dated]
+    try:
+        existing_mode: Optional[int] = target.stat().st_mode & 0o777
+    except OSError:
+        existing_mode = None
     # A unique temp name in the same directory: two writers cannot share the
     # fixed `<name>.tmp` and interleave their rows.
     handle, temporary_name = tempfile.mkstemp(
@@ -864,6 +892,12 @@ def write_daily_stats(
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write("\n".join(body) + "\n")
+        # `mkstemp` always creates 0600; hand the file the mode a normal write
+        # would have used, so a reader that could open the old TSV still can.
+        os.chmod(
+            temporary,
+            existing_mode if existing_mode is not None else _default_file_mode(),
+        )
         os.replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)

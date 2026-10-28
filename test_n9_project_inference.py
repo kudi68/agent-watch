@@ -1,4 +1,5 @@
 """N9: unknown dispatch hints keep inferring, `其他` ratio, and the daily TSV."""
+import os
 import tempfile
 import time
 import unittest
@@ -89,6 +90,39 @@ class UnknownHintInferenceTests(unittest.TestCase):
         project, source, warning = self.infer(folder, "medtool-import", hint="foo")
         self.assertEqual((project, source), ("medical-tools", "關鍵字"))
         self.assertEqual(warning, "")
+
+    def test_unknown_hint_falls_through_to_a_label_file_without_a_warning(self):
+        # Third success path with an unknown hint: the folder's own label wins.
+        folder = self.task_dir("labelled")
+        (folder / "PROMPT.md").write_text("# 卡\nproject: ios\n", encoding="utf-8")
+        project, source, warning = self.infer(folder, "沒有語意的任務名", hint="DONE")
+        self.assertEqual((project, source), ("ios-shortcuts", "標籤"))
+        self.assertEqual(warning, "")
+
+    def test_unknown_hint_falls_through_to_a_path_without_a_warning(self):
+        folder = self.task_dir("path-only")
+        (folder / "REPORT.md").write_text(
+            "改 ~/Projects/agent-watch/watch.py\n" * 3, encoding="utf-8"
+        )
+        project, source, warning = self.infer(folder, "沒有語意的任務名", hint="DONE")
+        self.assertEqual((project, source), ("agent-watch", "路徑"))
+        self.assertEqual(warning, "")
+
+    def test_unknown_hint_naming_a_dispatch_repo_keeps_dispatch_without_a_warning(self):
+        # `weak_hint` is a dispatch-only label: it is used, but it is not a
+        # project, so the card is reported under 派工 and not as a data error.
+        add_project(self, "night-copy", repo_names=["night-queue"], dispatch_only=True)
+        folder = self.task_dir("dispatch-repo-task")
+        project, source, warning = self.infer(
+            folder, "沒有語意的任務名", hint="night-queue"
+        )
+        self.assertEqual((project, source), ("night-copy", "派工"))
+        self.assertEqual(warning, "")
+
+    def test_dispatch_only_hint_is_dispatch_not_a_data_error(self):
+        folder = self.task_dir("night-queue-task")
+        project, source, warning = self.infer(folder, "沒有語意的任務名", hint="night")
+        self.assertEqual((project, source, warning), ("night", "派工", ""))
 
     def test_unknown_hint_without_evidence_stays_other(self):
         folder = self.task_dir("misc")
@@ -363,9 +397,84 @@ class DailyStatsTests(unittest.TestCase):
             watch.write_daily_stats(target, agents, day_start=day, now=day + 86400)
             lines = target.read_text(encoding="utf-8").splitlines()
             self.assertEqual(lines[0].split("\t"), list(watch.DAILY_STATS_COLUMNS))
-            self.assertEqual(lines[1].split("\t")[0], "2026-10-28")
-            self.assertEqual(lines[2], legacy)
+            # Rows stay in date order even though the column sets differ (P3-2).
+            self.assertEqual(
+                [line.split("\t")[0] for line in lines[1:]], ["2026-10-20", "2026-10-28"]
+            )
+            self.assertEqual(lines[1], legacy)
             self.assertEqual(sum(1 for line in lines if line == legacy), 1)
+
+    def test_legacy_row_for_a_recomputed_day_is_superseded(self):
+        # The same day in both schemas would put one date in the file twice; the
+        # row just recomputed from the cards wins (P3-2).
+        legacy = "2026-10-28\t5\t1\t20.0"
+        day = self.day_start()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            target.write_text(
+                "\t".join(watch.DAILY_STATS_COLUMNS) + "\n" + legacy + "\n",
+                encoding="utf-8",
+            )
+            watch.write_daily_stats(
+                target, [self.agent("agent-watch", "標籤", day + 60)],
+                day_start=day, now=day + 86400,
+            )
+            lines = target.read_text(encoding="utf-8").splitlines()
+            self.assertEqual([line.split("\t")[0] for line in lines[1:]], ["2026-10-28"])
+            self.assertNotIn(legacy, lines)
+            self.assertEqual(
+                lines[1].split("\t")[watch.DAILY_STATS_COLUMNS.index("other_count")], "0"
+            )
+
+    def test_legacy_rows_keep_date_order(self):
+        day = self.day_start()
+        newer_legacy = "2026-10-21\t5\t1\t20.0"
+        older_legacy = "2026-10-19\t4\t2\t50.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            target.write_text(
+                "\t".join(watch.DAILY_STATS_COLUMNS) + "\n"
+                + newer_legacy + "\n" + older_legacy + "\n",
+                encoding="utf-8",
+            )
+            watch.write_daily_stats(
+                target, [self.agent("other", "未判斷", day + 60)],
+                day_start=day, now=day + 86400,
+            )
+            lines = target.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                [line.split("\t")[0] for line in lines[1:]],
+                ["2026-10-19", "2026-10-21", "2026-10-28"],
+            )
+            self.assertEqual(lines[1], older_legacy)
+            self.assertEqual(lines[2], newer_legacy)
+
+    def test_existing_mode_survives_the_atomic_replace(self):
+        # `mkstemp` creates 0600; replacing a 0644 TSV must not lock it down (P3-3).
+        day = self.day_start()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            target.write_text(
+                "\t".join(watch.DAILY_STATS_COLUMNS) + "\n", encoding="utf-8"
+            )
+            os.chmod(target, 0o644)
+            watch.write_daily_stats(
+                target, [self.agent("other", "未判斷", day + 60)],
+                day_start=day, now=day + 86400,
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
+    def test_new_file_gets_the_umask_mode(self):
+        day = self.day_start()
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            watch.write_daily_stats(
+                target, [self.agent("other", "未判斷", day + 60)],
+                day_start=day, now=day + 86400,
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
 
     def test_write_does_not_reuse_a_fixed_temp_name(self):
         day = self.day_start()
