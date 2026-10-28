@@ -6274,6 +6274,7 @@ class AgentWatchApp(App):
         ("h", "hide_task", "隱藏"),
         ("d", "finish_task", "歸到已完成"),
         ("x", "dismiss_task", "清除需處理項目"),
+        ("X", "dismiss_stale", "清除過期／取代項目"),
         ("shift+x", "dismiss_stale", "清除過期／取代項目"),
         ("c", "collapse_project", "收起專案"),
         ("i", "toggle_pin", "釘選"),

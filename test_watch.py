@@ -2767,6 +2767,27 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.bucket(old, self.now), "history")
             self.assertEqual(app.state.stale_info(old, self.now), "已清除")
 
+    async def test_uppercase_x_and_shift_x_confirm_batch_without_reasons(self):
+        for key in ("X", "shift+x"):
+            with self.subTest(key=key):
+                agents = [
+                    self.agent("stale-a", "failed", completion_time=self.now - 172800),
+                    self.agent("stale-b", "failed", completion_time=self.now - 172800),
+                ]
+                app = self.handoff_app(agents)
+                async with app.run_test(size=(100, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press(key)
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissConfirmScreen)
+                    self.assertEqual(app.screen.count, 2)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    for agent in agents:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(app.state.task(agent.key)["dismissed_reason"], "")
+                    self.assertFalse(app.ui_error)
+
     def test_running_review_keeps_old_card_in_handoff(self):
         old, _, _, _, state = self.review_case(status="running", review="PASS\n")
         self.assertEqual(state.bucket(old, self.now), "handoff")
