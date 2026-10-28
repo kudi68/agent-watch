@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 from rich.markup import escape
 from rich.text import Text
 
+import tok_speed
+
 # Textual imports (conditional for --once flag speed)
 try:
     from textual.app import App, ComposeResult
@@ -59,6 +61,8 @@ ARCHITECTURE_PATH = _env_path(
     "AGENT_WATCH_ARCH", Path(__file__).with_name("arch.json")
 )
 MAGPIE_COMMAND = os.environ.get("AGENT_WATCH_MAGPIE", "magpie")
+# Daily tok/s per model/tier, long format (see tok_speed.py).
+DEFAULT_TOKS_TSV = _env_path("AGENT_WATCH_TOKS_TSV", ROOT_DIR / "agent-watch-toks.tsv")
 
 
 def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -4351,6 +4355,7 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+DISMISS_STALE_LABELS = frozenset({"已過期", "已被取代", "修正卡審查 FAIL"})
 SUPERSEDED_HANDOFF_WORD = (
     r"(?:fix|retry|rerun|redo|rework|claude|resume)"
 )
@@ -4543,7 +4548,7 @@ class WatchState:
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
         self._superseded: Dict[str, str] = {}
-        # Old task key -> name of the replacement that is still running.
+        # Old task key -> replacement name for a handed-off task.
         self._handoff: Dict[str, str] = {}
         self._auto_clear_labels: Dict[str, str] = {}
         self._review_failures: Set[str] = set()
@@ -4656,7 +4661,7 @@ class WatchState:
         return ""
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
-        """Return the history label for a dismissed, expired, or replaced task."""
+        """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
             if (
                 self._dismissed(agent)
@@ -4684,7 +4689,7 @@ class WatchState:
         return ""
 
     def handoff_label(self, agent: AgentInfo) -> str:
-        """Name the running replacement of a handed-off task."""
+        """Name the replacement associated with a handed-off task."""
         target = self._handoff.get(agent.key)
         return "已接手 → " + target if target else ""
 
@@ -4843,7 +4848,7 @@ class WatchState:
                 return "attention"
         if agent.status == "running":
             return "running"
-        if agent.key in self._review_failures:
+        if agent.key in self._review_failures and not self._dismissed(agent):
             return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
@@ -4948,13 +4953,13 @@ class WatchState:
         return ok, "已儲存" if ok else self.warning
 
     def dismiss_stale(self, agents: List[AgentInfo], now: float) -> int:
-        """Clear only expired or superseded tasks after the caller confirms."""
+        """Clear eligible stale or review-failed tasks after the caller confirms."""
         count = 0
         for agent in agents:
             # Aged unanswered questions require a deliberate single-card x action.
             if question_is_active(agent.question, agent.completion_time):
                 continue
-            if self.stale_info(agent, now) not in ("已過期", "已被取代"):
+            if self.stale_info(agent, now) not in DISMISS_STALE_LABELS:
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)
             count += int(ok)
@@ -4986,7 +4991,7 @@ def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
 
 def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False,
                     bucket: Optional[str] = None, history_label: str = "",
-                    answered_by: str = "") -> Text:
+                    answered_by: str = "", toks_text: str = "") -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
     bucket = bucket or board_bucket(agent, now)
@@ -5054,6 +5059,14 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
             wait_text = "  " + format_question_wait(wait_seconds)
         if answered_by and agent.status != "escalated":
             detail = "由 %s 回答 · %s" % (answered_by, detail)
+    if toks_text and bucket == "running":
+        # A running card's subtitle leads with its tok/s; the progress text keeps what is left.
+        speed = truncate_display("  " + toks_text, width)
+        result.append("\n" + speed, style="#7dcfff")
+        rest = width - display_width(speed)
+        if rest > 4:
+            result.append(truncate_display(" · " + detail, rest), style="#a9b1bd")
+        return result
     detail_width = max(1, width - display_width(wait_text))
     result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
     if wait_text:
@@ -5766,6 +5779,22 @@ class RunDataService:
         return True
 
 
+def toks_anchor(agent: AgentInfo) -> tok_speed.CardAnchor:
+    """What tok_speed needs to join magpie rows to this card; reading the log is left to its worker."""
+    end = agent.completion_time
+    if end is None and agent.status != "running" and agent.log_mtime:
+        end = agent.log_mtime
+    log_path = str(agent.log_path)
+    return tok_speed.CardAnchor(
+        key=agent.key,
+        agent=tok_speed.magpie_agent_name(agent.harness),
+        alias="" if agent.model == UNKNOWN_IDENTITY else tok_speed.normalize_model_name(agent.model),
+        start=agent.start_time,
+        end=end,
+        log_path="" if log_path == "/dev/null" else log_path,
+    )
+
+
 class NavTab(Static):
     def __init__(self, label: str, tab_id: str):
         super().__init__(label, classes="nav-tab", markup=False)
@@ -5813,6 +5842,7 @@ class TaskRow(Static, can_focus=True):
             agent, self.content_size.width, self.now, self.selected, bucket,
             self.app.state.stale_info(agent, self.now) or self.app.state.handoff_label(agent),
             self.app.state.answered_by(agent),
+            self.app.toks_text(agent, bucket),
         )
 
     def on_focus(self) -> None:
@@ -5903,7 +5933,7 @@ class HelpScreen(ModalScreen):
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  x            清除所選需處理項目；不會刪除問題檔\n"
-                "  X            確認後清除已過期／已被取代項目\n"
+                "  X            確認後清除過期／被取代／審查 FAIL 項目\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
                 "  i            釘選／取消釘選（最多 5 個）\n"
                 "  t            編輯自訂標籤（逗號分隔）\n"
@@ -6163,7 +6193,7 @@ class DismissConfirmScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dismiss-confirm-panel"):
             yield Static(
-                f"清除 {self.count} 筆已過期／已被取代任務？\nEnter 確認；Esc 取消。",
+                f"清除 {self.count} 筆可清除項目？\nEnter 確認；Esc 取消。",
                 id="dismiss-confirm-text", markup=False,
             )
 
@@ -6218,6 +6248,7 @@ class AgentWatchApp(App):
         done_path: Path = DEFAULT_DONE_TSV,
         state_path: Optional[Path] = None,
         decisions_path: Optional[Path] = None,
+        toks_svc: Optional[tok_speed.TokSpeedService] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
@@ -6228,6 +6259,10 @@ class AgentWatchApp(App):
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.decision_svc = DecisionService(decisions_path)
+        # tok/s is off unless main() passes a service, so tests never run magpie
+        # or write the live daily TSV by accident.
+        self.toks_svc = toks_svc
+        self._toks_version = -1
         self.notified_keys: Set[str] = set()
         self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
@@ -6592,12 +6627,12 @@ class AgentWatchApp(App):
             return
         candidates = [
             agent for agent in self.current_agents
-            if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
+            if self.state.stale_info(agent, self._now) in DISMISS_STALE_LABELS
         ]
         if not candidates:
             handoff = sum(self.state.bucket(a, self._now) == "handoff" for a in self.current_agents)
             note = f"；已接手 {handoff} 筆不能清除" if handoff else ""
-            self.show_state_message("目前沒有已過期或已被取代的項目" + note)
+            self.show_state_message("目前沒有可批次清除的項目" + note)
             return
 
         def confirmed(accepted: Optional[bool]) -> None:
@@ -6605,7 +6640,7 @@ class AgentWatchApp(App):
                 self.show_state_message("已取消清除")
                 return
             count = self.state.dismiss_stale(self.current_agents, self._now)
-            self.show_state_message(f"已清除 {count} 筆已過期／已被取代任務")
+            self.show_state_message(f"已清除 {count} 筆項目")
             self.last_snapshot = None
             self.update_data()
 
@@ -6965,6 +7000,30 @@ class AgentWatchApp(App):
         self.update_tree_display(force=True)
         self.set_interval(2.0, self.poll_data)
         self.set_interval(float(DECISIONS_REFRESH_SECONDS), self.refresh_decisions)
+        if self.toks_svc is not None:
+            self.set_interval(1.0, self.poll_toks)
+
+    def toks_text(self, agent: AgentInfo, bucket: str) -> str:
+        """Running rows' tok/s subtitle; empty when tok/s is off or the card is not running."""
+        if self.toks_svc is None or bucket != "running":
+            return ""
+        try:
+            return tok_speed.format_card_speed(self.toks_svc.result(agent.key))
+        except Exception:
+            return tok_speed.DASH + " tok/s"
+
+    def poll_toks(self) -> None:
+        """Checked every second; the service itself caches the magpie read and runs it off the UI thread."""
+        if self.toks_svc is None or not self._ui_ready:
+            return
+        try:
+            self.toks_svc.refresh_in_background([toks_anchor(a) for a in self.current_agents])
+            if self.toks_svc.version != self._toks_version:
+                self._toks_version = self.toks_svc.version
+                for widget in self._row_widgets.values():
+                    widget.refresh()
+        except Exception as e:
+            self.ui_error = f"tok/s 更新失敗：{e}"
 
     def refresh_decisions(self) -> None:
         """60 秒一次的專案樹重讀；新增的決策檔不用改設定就會出現。"""
@@ -7196,7 +7255,10 @@ def main():
     if args.once:
         return run_once_summary(runs_p, done_p)
 
-    app = AgentWatchApp(runs_path=runs_p, done_path=done_p)
+    app = AgentWatchApp(
+        runs_path=runs_p, done_path=done_p,
+        toks_svc=tok_speed.TokSpeedService(tsv_path=DEFAULT_TOKS_TSV),
+    )
     app.run()
     return 0
 
