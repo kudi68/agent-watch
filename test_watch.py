@@ -1788,7 +1788,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 40)) as pilot:
             await pilot.pause()
             self.assertEqual(len(app.query_one("#attention-list").query(watch.TaskRow)), 5)
-            self.assertIn("需處理 5 │ 進行中 0 │ 剛完成 0 │ 歷史 0 │ 隱藏 0 │ 總計 5", self.screen_text(app))
+            self.assertIn("需處理 5 │ 已接手 0 │ 進行中 0 │ 剛完成 0 │ 歷史 0 │ 隱藏 0 │ 總計 5", self.screen_text(app))
             await pilot.press("2")
             await pilot.pause()
             self.assertIn("目前沒有歷史任務", self.screen_text(app))
@@ -2470,6 +2470,143 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             print("v10-s3 fixture state isolated; TSV bytes and mtime_ns UNCHANGED")
 
 
+class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """N4: a failed card whose fix card is still running sits in 已接手."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def agent(self, name, status, project="claude-perm", **values):
+        defaults = dict(
+            name=name, log_path=Path("/dev/null"), last_path=Path("/dev/null"),
+            status=status, model="fixture", harness="Claude", start_time=self.now - 900,
+            elapsed="00:15:00", latest=name + " 最新進度", key=name + "::" + project,
+            project=project, log_mtime=self.now - 1,
+        )
+        defaults.update(values)
+        return AgentInfo(**defaults)
+
+    def pair(self, replacement_status="running", **values):
+        old = self.agent("claude-perm-p2-fix", "failed", completion_time=self.now - 600)
+        new = self.agent("claude-perm-p2-fix2", replacement_status, start_time=self.now - 300, **values)
+        return old, new
+
+    def make_state(self, agents):
+        directory = tempfile.TemporaryDirectory(prefix="aw-handoff-state-")
+        self.addCleanup(directory.cleanup)
+        state = watch.WatchState(Path(directory.name) / "state.json")
+        state.reconcile(agents, self.now)
+        return state
+
+    def test_running_fix2_moves_old_card_to_handoff_and_failure_returns_it(self):
+        old, new = self.pair()
+        state = self.make_state([old, new])
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+        self.assertEqual(state.stale_info(old, self.now), "")
+        self.assertEqual(state.handoff_label(old), "已接手 → claude-perm-p2-fix2")
+        new.status, new.completion_time = "failed", self.now - 10
+        state.reconcile([old, new], self.now)
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.handoff_label(old), "")
+        for status in ("complete", "reported", "partial"):
+            with self.subTest(status=status):
+                new.status = status
+                state.reconcile([old, new], self.now)
+                self.assertEqual(state.bucket(old, self.now), "history")
+                self.assertEqual(state.stale_info(old, self.now), "已被取代")
+
+    def test_handoff_row_names_replacement_in_teal(self):
+        old, new = self.pair()
+        state = self.make_state([old, new])
+        row = watch.render_task_row(
+            old, 100, self.now, bucket=state.bucket(old, self.now),
+            history_label=state.handoff_label(old),
+        )
+        self.assertIn("已接手 → claude-perm-p2-fix2", row.plain)
+        self.assertEqual(row.style, "#73daca")
+        self.assertIn("[#73daca]● 已接手[/]", watch.ATTENTION_LEGEND)
+        self.assertEqual(
+            watch.count_buckets([old], self.now, lambda _agent, _now: "handoff")["handoff"], 1
+        )
+
+    def test_handoff_cards_refuse_x_shift_x_hide_and_collapse(self):
+        old, new = self.pair()
+        stale = self.agent("stale-task", "failed", project="other-project",
+                           completion_time=self.now - 48 * 3600)
+        agents = [old, new, stale]
+        state = self.make_state(agents)
+        ok, message = state.apply("dismiss", old, agents, self.now)
+        self.assertFalse(ok)
+        self.assertIn("已接手的任務不能清除", message)
+        for operation in ("hide", "done"):
+            self.assertFalse(state.apply(operation, old, agents, self.now)[0])
+        self.assertEqual(state.dismiss_stale(agents, self.now), 1)
+        self.assertFalse(state.task(old.key).get("dismissed", False))
+        self.assertTrue(state.task(stale.key)["dismissed"])
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+        # A project with a handed-off card still has open work.
+        self.assertFalse(state.apply("collapse", old, [old], self.now)[0])
+
+    def handoff_app(self, agents):
+        return V10MainPageTests.fixture_app(self, agents)
+
+    async def test_handoff_section_sits_between_attention_and_pins(self):
+        old, new = self.pair()
+        failed = self.agent("other-failure", "failed", project="agent-watch",
+                            completion_time=self.now - 60)
+        recent = self.agent("done-task", "complete", project="agent-watch",
+                            completion_time=self.now - 60)
+        archived = self.agent("old-task", "complete", project="agent-watch",
+                              completion_time=self.now - 9000)
+        app = self.handoff_app([old, new, failed, recent, archived])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            attention, handoff, pinned = (
+                app.query_one(selector) for selector in ("#attention-box", "#handoff-box", "#pinned-box")
+            )
+            self.assertTrue(handoff.display)
+            self.assertLessEqual(attention.region.bottom, handoff.region.y)
+            self.assertLessEqual(handoff.region.bottom, pinned.region.y)
+            self.assertEqual([row.agent.key for row in handoff.query(watch.TaskRow)], [old.key])
+            self.assertNotIn(old.key, [row.agent.key for row in attention.query(watch.TaskRow)])
+            screen = V10MainPageTests.screen_text(app)
+            self.assertIn("● 已接手", screen)
+            self.assertIn("已接手 → claude-perm-p2-fix2", screen)
+            self.assertIn("需處理 1 │ 已接手 1 │ 進行中 1 │ 剛完成 1 │ 歷史 1 │ 隱藏 0 │ 總計 5", screen)
+            self.assertFalse(app.ui_error)
+            app.action_dismiss_stale()  # Shift+X
+            await pilot.pause()
+            self.assertIn("已接手 1 筆不能清除", app.state_message)
+            app.selected_key = old.key
+            app.action_dismiss_task()  # x
+            await pilot.pause()
+            self.assertIn("已接手的任務不能清除", app.state_message)
+            self.assertEqual(app.state.bucket(old, self.now), "handoff")
+
+        app = self.handoff_app([failed, recent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#handoff-box").display)
+            self.assertNotIn("已接手 →", V10MainPageTests.screen_text(app))
+
+    async def test_handoff_screenshot_100x35(self):
+        old, new = self.pair()
+        app = self.handoff_app([old, new])
+        with tempfile.TemporaryDirectory(prefix="agent-watch-handoff-shot-") as tmp:
+            shots = snapshot_dir(Path(tmp) / "shots")
+            async with app.run_test(size=(100, 35)) as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#main-tabs").active, "tab-work")
+                svg = app.export_screenshot(title="work-handoff-100x35.svg")
+            (shots / "work-handoff-100x35.svg").write_text(svg, encoding="utf-8")
+        self.assertIn("已接手 →", html.unescape(svg).replace("\xa0", " "))
+
+
 class SupersessionTests(unittest.TestCase):
     def make_agent(self, name, status, *, project="agent-watch", start=100,
                    completion=None, question=None):
@@ -2554,7 +2691,7 @@ class SupersessionTests(unittest.TestCase):
             watch.compute_superseded([old, replacement]),
             {old.key: replacement.key},
         )
-        self.assertEqual(state.bucket(old, 310), "history")
+        self.assertEqual(state.bucket(old, 310), "handoff")
 
     def test_phase_versioned_fix2_hands_off_matching_failed_card(self):
         old = self.make_agent(
@@ -2606,7 +2743,7 @@ class SupersessionTests(unittest.TestCase):
                     watch.compute_superseded([old, replacement]),
                     {old.key: replacement.key},
                 )
-                self.assertEqual(state.bucket(old, 310), "history")
+                self.assertEqual(state.bucket(old, 310), "handoff")
 
     def test_multi_digit_phase_siblings_and_other_phase_fixes_do_not_handoff(self):
         for old_name, new_name in (
@@ -2687,8 +2824,8 @@ class SupersessionTests(unittest.TestCase):
         self.assertEqual(watch.compute_superseded([old, replacement]), {
             old.key: replacement.key,
         })
-        self.assertEqual(state.stale_info(old, 210), "已被取代")
-        self.assertEqual(state.bucket(old, 210), "history")
+        self.assertEqual(state.stale_info(old, 210), "")
+        self.assertEqual(state.bucket(old, 210), "handoff")
 
     def test_failed_fix2_does_not_hide_old_failed_card(self):
         old = self.make_agent(
