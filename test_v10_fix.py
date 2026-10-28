@@ -232,7 +232,7 @@ class AttentionStateTests(unittest.TestCase):
         mapping = watch.compute_superseded([old, successful_later])
         self.assertEqual(mapping, {"old": "later-ok"})
         self.state.reconcile([old, successful_later], self.now)
-        self.assertEqual(self.state.stale_info(old, self.now), "已被取代")
+        self.assertEqual(self.state.stale_info(old, self.now), "已接手完成 → k1-s4s5-claude")
 
     def test_retry_suffix_replacement_and_review_number_guard(self):
         original = self.agent("foo", "foo", "failed", project="agent-watch",
@@ -354,9 +354,12 @@ class AttentionStateTests(unittest.TestCase):
                            completion=self.now - 23 * 3600)
         agents = [stale, replaced, winner, fresh]
         self.state.reconcile(agents, self.now)
-        self.assertEqual(self.state.dismiss_stale(agents, self.now), 2)
+        self.assertEqual(self.state.dismiss_stale(agents, self.now), 1)
         self.assertEqual(self.state.stale_info(stale, self.now), "已清除")
-        self.assertEqual(self.state.stale_info(replaced, self.now), "已清除")
+        self.assertEqual(
+            self.state.stale_info(replaced, self.now), "已接手完成 → foo-retry",
+        )
+        self.assertFalse(self.state.task(replaced.key).get("dismissed", False))
         self.assertFalse(self.state.task(fresh.key).get("dismissed", False))
         self.assertEqual(self.state.bucket(fresh, self.now), "attention")
         row = watch.render_task_row(

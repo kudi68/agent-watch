@@ -4352,9 +4352,11 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+DISMISS_STALE_LABELS = frozenset({"已過期", "已被取代", "修正卡審查 FAIL"})
 SUPERSEDED_HANDOFF_WORD = (
-    r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
+    r"(?:fix|retry|rerun|redo|rework|claude|resume)"
 )
+REVIEW_CARD_SUFFIX_RE = re.compile(r"(?:review\d*|rereview)$", re.IGNORECASE)
 # SPEC §A name rule: only an explicit hand-off suffix links an old card to a
 # newer one. Phase/version markers (`-p12`, `-v10`) stay part of the card's
 # identity; a repair word glued straight onto one is still stripped and the
@@ -4394,6 +4396,47 @@ def _same_known_project(left: AgentInfo, right: AgentInfo) -> bool:
         and right.project != PROJECT_OTHER
         and left.project == right.project
     )
+
+
+def _review_for(replacement: AgentInfo, agents: List[AgentInfo]) -> Optional[AgentInfo]:
+    prefix = replacement.name.casefold() + "-"
+    reviews = [
+        agent for agent in agents
+        if agent.key != replacement.key
+        and _same_known_project(replacement, agent)
+        and agent.name.casefold().startswith(prefix)
+        and REVIEW_CARD_SUFFIX_RE.fullmatch(agent.name.casefold()[len(prefix):])
+    ]
+    return max(reviews, key=_replacement_time) if reviews else None
+
+
+def _read_first_lines(path: Path) -> List[str]:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return [line.rstrip("\r\n") for _, line in zip(range(20), stream)]
+    except OSError:
+        return []
+
+
+def _review_verdict(agent: AgentInfo) -> Optional[str]:
+    folder = agent.last_path.parent
+    review_lines = _read_first_lines(folder / "REVIEW.md")
+    report_lines = _read_first_lines(folder / "REPORT.md")
+    if review_lines:
+        match = re.match(r"^[\s#>*`-]*(PASS|FAIL)\b", review_lines[0], re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    if report_lines:
+        match = re.match(r"^\s*DONE\s+[—-]\s*(PASS|FAIL)\b", report_lines[0], re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    for line in review_lines + report_lines:
+        match = re.match(
+            r"^[\s#>*-]*verdict\s*[:：]\s*(PASS|FAIL)\b", line, re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper()
+    return None
 
 
 def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
@@ -4502,8 +4545,10 @@ class WatchState:
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
         self._superseded: Dict[str, str] = {}
-        # Old task key -> name of the replacement that is still running.
+        # Old task key -> replacement name for a handed-off task.
         self._handoff: Dict[str, str] = {}
+        self._auto_clear_labels: Dict[str, str] = {}
+        self._review_failures: Set[str] = set()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self._validate(data)
@@ -4613,13 +4658,17 @@ class WatchState:
         return ""
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
-        """Return the history label for a dismissed, expired, or replaced task."""
+        """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
             return ""
         if agent.status == "running":
             return ""
         if self._dismissed(agent):
             return "已清除"
+        if agent.key in self._review_failures:
+            return "修正卡審查 FAIL"
+        if agent.key in self._auto_clear_labels:
+            return self._auto_clear_labels[agent.key]
         if agent.key in self._handoff:
             # Still handed off, not finished: it must not expire into history.
             return ""
@@ -4632,7 +4681,7 @@ class WatchState:
         return ""
 
     def handoff_label(self, agent: AgentInfo) -> str:
-        """Name the running replacement of a handed-off task."""
+        """Name the replacement associated with a handed-off task."""
         target = self._handoff.get(agent.key)
         return "已接手 → " + target if target else ""
 
@@ -4706,10 +4755,26 @@ class WatchState:
         """Reconcile run state after a complete registry snapshot."""
         self._superseded = compute_superseded(agents)
         by_key = {agent.key: agent for agent in agents}
-        self._handoff = {
-            old: by_key[new].name for old, new in self._superseded.items()
-            if by_key[new].status == "running"
-        }
+        self._handoff = {}
+        self._auto_clear_labels = {}
+        self._review_failures = set()
+        for old, new in self._superseded.items():
+            replacement = by_key[new]
+            if replacement.status != "complete":
+                self._handoff[old] = replacement.name
+                continue
+            review = _review_for(replacement, agents)
+            if review is None:
+                self._auto_clear_labels[old] = "已接手完成 → " + replacement.name
+            elif review.status == "running" or question_is_active(
+                review.question, review.completion_time,
+            ):
+                self._handoff[old] = replacement.name
+            elif (verdict := _review_verdict(review)) == "FAIL":
+                self._review_failures.add(old)
+            else:
+                note = "（審查讀不到，DONE 即清）" if verdict is None else ""
+                self._auto_clear_labels[old] = "已接手完成 → " + replacement.name + note
         data = copy.deepcopy(self.data)
         changed = False
         cleanup_warning = ""
@@ -4770,6 +4835,8 @@ class WatchState:
             return "attention"
         if agent.status == "running":
             return "running"
+        if agent.key in self._review_failures and not self._dismissed(agent):
+            return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
             return "history"
@@ -4849,12 +4916,12 @@ class WatchState:
         return ok, "已儲存" if ok else self.warning
 
     def dismiss_stale(self, agents: List[AgentInfo], now: float) -> int:
-        """Clear only expired or superseded tasks after the caller confirms."""
+        """Clear eligible stale or review-failed tasks after the caller confirms."""
         count = 0
         for agent in agents:
             if question_is_active(agent.question, agent.completion_time):
                 continue
-            if self.stale_info(agent, now) not in ("已過期", "已被取代"):
+            if self.stale_info(agent, now) not in DISMISS_STALE_LABELS:
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)
             count += int(ok)
@@ -4907,6 +4974,8 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
         status = history_label or "已完成"
     elif bucket == "handoff":
         status = history_label or "已接手"
+    elif bucket == "attention" and history_label == "修正卡審查 FAIL":
+        status = history_label
     if bucket in ("recent", "history", "handoff"):
         line = "{}{} {} │ {} │ {}".format(
             marker, format_completion_time(agent.completion_time, now),
@@ -5796,7 +5865,7 @@ class HelpScreen(ModalScreen):
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  x            清除所選需處理項目；不會刪除問題檔\n"
-                "  X            確認後清除已過期／已被取代項目\n"
+                "  X            確認後清除過期／被取代／審查 FAIL 項目\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
                 "  i            釘選／取消釘選（最多 5 個）\n"
                 "  t            編輯自訂標籤（逗號分隔）\n"
@@ -6056,7 +6125,7 @@ class DismissConfirmScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dismiss-confirm-panel"):
             yield Static(
-                f"清除 {self.count} 筆已過期／已被取代任務？\nEnter 確認；Esc 取消。",
+                f"清除 {self.count} 筆可清除項目？\nEnter 確認；Esc 取消。",
                 id="dismiss-confirm-text", markup=False,
             )
 
@@ -6311,7 +6380,7 @@ class AgentWatchApp(App):
         handoff_box = self.query_one("#handoff-box", Vertical)
         handoff_box.remove_children()
         handoff_box.display = bool(handoff)
-        handoff_box.border_title = f"已接手 · {len(handoff)} · 修正卡進行中"
+        handoff_box.border_title = f"已接手 · {len(handoff)} · 等待結果"
         if handoff:
             handoff_box.mount(*[row(a) for a in handoff])
         pinned_box.mount(*([row(a) for a in pinned] if pinned else [
@@ -6472,12 +6541,12 @@ class AgentWatchApp(App):
             return
         candidates = [
             agent for agent in self.current_agents
-            if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
+            if self.state.stale_info(agent, self._now) in DISMISS_STALE_LABELS
         ]
         if not candidates:
             handoff = sum(self.state.bucket(a, self._now) == "handoff" for a in self.current_agents)
             note = f"；已接手 {handoff} 筆不能清除" if handoff else ""
-            self.show_state_message("目前沒有已過期或已被取代的項目" + note)
+            self.show_state_message("目前沒有可批次清除的項目" + note)
             return
 
         def confirmed(accepted: Optional[bool]) -> None:
@@ -6485,7 +6554,7 @@ class AgentWatchApp(App):
                 self.show_state_message("已取消清除")
                 return
             count = self.state.dismiss_stale(self.current_agents, self._now)
-            self.show_state_message(f"已清除 {count} 筆已過期／已被取代任務")
+            self.show_state_message(f"已清除 {count} 筆項目")
             self.last_snapshot = None
             self.update_data()
 
