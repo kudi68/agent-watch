@@ -196,6 +196,9 @@ QUOTA_BURN_AHEAD_PERCENT = 15
 QUOTA_CRITICAL_PERCENT = 85
 # SPEC §3.3: a question left unanswered for 30 minutes turns red and notifies.
 QUESTION_OVERDUE_SECONDS = 30 * 60
+QUESTION_CLEARABLE_SECONDS = 24 * 3600
+
+
 def _stale_attention_seconds_from_env() -> int:
     try:
         hours = float(os.environ.get("AGENT_WATCH_STALE_HOURS", "24"))
@@ -1215,7 +1218,7 @@ def question_escalated(question: Optional[Dict[str, Any]],
 def question_wait_seconds(question: Optional[Dict[str, Any]], now: float) -> int:
     if not question:
         return 0
-    asked = question.get("asked_at_ts") or question.get("mtime") or now
+    asked = question.get("mtime") or question.get("asked_at_ts") or now
     return max(0, int(now - asked))
 
 
@@ -4382,6 +4385,11 @@ class WatchState:
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the history label for a dismissed, expired, or replaced task."""
         if question_is_active(agent.question, agent.completion_time):
+            if (
+                self._dismissed(agent)
+                and question_wait_seconds(agent.question, now) >= QUESTION_CLEARABLE_SECONDS
+            ):
+                return "已清除"
             return ""
         if agent.status == "running":
             return ""
@@ -4554,7 +4562,11 @@ class WatchState:
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
         if question_is_active(agent.question, agent.completion_time):
-            return "attention"
+            if (
+                not self._dismissed(agent)
+                or question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
+            ):
+                return "attention"
         if agent.status == "running":
             return "running"
         if agent.key in self._review_failures:
@@ -4580,7 +4592,10 @@ class WatchState:
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
-            if question_is_active(agent.question, agent.completion_time):
+            if (
+                question_is_active(agent.question, agent.completion_time)
+                and question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
+            ):
                 return False, "尚未收到這題的有效 ANSWER.md，不能清除"
             if agent.status == "running" or bucket == "running":
                 return False, "進行中的任務不能清除"
@@ -4641,6 +4656,7 @@ class WatchState:
         """Clear only expired or superseded tasks after the caller confirms."""
         count = 0
         for agent in agents:
+            # Aged unanswered questions require a deliberate single-card x action.
             if question_is_active(agent.question, agent.completion_time):
                 continue
             if self.stale_info(agent, now) not in ("已過期", "已被取代"):

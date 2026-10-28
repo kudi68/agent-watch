@@ -211,6 +211,21 @@ class AttentionStateTests(unittest.TestCase):
             project=project,
         )
 
+    def orphan_question(self, name, age_seconds, answer_content=None):
+        root = self.root / name
+        root.mkdir()
+        question_path = root / "QUESTION.md"
+        question_path.write_text(
+            "# QUESTION\nid: q1\nquestion: 要先修 A 還是 B？\n"
+            "options:\n- A: 先修 A\n- B: 先修 B\n",
+            encoding="utf-8",
+        )
+        os.utime(question_path, (self.now - age_seconds, self.now - age_seconds))
+        answer_path = root / "ANSWER.md"
+        if answer_content is not None:
+            answer_path.write_text(answer_content, encoding="utf-8")
+        return root, question_path, answer_path, watch.read_task_question(root)
+
     def test_old_failures_expire_but_recent_failures_stay_attention(self):
         old = self.agent("old", "old-task", "failed", completion=self.now - 48 * 3600)
         recent = self.agent("recent", "recent-task", "failed", completion=self.now - 23 * 3600)
@@ -340,6 +355,61 @@ class AttentionStateTests(unittest.TestCase):
         self.assertIn("尚未收到這題的有效 ANSWER.md", message)
         self.assertEqual(question_path.read_text(encoding="utf-8"), "question bytes\n")
         self.assertEqual(answer_path.read_text(encoding="utf-8"), "answer bytes\n")
+
+    def test_question_at_23h59_cannot_be_cleared_and_state_is_unchanged(self):
+        _, _, _, question = self.orphan_question(
+            "question-23h59", watch.QUESTION_CLEARABLE_SECONDS - 60,
+        )
+        agent = self.agent("question-23h59", "question-23h59", "question",
+                           question=question)
+        self.state.reconcile([agent], self.now)
+        before = (
+            self.state_path.exists(),
+            self.state_path.read_bytes() if self.state_path.exists() else None,
+            self.state.data.copy(),
+        )
+
+        ok, message = self.state.apply("dismiss", agent, [agent], self.now)
+
+        self.assertEqual(watch.question_wait_seconds(question, self.now), 23 * 3600 + 59 * 60)
+        self.assertFalse(ok)
+        self.assertEqual(message, "尚未收到這題的有效 ANSWER.md，不能清除")
+        self.assertEqual(
+            before,
+            (
+                self.state_path.exists(),
+                self.state_path.read_bytes() if self.state_path.exists() else None,
+                self.state.data.copy(),
+            ),
+        )
+
+    def test_late_answer_and_rerun_after_overdue_manual_clear(self):
+        question_root, _, _, question = self.orphan_question(
+            "question-late-answer", watch.QUESTION_CLEARABLE_SECONDS + 60,
+        )
+        agent = self.agent(
+            "question-late-answer", "question-late-answer", "question",
+            start=self.now - 300, question=question,
+        )
+        self.state.reconcile([agent], self.now)
+        self.assertTrue(self.state.apply("dismiss", agent, [agent], self.now)[0])
+        self.assertTrue(self.state.task(agent.key)["dismissed"])
+
+        self.assertTrue(watch.write_answer_file(
+            question_root, agent.question, "A", now=self.now + 1,
+        )[0])
+        agent.question = watch.read_task_question(question_root)
+        self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
+        self.state.reconcile([agent], self.now + 1)
+        self.assertTrue(self.state.task(agent.key)["dismissed"])
+        self.assertEqual(self.state.bucket(agent, self.now + 1), "history")
+
+        agent.status = "running"
+        agent.start_time = self.now + 2
+        agent.process_alive = True
+        self.state.reconcile([agent], self.now + 2)
+        self.assertFalse(self.state.task(agent.key)["dismissed"])
+        self.assertEqual(self.state.bucket(agent, self.now + 2), "running")
 
     def test_bulk_dismiss_only_targets_stale_or_superseded(self):
         stale = self.agent("stale", "stale-task", "failed",

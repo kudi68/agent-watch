@@ -1807,6 +1807,11 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             "- B: 先修 B\n",
             encoding="utf-8",
         )
+        question_path = question_root / "QUESTION.md"
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS - 60),
+        )
         agent = self.fixture_agents()[4]
         agent.status = "question"
         agent.completion_time = self.now - 60
@@ -1817,8 +1822,15 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                23 * 3600 + 59 * 60,
+            )
             await pilot.press("x")
             await pilot.pause()
+            self.assertEqual(
+                app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
+            )
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
             self.assertFalse(app.state.task(agent.key).get("dismissed", False))
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
@@ -1831,6 +1843,59 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             agent.status = "complete"
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
+
+    async def test_x_clears_overdue_question_but_shift_x_leaves_it_alone(self):
+        question_dir = tempfile.TemporaryDirectory(prefix="aw-question-overdue-x-")
+        self.addCleanup(question_dir.cleanup)
+        question_root = Path(question_dir.name)
+        question_path = question_root / "QUESTION.md"
+        answer_path = question_root / "ANSWER.md"
+        question_path.write_text(
+            "# QUESTION\nid: q1\nquestion: 要先修 A 還是 B？\n"
+            "options:\n- A: 先修 A\n- B: 先修 B\n",
+            encoding="utf-8",
+        )
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS + 60),
+        )
+        answer_path.write_text(
+            "# ANSWER\nid: old-question\nanswered_at: 2026-10-24T00:00:00Z\n"
+            "choice: A\n",
+            encoding="utf-8",
+        )
+        paths = (question_path, answer_path)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths
+        }
+        agent = self.fixture_agents()[4]
+        agent.status = "question"
+        agent.completion_time = self.now - 60
+        agent.question = watch.read_task_question(question_root)
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                24 * 3600 + 60,
+            )
+            await pilot.press("shift+x")
+            await pilot.pause()
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertTrue(app.state.task(agent.key)["dismissed"])
+            self.assertEqual(app.state.bucket(agent, self.now), "history")
+            self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
+
+        self.assertEqual(
+            before,
+            {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths},
+        )
 
     async def test_x_clears_malformed_question_after_showing_why(self):
         question_dir = tempfile.TemporaryDirectory(prefix="aw-question-malformed-")
