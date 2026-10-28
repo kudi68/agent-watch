@@ -3841,6 +3841,7 @@ DECISION_COLUMNS = (
     "date", "id", "parent", "kind", "spec", "summary",
     "decision", "evidence", "status", "agent", "merge_target",
 )
+DECISION_COLUMNS_EXPANDED = DECISION_COLUMNS + ("card_key", "supersedes")
 DECISION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DECISION_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 DECISION_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
@@ -3931,6 +3932,8 @@ class DecisionNode:
     status: str
     agent: str
     merge_target: str
+    card_key: str = "-"
+    supersedes: str = "-"
     children: List["DecisionNode"] = field(default_factory=list)
     current: bool = False
 
@@ -3972,7 +3975,10 @@ def parse_decision_table(
     order: List[str] = []
     title = ""
     header_seen = False
-    for row_number, raw in enumerate(text.splitlines(), start=1):
+    row_columns = DECISION_COLUMNS
+    rows = text.splitlines()
+    for row_index, raw in enumerate(rows):
+        row_number = row_index + 1
         stripped = raw.strip()
         if not title and stripped.startswith("#"):
             title = stripped.lstrip("#").strip()
@@ -3984,16 +3990,42 @@ def parse_decision_table(
             continue
         if not header_seen:
             header_seen = True
-            if any(cell.casefold() in DECISION_COLUMNS for cell in cells):
+            folded = tuple(cell.casefold() for cell in cells)
+            if folded == DECISION_COLUMNS:
+                row_columns = DECISION_COLUMNS
+                continue
+            if folded == DECISION_COLUMNS_EXPANDED:
+                row_columns = DECISION_COLUMNS_EXPANDED
+                continue
+            next_is_separator = False
+            for following in rows[row_index + 1:]:
+                next_stripped = following.strip()
+                if not next_stripped:
+                    continue
+                if not next_stripped.startswith("|"):
+                    break
+                next_cells = [
+                    cell.strip() for cell in next_stripped.strip("|").split("|")
+                ]
+                next_is_separator = bool(next_cells) and all(
+                    DECISION_SEPARATOR_RE.match(cell) for cell in next_cells
+                )
+                break
+            if next_is_separator or any(
+                cell.casefold() in DECISION_COLUMNS_EXPANDED for cell in cells
+            ):
+                problems.append(
+                    f"L{row_number} 表頭格式不支援。只接受 11 欄或 13 欄表頭。"
+                )
                 continue
             problems.append(f"L{row_number} 第一列不是表頭。當成資料列解讀。")
-        if len(cells) != len(DECISION_COLUMNS):
+        if len(cells) != len(row_columns):
             problems.append(
-                f"L{row_number} 欄數 {len(cells)}。需 {len(DECISION_COLUMNS)} 欄。內容："
+                f"L{row_number} 欄數 {len(cells)}。需 {len(row_columns)} 欄。內容："
                 f"{truncate_display(stripped, 72)}"
             )
             continue
-        values = dict(zip(DECISION_COLUMNS, cells))
+        values = dict(zip(row_columns, cells))
         node_id = values["id"]
         if not node_id:
             problems.append(f"L{row_number} 缺少 id：{truncate_display(stripped, 72)}")
@@ -4019,6 +4051,23 @@ def parse_decision_table(
             problems.append(
                 f"L{row_number} id {node_id} 未知種類「{values['kind'] or '-'}」"
             )
+        card_key = values.get("card_key", "-")
+        supersedes = values.get("supersedes", "-")
+        if "card_key" in values and (not card_key or not supersedes):
+            problems.append(
+                f"L{row_number} card_key／supersedes 不可留空，請填 -。"
+            )
+            continue
+        if supersedes not in ("", "-") and card_key in ("", "-"):
+            problems.append(
+                f"L{row_number} id {node_id} supersedes 需要 card_key。"
+            )
+            continue
+        if supersedes not in ("", "-") and supersedes == card_key:
+            problems.append(
+                f"L{row_number} id {node_id} supersedes 不可等於 card_key。"
+            )
+            continue
         node = DecisionNode(
             line=name,
             row=row_number,
@@ -4033,6 +4082,8 @@ def parse_decision_table(
             status=status,
             agent=values["agent"],
             merge_target=values["merge_target"],
+            card_key=card_key,
+            supersedes=supersedes,
         )
         previous = by_id.get(node_id)
         if previous is None:
@@ -4042,6 +4093,14 @@ def parse_decision_table(
             or previous.kind != node.kind
             or previous.spec != node.spec
             or previous.merge_target != node.merge_target
+            or (
+                previous.card_key != "-"
+                and previous.card_key != node.card_key
+            )
+            or (
+                previous.supersedes != "-"
+                and previous.supersedes != node.supersedes
+            )
         ):
             problems.append(
                 f"L{row_number} id {node_id} 的 parent／kind／spec 與前一列不同。"

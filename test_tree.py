@@ -14,6 +14,8 @@ HEADER = (
     "| status | agent | merge_target |"
 )
 SEPARATOR = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+EXPANDED_HEADER = HEADER[:-2] + " | card_key | supersedes |"
+EXPANDED_SEPARATOR = SEPARATOR[:-2] + " | --- | --- |"
 
 
 def decision_row(
@@ -28,14 +30,22 @@ def decision_row(
     status="done",
     agent="-",
     merge_target="-",
+    card_key="-",
+    supersedes="-",
+    expanded=False,
 ):
     cells = [date, node_id, parent, kind, spec, summary, decision, evidence,
              status, agent, merge_target]
+    if expanded:
+        cells.extend([card_key, supersedes])
     return "| " + " | ".join(cells) + " |"
 
 
-def decisions_file(*rows, title="# demo 決策節點"):
-    return "\n".join([title, "", HEADER, SEPARATOR, *rows, ""])
+def decisions_file(*rows, title="# demo 決策節點", expanded=False):
+    header, separator = (
+        (EXPANDED_HEADER, EXPANDED_SEPARATOR) if expanded else (HEADER, SEPARATOR)
+    )
+    return "\n".join([title, "", header, separator, *rows, ""])
 
 
 class DecisionParseTests(unittest.TestCase):
@@ -112,6 +122,130 @@ class DecisionParseTests(unittest.TestCase):
             decisions_file(decision_row(node_id=""))
         )
         self.assertTrue(any("缺少 id" in problem for problem in problems))
+
+    def test_legacy_parse_and_tree_render_match_the_pre_expand_snapshot(self):
+        text = decisions_file(decision_row(node_id="goal", summary="主幹目標"))
+        nodes, problems, title = watch.parse_decision_table(text)
+        self.assertEqual(problems, [])
+        self.assertEqual(title, "demo 決策節點")
+        self.assertEqual(
+            [(node.date, node.id, node.parent, node.kind, node.spec, node.summary,
+              node.decision, node.evidence, node.status, node.agent, node.merge_target,
+              node.card_key, node.supersedes) for node in nodes],
+            [("2026-10-26", "goal", "-", "trunk", "s§1", "主幹目標", "決定",
+              "/tmp/REPORT.md", "done", "-", "-", "-", "-")],
+        )
+        line = watch.build_decision_line("demo", text)
+        board = watch.DecisionBoard(
+            directory=Path("/nonexistent"), lines=[line], errors=[], refreshed_at=0.0,
+        )
+        self.assertEqual(
+            watch.render_decision_tree(board, 100, now=0),
+            "[bold #7aa2f7]專案樹[/] [#565f89]1 條線 · 1 個節點 · 進行中 0 · "
+            "等待 0[/][#565f89] · 讀取 08:00:00 · 每 60 秒自動重讀[/]\n\n"
+            "[bold #7aa2f7]▌ demo[/] [#565f89]1 個節點[/][#565f89] · 目前 [/]"
+            "[bold #e0af68]goal（done）[/]\n"
+            "[#565f89]2026-10-26[/] [bold #0f1117 on #9ece6a] 目前 [/]"
+            " [#9ece6a]✓ done[/] [#c4c9d4]goal[/] [#9ece6a]trunk[/]\n"
+            "  [bold #c4c9d4]主幹目標[/]",
+        )
+
+    def test_legacy_error_message_is_unchanged(self):
+        _nodes, problems, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(node_id="goal"),
+                "| 2026-10-26 | broken |",
+            )
+        )
+        self.assertEqual(
+            problems,
+            ["L6 欄數 2。需 11 欄。內容：| 2026-10-26 | broken |"],
+        )
+
+    def test_expanded_header_parses_new_fields(self):
+        nodes, problems, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(
+                    node_id="work", kind="branch", parent="goal", expanded=True,
+                    card_key="manual:na2-n5-fix1", supersedes="manual:na2-n4-codex",
+                ),
+                expanded=True,
+            )
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            (nodes[0].card_key, nodes[0].supersedes),
+            ("manual:na2-n5-fix1", "manual:na2-n4-codex"),
+        )
+
+    def test_unrecognized_header_is_reported(self):
+        header = HEADER[:-2] + " | unexpected |"
+        separator = SEPARATOR[:-2] + " | --- |"
+        text = "\n".join([
+            "# malformed", "", header, separator,
+            "| 2026-10-26 | goal | - | trunk | s§1 | 摘要 | 決定 | /tmp/R.md | done | - | - | - |",
+            "",
+        ])
+        nodes, problems, _title = watch.parse_decision_table(text)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any("表頭" in problem for problem in problems))
+
+    def test_mixed_row_width_is_reported_and_not_parsed(self):
+        nodes, problems, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(node_id="goal"),
+                expanded=True,
+            )
+        )
+        self.assertEqual(nodes, [])
+        self.assertTrue(any("欄數 11。需 13 欄" in problem for problem in problems))
+
+    def test_card_key_and_supersedes_can_be_filled_once_then_are_immutable(self):
+        nodes, problems, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(node_id="work", kind="branch", expanded=True),
+                decision_row(
+                    node_id="work", kind="branch", expanded=True,
+                    card_key="manual:task", supersedes="manual:old",
+                ),
+                decision_row(
+                    node_id="work", kind="branch", expanded=True,
+                    card_key="manual:task", supersedes="manual:old",
+                ),
+                expanded=True,
+            )
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual((nodes[0].card_key, nodes[0].supersedes),
+                         ("manual:task", "manual:old"))
+        _nodes, changed, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(
+                    node_id="work", kind="branch", expanded=True,
+                    card_key="manual:task", supersedes="manual:old",
+                ),
+                decision_row(
+                    node_id="work", kind="branch", expanded=True,
+                    card_key="manual:changed", supersedes="manual:other",
+                ),
+                expanded=True,
+            )
+        )
+        self.assertTrue(any("沿用最後一列" in problem for problem in changed))
+
+    def test_supersedes_without_card_key_is_reported(self):
+        nodes, problems, _title = watch.parse_decision_table(
+            decisions_file(
+                decision_row(
+                    node_id="work", kind="branch", expanded=True,
+                    supersedes="manual:old",
+                ),
+                expanded=True,
+            )
+        )
+        self.assertEqual(nodes, [])
+        self.assertTrue(any("card_key" in problem and "supersedes" in problem
+                            for problem in problems))
 
 
 class DecisionTreeTests(unittest.TestCase):
