@@ -182,6 +182,9 @@ PROJECT_PATH_FORBIDDEN_RE = re.compile(
     r"不[要]?改|不[要]?動|禁止|不[要]?碰|沒有碰|未碰|forbidden", re.IGNORECASE
 )
 PROJECT_PATH_MENTION_MIN = 3
+# `~/Projects/status` is the status dashboard every task updates, so it is meta
+# evidence like the runs root: mentioning it must never decide a card's project.
+PROJECT_META_PATH_NAMES = frozenset({"status"})
 PROJECT_SIGNAL_READ_BYTES = 128 * 1024
 PROJECT_SIGNAL_CACHE_LIMIT = 800
 _PROJECT_LABEL_CACHE: Dict[str, Any] = {}
@@ -246,10 +249,10 @@ def keyword_matches(keyword: str, text: str) -> bool:
 
 def resolve_project(value: str) -> Tuple[str, str]:
     ensure_architecture_data()
+    wanted = value.casefold()
     for project_id, config in ARCHITECTURE_DATA["projects"].items():
-        if value.casefold() in [project_id.casefold()] + [
-            alias.casefold() for alias in config.get("aliases", [])
-        ]:
+        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        if wanted in {str(name).casefold() for name in names}:
             return project_id, ""
     return PROJECT_OTHER, f"未知專案：{value}"
 
@@ -398,6 +401,44 @@ def _project_for_repo_name(name: str) -> str:
     return ""
 
 
+def _repo_key(value: str) -> str:
+    """Spelling-insensitive repo key: `MedKnowledge` == `med-knowledge`."""
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+def _project_for_repo_hint(hint: str) -> str:
+    """Map a dispatch hint that is not a project id onto a registered repo.
+
+    Hints are hand-written and often name the repo instead of the project
+    (`Projects/MedKnowledge/`, `personal_capture`, `agent-watch-fix2`), so the
+    comparison ignores separators and a common task-suffix decoration.
+    """
+    if not hint:
+        return ""
+    text = hint.strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
+    if not text:
+        return ""
+    match = re.search(r"projects/([^/\s]+)", text, re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    text = text.rstrip("/")
+    candidates = {text}
+    candidates.add(re.sub(r"(?:[-_](?:fix|review|retry|rerun|v\d+|\d+))+$", "", text, flags=re.IGNORECASE))
+    ensure_architecture_data()
+    keys = {_repo_key(value) for value in candidates if _repo_key(value)}
+    if not keys:
+        return ""
+    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
+        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+            continue
+        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        for path in config.get("repo_paths", []):
+            names.append(str(path).strip("/").rsplit("/", 1)[-1])
+        if any(_repo_key(name) in keys for name in names):
+            return project_id
+    return ""
+
+
 def _project_for_repo_path(root: Path) -> str:
     ensure_architecture_data()
     haystack = str(root).casefold().replace("\\", "/").rstrip("/") + "/"
@@ -493,10 +534,10 @@ def task_path_project(task_dir: Path) -> str:
         tallies: Dict[str, int] = {}
         for name, count in counts.items():
             # Every task folder lives under the runs root; that path is not evidence.
-            if name.casefold() == workspace:
+            if name.casefold() == workspace or name.casefold() in PROJECT_META_PATH_NAMES:
                 continue
             project_id, error = resolve_project(name)
-            if error:
+            if error or project_is_dispatch_only(project_id):
                 continue
             tallies[project_id] = tallies.get(project_id, 0) + count
         if not tallies:
@@ -570,17 +611,29 @@ def infer_project_details(
 ) -> Tuple[str, str, str]:
     """Group a task by explicit label, then location, paths, and finally keywords.
 
-    Returns `(project_id, evidence_source, warning)`. The warning is only set for
-    a malformed explicit project column, which keeps the historical data error.
+    Returns `(project_id, evidence_source, warning)`. A hint that is not in
+    `arch.json` is kept as a warning and inference carries on: it may name a repo,
+    and git / paths / keywords can still place the card. Only when every stage
+    fails is the card `other`, with basis `未判斷`.
     """
     ensure_architecture_data()
     folder = task_dir if task_dir is not None else project_folder(log_path, last_path)
     weak_hint = ""
+    hint_warning = ""
     if project_hint:
         project_id, error = resolve_project(project_hint)
         if error:
-            return PROJECT_OTHER, PROJECT_SOURCE_NONE, error
-        if project_is_dispatch_only(project_id):
+            hint_warning = error
+            repo_project = _project_for_repo_hint(project_hint)
+            if repo_project and not project_is_dispatch_only(repo_project):
+                return (
+                    repo_project,
+                    PROJECT_SOURCE_LABEL,
+                    f"{error}（以 repo 名歸類為 {project_label(repo_project)}）",
+                )
+            if repo_project:
+                weak_hint = repo_project
+        elif project_is_dispatch_only(project_id):
             # `--project night` records the dispatch system, not the project.
             weak_hint = project_id
         else:
@@ -593,19 +646,19 @@ def infer_project_details(
                 if project_is_dispatch_only(project_id):
                     weak_hint = weak_hint or project_id
                 else:
-                    return project_id, PROJECT_SOURCE_LABEL, ""
+                    return project_id, PROJECT_SOURCE_LABEL, hint_warning
         project_id = task_git_project(folder)
         if project_id:
-            return project_id, PROJECT_SOURCE_GIT, ""
+            return project_id, PROJECT_SOURCE_GIT, hint_warning
         project_id = task_path_project(folder)
         if project_id:
-            return project_id, PROJECT_SOURCE_PATH, ""
+            return project_id, PROJECT_SOURCE_PATH, hint_warning
     project_id = keyword_project(name, log_path, last_path)
     if project_id:
-        return project_id, PROJECT_SOURCE_KEYWORD, ""
+        return project_id, PROJECT_SOURCE_KEYWORD, hint_warning
     if weak_hint:
-        return weak_hint, PROJECT_SOURCE_DISPATCH, ""
-    return PROJECT_OTHER, PROJECT_SOURCE_NONE, ""
+        return weak_hint, PROJECT_SOURCE_DISPATCH, hint_warning
+    return PROJECT_OTHER, PROJECT_SOURCE_NONE, hint_warning
 
 
 def infer_project(
@@ -631,6 +684,114 @@ def project_source_summary(agents: List["AgentInfo"]) -> str:
     ordered = [source for source in PROJECT_SOURCE_ORDER if source in counts]
     ordered += [source for source in counts if source not in PROJECT_SOURCE_ORDER]
     return "／".join(f"{source} {counts[source]}" for source in ordered)
+
+
+PROJECT_OTHER_WINDOW_DAYS = 14
+
+
+def agent_activity_time(agent: "AgentInfo") -> float:
+    """Latest moment a card shows activity; 0 when it has no usable timestamp."""
+    return agent.completion_time or agent.start_time or agent.log_mtime or 0.0
+
+
+def project_other_summary(
+    agents: List["AgentInfo"],
+    now: Optional[float] = None,
+    window_days: int = PROJECT_OTHER_WINDOW_DAYS,
+) -> str:
+    """`其他 N（x%）` for the recent window, e.g. `其他 3（7.5%）`."""
+    current = time.time() if now is None else now
+    cutoff = current - window_days * 86400
+    window = [agent for agent in agents if agent_activity_time(agent) >= cutoff]
+    total = len(window)
+    other = sum(
+        1 for agent in window
+        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
+    )
+    ratio = (other / total * 100) if total else 0.0
+    return f"其他 {other}（{ratio:.1f}%）"
+
+
+DAILY_STATS_BASIS_SOURCES = (
+    PROJECT_SOURCE_LABEL,
+    PROJECT_SOURCE_DISPATCH,
+    PROJECT_SOURCE_KEYWORD,
+    PROJECT_SOURCE_GIT,
+    PROJECT_SOURCE_PATH,
+    PROJECT_SOURCE_NONE,
+)
+DAILY_STATS_COLUMNS = (
+    "date", "total", "other_count", "other_ratio",
+    *[f"basis_{source}" for source in DAILY_STATS_BASIS_SOURCES],
+)
+
+
+def daily_stats_row(
+    agents: List["AgentInfo"],
+    day_start: float,
+    now: Optional[float] = None,
+) -> Dict[str, str]:
+    """One daily TSV row: totals, the `其他` share, and the basis distribution."""
+    day = datetime.fromtimestamp(day_start)
+    day_end = day_start + 86400
+    window = [
+        agent for agent in agents
+        if day_start <= agent_activity_time(agent) < day_end
+    ]
+    total = len(window)
+    other = sum(
+        1 for agent in window
+        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
+    )
+    row = {
+        "date": day.strftime("%Y-%m-%d"),
+        "total": str(total),
+        "other_count": str(other),
+        "other_ratio": f"{(other / total * 100) if total else 0.0:.1f}",
+    }
+    for source in DAILY_STATS_BASIS_SOURCES:
+        row[f"basis_{source}"] = str(sum(
+            1 for agent in window
+            if (agent.project_source or PROJECT_SOURCE_NONE) == source
+        ))
+    return row
+
+
+def write_daily_stats(
+    path: Path,
+    agents: List["AgentInfo"],
+    day_start: Optional[float] = None,
+    now: Optional[float] = None,
+) -> Path:
+    """Rewrite today's row in the daily stats TSV; other days are preserved.
+
+    The caller owns the path so tests (and alternate runs roots) never touch the
+    live `~/Projects/night/agent-watch-daily.tsv`.
+    """
+    target = Path(path)
+    current = time.time() if now is None else now
+    if day_start is None:
+        day_start = datetime.fromtimestamp(current).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).timestamp()
+    row = daily_stats_row(agents, day_start, current)
+    rows: Dict[str, List[str]] = {}
+    if target.is_file():
+        for line in target.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) != len(DAILY_STATS_COLUMNS) or parts[0] == "date":
+                continue
+            rows[parts[0]] = parts
+    rows[row["date"]] = [row[column] for column in DAILY_STATS_COLUMNS]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = ["\t".join(DAILY_STATS_COLUMNS)]
+    body += ["\t".join(rows[day]) for day in sorted(rows)]
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text("\n".join(body) + "\n", encoding="utf-8")
+    os.replace(temporary, target)
+    return target
 
 
 
@@ -2273,6 +2434,7 @@ def format_bucket_counts(
     return (
         f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
         f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ 總計 {counts['total']}"
+        f" │ {project_other_summary(agents, now)}"
     )
 
 
@@ -4900,11 +5062,18 @@ def notify_question_overdue(agent: AgentInfo):
 def run_once_summary(
     runs_path: Path = DEFAULT_RUNS_TSV,
     done_path: Path = DEFAULT_DONE_TSV,
+    daily_stats_path: Optional[Path] = None,
 ) -> int:
     """Print one-time plain text summary to stdout and exit 0."""
     now = time.time()
     log_parser = LogParser()
     agents, errors = load_all_agents(runs_path, done_path, log_parser, now)
+    if daily_stats_path is not None:
+        # The daily TSV is opt-in: a caller that names a path owns the write.
+        try:
+            write_daily_stats(daily_stats_path, agents, now=now)
+        except OSError as exc:
+            errors.append(f"每日統計寫入失敗：{exc}")
     quota_svc = QuotaService()
     quota_text, quota_raw = quota_svc.fetch(force=True)
     _, _, quota_stale, _ = quota_svc.snapshot()
@@ -6621,6 +6790,7 @@ class AgentWatchApp(App):
             f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
             f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
             f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
+            f" │ {project_other_summary(agents, now)}"
         )
         width = self.size.width if self._ui_ready else 80
 
