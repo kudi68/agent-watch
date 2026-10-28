@@ -364,6 +364,158 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(lines[0].split("\t"), list(watch.DAILY_STATS_COLUMNS))
             self.assertEqual(lines[1].split("\t")[0], "2026-10-28")
 
+    def test_daily_attention_classifies_today_and_empty_ratio(self):
+        day = self.day_start()
+        now = day + 8 * 3600
+
+        def card(name, status, started, question=None, source="tsv", mtime=None):
+            agent = self.agent("p", name, started)
+            agent.key, agent.status = name, status
+            agent.start_source = source
+            agent.log_mtime = started if mtime is None else mtime
+            agent.question, agent.completion_time = question, None
+            return agent
+
+        def question(age, escalated=False):
+            return {"mtime": now - age, "answered": False, "escalated": escalated}
+
+        agents = [
+            card("waiting-q", "question", now, question(60)),
+            card("overdue-q", "question", now, question(watch.QUESTION_OVERDUE_SECONDS)),
+            card("escalated-q", "question", now, question(60, True)),
+            card("blocked", "blocked", now), card("failed", "failed", now),
+            card("no-report", "no_report", now), card("waiting", "waiting", now),
+            card("malformed", "error", now, {"error": "bad"}),
+            card("handed", "failed", now), card("clear-reason", "failed", now),
+            card("clear", "blocked", now), card("done", "complete", now),
+            card("mtime-fallback", "complete", day - 86400, source="pid", mtime=now),
+            card("old-mtime", "failed", now, source="log", mtime=day - 86400),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = watch.WatchState(Path(tmp) / "state.json")
+            state._handoff["handed"] = "replacement"
+            cleared_agents = {agent.key: agent for agent in agents}
+            for key, reason in (("clear-reason", "reason"), ("clear", "")):
+                state.data["tasks"][key] = {
+                    "dismissed": True,
+                    "dismissed_at": watch.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
+                    "dismissed_reason": reason,
+                    "dismissed_sig": state.dismissed_signature(cleared_agents[key]),
+                }
+            row = watch.daily_attention_row(agents, state, now)
+            self.assertEqual(
+                {key: row[key] for key in watch.N7_DAILY_STATS_COLUMNS[1:]},
+                {
+                    "total_cards": 13, "q_waiting": 1, "q_overdue": 1,
+                    "escalated": 1, "blocked": 1, "failed": 1, "no_report": 1,
+                    "attention_other": 2, "handed_off": 1, "manual_cleared": 2,
+                    "manual_with_reason": 1, "attention_ratio": "61.5",
+                },
+            )
+            empty = watch.daily_attention_row([], state, now)
+            self.assertEqual((empty["total_cards"], empty["attention_ratio"]), (0, ""))
+
+    def test_daily_attention_prefers_tsv_started_at_to_log_mtime(self):
+        day = self.day_start()
+        now = day + 8 * 3600
+        agent = self.agent("other", "未判斷", now)
+        agent.key = "started-at-priority"
+        agent.status = "failed"
+        agent.start_source = "tsv"
+        agent.log_mtime = day - 86400
+        with tempfile.TemporaryDirectory() as tmp:
+            state = watch.WatchState(Path(tmp) / "state.json")
+            row = watch.daily_attention_row([agent], state, now)
+
+        self.assertEqual(row["total_cards"], 1)
+        self.assertEqual(row["failed"], 1)
+        self.assertEqual(row["attention_ratio"], "100.0")
+
+    def test_daily_attention_suppresses_only_matching_dismissed_signature(self):
+        day = self.day_start()
+        now = day + 8 * 3600
+        completion_changed = self.agent("other", "未判斷", now)
+        completion_changed.key = "completion-changed"
+        completion_changed.status = "failed"
+        completion_changed.start_source = "tsv"
+        completion_changed.completion_time = now - 30
+
+        question_changed = self.agent("other", "未判斷", now)
+        question_changed.key = "question-changed"
+        question_changed.status = "question"
+        question_changed.start_source = "tsv"
+        question_changed.completion_time = None
+        question_changed.question = {
+            "id": "new-question", "mtime": now - 60, "answered": False,
+        }
+
+        matching = self.agent("other", "未判斷", now)
+        matching.key = "matching"
+        matching.status = "blocked"
+        matching.start_source = "tsv"
+
+        agents = [completion_changed, question_changed, matching]
+        dismissed_at = watch.datetime.fromtimestamp(now).astimezone().isoformat(
+            timespec="seconds"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state = watch.WatchState(Path(tmp) / "state.json")
+            state.data["tasks"] = {
+                "completion-changed": {
+                    "dismissed": True, "dismissed_at": dismissed_at,
+                    "dismissed_reason": "resolved",
+                    "dismissed_sig": f"failed||{now - 90}",
+                },
+                "question-changed": {
+                    "dismissed": True, "dismissed_at": dismissed_at,
+                    "dismissed_reason": "resolved",
+                    "dismissed_sig": "question|old-question|",
+                },
+                "matching": {
+                    "dismissed": True, "dismissed_at": dismissed_at,
+                    "dismissed_sig": state.dismissed_signature(matching),
+                },
+            }
+            row = watch.daily_attention_row(agents, state, now)
+
+        self.assertEqual(row["manual_cleared"], 3)
+        self.assertEqual(row["manual_with_reason"], 2)
+        self.assertEqual(row["failed"], 1)
+        self.assertEqual(row["q_waiting"], 1)
+        self.assertEqual(row["blocked"], 0)
+        self.assertEqual(row["attention_ratio"], "66.7")
+
+    def test_daily_writer_merges_n7_n9_columns_and_keeps_older_row(self):
+        day = self.day_start()
+        older = day - 86400
+        now = day + 8 * 3600
+        old_agent = self.agent("other", "old", older + 60)
+        today_agent = self.agent("other", "today", day + 60)
+        today_agent.start_source = "tsv"
+        for order in (("n7", "n9"), ("n9", "n7")):
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "daily.tsv"
+                state = watch.WatchState(Path(tmp) / "state.json")
+                n7_row = watch.daily_attention_row([today_agent], state, now)
+                watch.write_daily_stats(target, [old_agent], older, now)
+                old_line = target.read_text(encoding="utf-8").splitlines()[1]
+                for writer in order:
+                    if writer == "n7":
+                        watch.write_daily_stats(
+                            target, [today_agent], day, now, row=n7_row,
+                            owned_columns=watch.N7_DAILY_STATS_COLUMNS,
+                        )
+                    else:
+                        watch.write_daily_stats(target, [today_agent], day, now)
+                lines = target.read_text(encoding="utf-8").splitlines()
+                header = lines[0].split("\t")
+                values = dict(zip(header, lines[-1].split("\t")))
+                self.assertEqual(lines[1], old_line)
+                self.assertTrue(set(watch.N7_DAILY_STATS_COLUMNS) <= set(header))
+                self.assertEqual(values["total_cards"], "1")
+                self.assertEqual(values["other_count"], "1")
+                self.assertEqual(sum(line.startswith("2026-10-28\t") for line in lines), 1)
+
     def test_other_days_are_preserved_and_sorted(self):
         day = self.day_start()
         older = day - 86400
@@ -381,6 +533,24 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual([row.split("\t")[0] for row in rows], ["2026-10-27", "2026-10-28"])
             self.assertEqual(rows[0].split("\t")[watch.DAILY_STATS_COLUMNS.index("other_count")], "1")
             self.assertEqual(rows[1].split("\t")[watch.DAILY_STATS_COLUMNS.index("other_count")], "0")
+
+    def test_writer_rejects_a_row_for_yesterday(self):
+        day = self.day_start()
+        yesterday = day - 86400
+        yesterday_date = time.strftime("%Y-%m-%d", time.localtime(yesterday))
+        old_line = yesterday_date + "\t5\t1\t20.0"
+        original = "\t".join(watch.DAILY_STATS_COLUMNS) + "\n" + old_line + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            target.write_text(original, encoding="utf-8")
+            stale_row = {"date": yesterday_date}
+            with self.assertLogs("watch", level="WARNING") as logged:
+                watch.write_daily_stats(
+                    target, [], day_start=day, now=day + 8 * 3600,
+                    row=stale_row, owned_columns=watch.N7_DAILY_STATS_COLUMNS,
+                )
+            self.assertIn("not today", logged.output[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
 
     def test_older_column_rows_are_kept_verbatim(self):
         # A column-set upgrade must not erase earlier days (P3-3).
@@ -488,6 +658,130 @@ class DailyStatsTests(unittest.TestCase):
             )
             self.assertEqual(stale.read_text(encoding="utf-8"), "another writer's file\n")
             self.assertTrue(target.is_file())
+
+
+class DailyStatsIntegrationTests(unittest.TestCase):
+    def day_start(self, year=2026, month=10, day=28):
+        return time.mktime((year, month, day, 0, 0, 0, 0, 0, -1))
+
+    def agent(self, now, status="complete", key="today"):
+        return watch.AgentInfo(
+            name=key,
+            log_path=Path("/tmp") / key / "run.log",
+            last_path=Path("/tmp") / key / "REPORT.md",
+            status=status,
+            model="test",
+            start_time=now - 60,
+            elapsed="1m",
+            latest=status,
+            log_mtime=now,
+            key=key,
+            completion_time=now - 30 if status == "complete" else None,
+            project="other",
+            project_source="未判斷",
+            start_source="tsv",
+        )
+
+    def test_daily_path_uses_env_override_and_root_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            override = Path(tmp) / "override.tsv"
+            with patch.object(watch, "ROOT_DIR", root), patch.dict(
+                os.environ, {"AGENT_WATCH_DAILY": str(override)}
+            ):
+                self.assertEqual(watch.daily_stats_path_from_env(), override)
+            with patch.object(watch, "ROOT_DIR", root), patch.dict(os.environ):
+                os.environ.pop("AGENT_WATCH_DAILY", None)
+                self.assertEqual(
+                    watch.daily_stats_path_from_env(),
+                    root / "agent-watch-daily.tsv",
+                )
+
+    def test_update_data_writes_changed_today_once_and_preserves_other_columns(self):
+        day = self.day_start()
+        older_day = day - 86400
+        now = day + 8 * 3600
+        older_agent = self.agent(older_day + 3600, key="older")
+        today_agent = self.agent(now)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "agent-watch-daily.tsv"
+            watch.write_daily_stats(
+                target, [older_agent], day_start=older_day, now=older_day + 86400,
+            )
+            watch.write_daily_stats(
+                target, [today_agent], day_start=day, now=now,
+            )
+            old_date = time.strftime("%Y-%m-%d", time.localtime(older_day))
+            old_line = next(
+                line for line in target.read_text(encoding="utf-8").splitlines()
+                if line.startswith(old_date + "\t")
+            )
+            current_agents = [today_agent]
+            app = watch.AgentWatchApp(
+                runs_path=root / "runs.tsv",
+                done_path=root / "done.tsv",
+                state_path=root / "state.json",
+                decisions_path=root / "decisions",
+                daily_stats_path=target,
+            )
+            with patch.object(
+                watch, "load_all_agents",
+                side_effect=lambda *args: (current_agents, []),
+            ), patch.object(
+                watch, "notify_completion",
+            ):
+                self.assertTrue(app.update_data(now=now))
+                first_text = target.read_text(encoding="utf-8")
+                first_stat = target.stat()
+
+                self.assertFalse(app.update_data(now=now + 1))
+                self.assertEqual(target.read_text(encoding="utf-8"), first_text)
+                self.assertEqual(target.stat().st_mtime_ns, first_stat.st_mtime_ns)
+
+                today_agent.status = "blocked"
+                today_agent.latest = "blocked"
+                self.assertTrue(app.update_data(now=now + 2))
+
+            lines = target.read_text(encoding="utf-8").splitlines()
+            header = lines[0].split("\t")
+            today_date = time.strftime("%Y-%m-%d", time.localtime(now))
+            today_lines = [
+                line for line in lines[1:]
+                if line.split("\t", 1)[0] == today_date
+            ]
+            self.assertEqual(len(today_lines), 1)
+            values = dict(zip(header, today_lines[0].split("\t")))
+            self.assertEqual(values["other_count"], "1")
+            self.assertEqual(values["basis_未判斷"], "1")
+            self.assertEqual(values["blocked"], "1")
+            self.assertTrue(set(watch.N7_DAILY_STATS_COLUMNS) <= set(header))
+            self.assertTrue(set(watch.DAILY_STATS_COLUMNS) <= set(header))
+            self.assertEqual(
+                next(line for line in lines[1:] if line.startswith(old_date + "\t")),
+                old_line,
+            )
+            self.assertNotEqual(target.read_text(encoding="utf-8"), first_text)
+
+    def test_update_data_logs_writer_failure_and_continues(self):
+        now = self.day_start() + 8 * 3600
+        agent = self.agent(now)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = watch.AgentWatchApp(
+                runs_path=root / "runs.tsv",
+                done_path=root / "done.tsv",
+                state_path=root / "state.json",
+                decisions_path=root / "decisions",
+                daily_stats_path=root / "agent-watch-daily.tsv",
+            )
+            with patch.object(
+                watch, "load_all_agents", return_value=([agent], [])
+            ), patch.object(
+                watch, "write_daily_stats", side_effect=OSError("write blocked")
+            ), self.assertLogs("watch", level="WARNING") as logged:
+                self.assertTrue(app.update_data(now=now))
+            self.assertIn("daily stats update failed", logged.output[0])
 
 
 if __name__ == "__main__":
