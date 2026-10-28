@@ -4076,8 +4076,9 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
 SUPERSEDED_HANDOFF_WORD = (
-    r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
+    r"(?:fix|retry|rerun|redo|rework|claude|resume)"
 )
+REVIEW_CARD_SUFFIX_RE = re.compile(r"(?:review\d*|rereview)$", re.IGNORECASE)
 # SPEC §A name rule: only an explicit hand-off suffix links an old card to a
 # newer one. Phase/version markers (`-p12`, `-v10`) stay part of the card's
 # identity; a repair word glued straight onto one is still stripped and the
@@ -4117,6 +4118,47 @@ def _same_known_project(left: AgentInfo, right: AgentInfo) -> bool:
         and right.project != PROJECT_OTHER
         and left.project == right.project
     )
+
+
+def _review_for(replacement: AgentInfo, agents: List[AgentInfo]) -> Optional[AgentInfo]:
+    prefix = replacement.name.casefold() + "-"
+    reviews = [
+        agent for agent in agents
+        if agent.key != replacement.key
+        and _same_known_project(replacement, agent)
+        and agent.name.casefold().startswith(prefix)
+        and REVIEW_CARD_SUFFIX_RE.fullmatch(agent.name.casefold()[len(prefix):])
+    ]
+    return max(reviews, key=_replacement_time) if reviews else None
+
+
+def _read_first_lines(path: Path) -> List[str]:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            return [line.rstrip("\r\n") for _, line in zip(range(20), stream)]
+    except OSError:
+        return []
+
+
+def _review_verdict(agent: AgentInfo) -> Optional[str]:
+    folder = agent.last_path.parent
+    review_lines = _read_first_lines(folder / "REVIEW.md")
+    report_lines = _read_first_lines(folder / "REPORT.md")
+    if review_lines:
+        match = re.match(r"^[\s#>*`-]*(PASS|FAIL)\b", review_lines[0], re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    if report_lines:
+        match = re.match(r"^\s*DONE\s+[—-]\s*(PASS|FAIL)\b", report_lines[0], re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    for line in review_lines + report_lines:
+        match = re.match(
+            r"^[\s#>*-]*verdict\s*[:：]\s*(PASS|FAIL)\b", line, re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper()
+    return None
 
 
 def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
@@ -4227,6 +4269,8 @@ class WatchState:
         self._superseded: Dict[str, str] = {}
         # Old task key -> name of the replacement that is still running.
         self._handoff: Dict[str, str] = {}
+        self._auto_clear_labels: Dict[str, str] = {}
+        self._review_failures: Set[str] = set()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self._validate(data)
@@ -4343,6 +4387,10 @@ class WatchState:
             return ""
         if self._dismissed(agent):
             return "已清除"
+        if agent.key in self._review_failures:
+            return "修正卡審查 FAIL"
+        if agent.key in self._auto_clear_labels:
+            return self._auto_clear_labels[agent.key]
         if agent.key in self._handoff:
             # Still handed off, not finished: it must not expire into history.
             return ""
@@ -4429,10 +4477,26 @@ class WatchState:
         """Reconcile run state after a complete registry snapshot."""
         self._superseded = compute_superseded(agents)
         by_key = {agent.key: agent for agent in agents}
-        self._handoff = {
-            old: by_key[new].name for old, new in self._superseded.items()
-            if by_key[new].status == "running"
-        }
+        self._handoff = {}
+        self._auto_clear_labels = {}
+        self._review_failures = set()
+        for old, new in self._superseded.items():
+            replacement = by_key[new]
+            if replacement.status != "complete":
+                self._handoff[old] = replacement.name
+                continue
+            review = _review_for(replacement, agents)
+            if review is None:
+                self._auto_clear_labels[old] = "已接手完成 → " + replacement.name
+            elif review.status == "running" or question_is_active(
+                review.question, review.completion_time,
+            ):
+                self._handoff[old] = replacement.name
+            elif (verdict := _review_verdict(review)) == "FAIL":
+                self._review_failures.add(old)
+            else:
+                note = "（審查讀不到，DONE 即清）" if verdict is None else ""
+                self._auto_clear_labels[old] = "已接手完成 → " + replacement.name + note
         data = copy.deepcopy(self.data)
         changed = False
         cleanup_warning = ""
@@ -4493,6 +4557,8 @@ class WatchState:
             return "attention"
         if agent.status == "running":
             return "running"
+        if agent.key in self._review_failures:
+            return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
             return "history"
@@ -4630,6 +4696,8 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
         status = history_label or "已完成"
     elif bucket == "handoff":
         status = history_label or "已接手"
+    elif bucket == "attention" and history_label == "修正卡審查 FAIL":
+        status = history_label
     if bucket in ("recent", "history", "handoff"):
         line = "{}{} {} │ {} │ {}".format(
             marker, format_completion_time(agent.completion_time, now),
@@ -5997,7 +6065,7 @@ class AgentWatchApp(App):
         handoff_box = self.query_one("#handoff-box", Vertical)
         handoff_box.remove_children()
         handoff_box.display = bool(handoff)
-        handoff_box.border_title = f"已接手 · {len(handoff)} · 修正卡進行中"
+        handoff_box.border_title = f"已接手 · {len(handoff)} · 等待結果"
         if handoff:
             handoff_box.mount(*[row(a) for a in handoff])
         pinned_box.mount(*([row(a) for a in pinned] if pinned else [

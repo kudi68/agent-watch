@@ -2510,12 +2510,97 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         state.reconcile([old, new], self.now)
         self.assertEqual(state.bucket(old, self.now), "attention")
         self.assertEqual(state.handoff_label(old), "")
-        for status in ("complete", "reported", "partial"):
+        for status, bucket in (("complete", "history"), ("reported", "handoff"),
+                               ("partial", "handoff")):
             with self.subTest(status=status):
-                new.status = status
+                new.status, new.completion_time = status, self.now - 10
                 state.reconcile([old, new], self.now)
-                self.assertEqual(state.bucket(old, self.now), "history")
-                self.assertEqual(state.stale_info(old, self.now), "已被取代")
+                self.assertEqual(state.bucket(old, self.now), bucket)
+                if status == "complete":
+                    self.assertEqual(
+                        state.stale_info(old, self.now),
+                        "已接手完成 → claude-perm-p2-fix2",
+                    )
+
+    def review_case(self, status="complete", report=None, review=None, question=None):
+        old, fix = self.pair("complete", completion_time=self.now - 10)
+        directory = tempfile.TemporaryDirectory(prefix="aw-review-card-")
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        if report is not None:
+            (folder / "REPORT.md").write_text(report, encoding="utf-8")
+        if review is not None:
+            (folder / "REVIEW.md").write_text(review, encoding="utf-8")
+        reviewer = self.agent(
+            fix.name + "-review", status, last_path=folder / "task.log",
+            completion_time=self.now - 5, question=question,
+        )
+        agents = [old, fix, reviewer]
+        return old, fix, reviewer, agents, self.make_state(agents)
+
+    def test_review_pass_clears_old_card(self):
+        old, _, _, _, state = self.review_case(review="Review notes\nverdict: PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(
+            state.stale_info(old, self.now), "已接手完成 → claude-perm-p2-fix2",
+        )
+
+    def test_review_fail_returns_old_card_to_attention(self):
+        old, _, _, _, state = self.review_case(review="FAIL\n")
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_running_review_keeps_old_card_in_handoff(self):
+        old, _, _, _, state = self.review_case(status="running", review="PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+
+    def test_unreadable_verdict_clears_with_note(self):
+        old, _, _, _, state = self.review_case(report="DONE\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertIn("（審查讀不到，DONE 即清）", state.stale_info(old, self.now))
+
+    def test_done_fail_report_first_line_parses_as_fail(self):
+        old, _, _, _, state = self.review_case(
+            report="DONE — FAIL（P2 × 2、P3 × 4）\n",
+        )
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_auto_clear_recomputes_when_review_flips_to_fail(self):
+        old, _, reviewer, agents, state = self.review_case(review="PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.task(old.key), {})
+        (reviewer.last_path.parent / "REVIEW.md").write_text("FAIL\n", encoding="utf-8")
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_active_review_question_keeps_old_card_handed_off(self):
+        old, _, _, _, state = self.review_case(
+            question={"id": "q1", "answered": False},
+        )
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+
+    def test_review_inputs_are_read_only(self):
+        old, _, reviewer, agents, _ = self.review_case(
+            report="DONE — FAIL（P2 × 2、P3 × 4）\n", review="FAIL\n",
+        )
+        folder = reviewer.last_path.parent
+        paths = [folder / name for name in (
+            "agent-runs.tsv", "agent-runs-done.tsv", "REPORT.md",
+            "REVIEW.md", "QUESTION.md", "ANSWER.md",
+        )]
+        for path in paths:
+            path.touch(exist_ok=True)
+        (folder / "QUESTION.md").write_text(
+            "# QUESTION\nid: q1\noptions:\n- A: A\n", encoding="utf-8",
+        )
+        before = [(path.stat().st_mtime_ns, path.read_bytes()) for path in paths]
+        state = watch.WatchState(folder / "state.json")
+        state.reconcile(agents, self.now)
+        self.assertEqual(
+            before, [(path.stat().st_mtime_ns, path.read_bytes()) for path in paths],
+        )
 
     def test_handoff_row_names_replacement_in_teal(self):
         old, new = self.pair()
@@ -2641,7 +2726,6 @@ class SupersessionTests(unittest.TestCase):
             ("awv10-p2", "awv10-p2fix"),
             ("task", "task-fix"),
             ("task-p2", "task-p2fix"),
-            ("task", "task-rereview"),
             ("task-fix", "task-fix2-retry-3"),
         ):
             with self.subTest(old=old_name, new=new_name):
@@ -2649,6 +2733,13 @@ class SupersessionTests(unittest.TestCase):
                     watch._normalized_task_name(old_name),
                     watch._normalized_task_name(new_name),
                 )
+
+    def test_review_card_names_do_not_supersede_original_card(self):
+        old = self.make_agent("task", "failed", start=100, completion=200)
+        for name in ("task-review", "task-rereview"):
+            with self.subTest(name=name):
+                review = self.make_agent(name, "running", start=300)
+                self.assertNotIn(old.key, watch.compute_superseded([old, review]))
 
     def test_numbered_sibling_cards_keep_their_own_status(self):
         for old_name, new_name in (
@@ -2847,7 +2938,7 @@ class SupersessionTests(unittest.TestCase):
         state = self.make_state()
         state.reconcile([old, replacement], 310)
         self.assertEqual(state.bucket(old, 310), "history")
-        self.assertEqual(state.stale_info(old, 310), "已被取代")
+        self.assertEqual(state.stale_info(old, 310), "已接手完成 → claude-perm-p2-fix2")
 
     def test_name_matching_never_crosses_project_boundary(self):
         old = self.make_agent(
