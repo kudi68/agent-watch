@@ -1181,16 +1181,24 @@ def read_task_question(directory: Path) -> Optional[Dict[str, Any]]:
     return question
 
 
+def question_is_malformed(question: Optional[Dict[str, Any]]) -> bool:
+    """True when QUESTION.md cannot be answered until someone fixes the file."""
+    return bool(question and question.get("error"))
+
+
 def question_is_active(question: Optional[Dict[str, Any]],
                        completion_time: Optional[float] = None) -> bool:
-    """An unanswered question is attention until a matching ANSWER.md exists."""
-    if not question or question.get("answered"):
+    """An unanswered, well-formed question is attention until a matching ANSWER.md exists.
+
+    A malformed question (parse error: missing id/question/options, bad option
+    syntax) can never be answered, so it must not pin the card to attention
+    forever: the card falls back to its own status, the board labels it
+    `malformed`, and `x` clears it. `completion_time` is kept for call
+    compatibility; SPEC §3.3 never expires a question by time, so it is unused.
+    """
+    if question is None or question.get("error"):
         return False
-    asked = question.get("asked_at_ts") or question.get("mtime") or 0
-    if completion_time is not None and asked <= completion_time:
-        # A leftover question older than the finished run belongs to an older run.
-        return False
-    return True
+    return not question.get("answered")
 
 
 def question_escalated(question: Optional[Dict[str, Any]],
@@ -4066,11 +4074,33 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
-SUPERSEDED_SUFFIX_RE = re.compile(r"(?:-retry|-claude|-rerun|-redo|-fix|-v\d+|-?\d+)$", re.IGNORECASE)
+SUPERSEDED_HANDOFF_WORD = (
+    r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
+)
+# SPEC §A name rule: only an explicit hand-off suffix links an old card to a
+# newer one. Phase/version markers (`-p12`, `-v10`) stay part of the card's
+# identity; a repair word glued straight onto one is still stripped and the
+# marker kept via the `phase` group (`awv10-p12fix` -> `awv10-p12`). The glued
+# form needs no hyphen, so `wp6fix` -> `wp6` too; a bare `wp6` is untouched.
+SUPERSEDED_SUFFIX_RE = re.compile(
+    r"(?:-|(?P<phase>[pv]\d+))"                          # -fix / p12fix
+    + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?$",       # fix, fix2, retry-3
+    re.IGNORECASE,
+)
+
+
+def _strip_handoff_suffix(match: "re.Match[str]") -> str:
+    return match.group("phase") or ""
 
 
 def _normalized_task_name(name: str) -> str:
-    return SUPERSEDED_SUFFIX_RE.sub("", name.casefold())
+    """Strip repeated hand-off suffixes; a name without one is its own family."""
+    normalized = name.casefold()
+    while True:
+        stripped = SUPERSEDED_SUFFIX_RE.sub(_strip_handoff_suffix, normalized)
+        if stripped == normalized:
+            return normalized.strip()
+        normalized = stripped
 
 
 def _replacement_time(agent: AgentInfo) -> float:
@@ -4079,16 +4109,27 @@ def _replacement_time(agent: AgentInfo) -> float:
     return agent.start_time or agent.log_mtime or 0.0
 
 
+def _same_known_project(left: AgentInfo, right: AgentInfo) -> bool:
+    return bool(
+        left.project and right.project
+        and left.project != PROJECT_OTHER
+        and right.project != PROJECT_OTHER
+        and left.project == right.project
+    )
+
+
 def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
     """Map an actionable old task key to a successful or running replacement key."""
     result: Dict[str, str] = {}
     replaceable = [
         agent for agent in agents
-        if agent.status in ATTENTION_FAILURE_STATUSES or agent.status == "question"
+        if agent.status in ATTENTION_FAILURE_STATUSES
+        and not question_is_active(agent.question, agent.completion_time)
     ]
     replacements = [
         agent for agent in agents
         if agent.status in SUPERSEDED_REPLACEMENT_STATUSES
+        and not question_is_active(agent.question, agent.completion_time)
     ]
 
     for old in replaceable:
@@ -4106,6 +4147,7 @@ def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
             matches = [
                 agent for agent in replacements
                 if agent.key != old.key
+                and _same_known_project(old, agent)
                 and agent.name.casefold() == old.name.casefold()
                 and agent.start_time is not None
                 and (old.start_time is None or agent.start_time > old.start_time)
@@ -4115,12 +4157,22 @@ def compute_superseded(agents: List[AgentInfo]) -> Dict[str, str]:
 
         if target is None and old.completion_time is not None:
             old_family = _normalized_task_name(old.name)
-            matches = [
-                agent for agent in agents
+            # A name that normalizes to nothing never identifies a family.
+            matches = [] if not old_family else [
+                agent for agent in replacements
                 if agent.key != old.key
-                and agent.status in SUPERSEDED_SUCCESS_STATUSES
-                and agent.completion_time is not None
-                and agent.completion_time > old.completion_time
+                and _same_known_project(old, agent)
+                and (
+                    (
+                        agent.status == "running"
+                        and _replacement_time(agent) > old.completion_time
+                    )
+                    or (
+                        agent.status in SUPERSEDED_SUCCESS_STATUSES
+                        and agent.completion_time is not None
+                        and agent.completion_time > old.completion_time
+                    )
+                )
                 and _normalized_task_name(agent.name) == old_family
                 and agent.name.casefold() != old.name.casefold()
             ]
@@ -4249,15 +4301,6 @@ class WatchState:
             and entry.get("dismissed_sig") == self.dismissed_signature(agent)
         )
 
-    def _question_is_stale(self, agent: AgentInfo, now: float) -> bool:
-        question = agent.question
-        if not question_is_active(question, agent.completion_time):
-            return False
-        if agent.process_alive is True:
-            return False
-        asked = question.get("asked_at_ts") or question.get("mtime") or 0
-        return bool(asked and now - asked > STALE_ATTENTION_SECONDS)
-
     def remember_escalation(self, agent: AgentInfo, question: Optional[Dict[str, Any]] = None,
                             target: str = "") -> bool:
         """Remember the hand-off so a later normal answer can name who answered."""
@@ -4290,14 +4333,14 @@ class WatchState:
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the history label for a dismissed, expired, or replaced task."""
+        if question_is_active(agent.question, agent.completion_time):
+            return ""
         if agent.status == "running":
             return ""
         if self._dismissed(agent):
             return "已清除"
         if agent.key in self._superseded:
             return "已被取代"
-        if self._question_is_stale(agent, now):
-            return "已過期"
         if agent.status in ATTENTION_FAILURE_STATUSES:
             timestamp = agent.completion_time or agent.log_mtime
             if timestamp and now - timestamp > STALE_ATTENTION_SECONDS:
@@ -4429,15 +4472,10 @@ class WatchState:
                 self.warning = cleanup_warning
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
+        if question_is_active(agent.question, agent.completion_time):
+            return "attention"
         if agent.status == "running":
             return "running"
-        active_question = question_is_active(agent.question, agent.completion_time)
-        if (
-            active_question and not self._dismissed(agent)
-            and agent.key not in self._superseded
-            and not self._question_is_stale(agent, now)
-        ):
-            return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
             return "history"
@@ -4457,6 +4495,8 @@ class WatchState:
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
+            if question_is_active(agent.question, agent.completion_time):
+                return False, "尚未收到這題的有效 ANSWER.md，不能清除"
             if agent.status == "running" or bucket == "running":
                 return False, "進行中的任務不能清除"
             if bucket != "attention" and disposition not in ("已過期", "已被取代"):
@@ -4470,6 +4510,8 @@ class WatchState:
                 dismissed_sig=self.dismissed_signature(agent),
                 run_start=agent.start_time,
             )
+            if ok and question_is_malformed(agent.question):
+                return True, "已清除 malformed 問題卡；不會刪除或修改 QUESTION.md"
             if ok and agent.question:
                 return True, "已清除；不會刪除或修改 QUESTION.md／ANSWER.md"
             return ok, "已清除" if ok else self.warning
@@ -4512,6 +4554,8 @@ class WatchState:
         """Clear only expired or superseded tasks after the caller confirms."""
         count = 0
         for agent in agents:
+            if question_is_active(agent.question, agent.completion_time):
+                continue
             if self.stale_info(agent, now) not in ("已過期", "已被取代"):
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)
@@ -4594,7 +4638,9 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     wait_text = ""
     if agent.question:
         if agent.question.get("error"):
-            detail = "問題格式錯誤：" + agent.question["error"]
+            detail = "malformed · 問題格式錯誤：%s · 補好 QUESTION.md 或按 x 清除" % (
+                agent.question["error"],
+            )
         elif agent.status == "escalated":
             detail = "已轉介給 %s，等上層回答：%s" % (
                 agent.question.get("escalate_to") or DEFAULT_ESCALATE_TARGET,
@@ -5604,7 +5650,10 @@ class QuestionScreen(ModalScreen):
                     id="question-note",
                 )
             yield Static(
-                "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · 最下面兩列轉給上層 · Esc 取消",
+                ("malformed：問題格式錯誤，不能回答 · 補好 QUESTION.md 後重開，"
+                 "或 Esc 回看板按 x 清除（不會刪檔）"
+                 if question.get("error") else
+                 "選項 ↑↓ 移動 · Enter 送出並寫 ANSWER.md · 最下面兩列轉給上層 · Esc 取消"),
                 id="question-hint",
             )
 
