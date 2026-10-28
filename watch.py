@@ -860,7 +860,7 @@ def daily_attention_row(
             continue
     counts = {column: 0 for column in N7_DAILY_STATS_COLUMNS[2:10]}
     for agent in cards:
-        if agent.key in cleared:
+        if state._dismissed(agent):
             continue
         bucket = state.bucket(agent, now)
         if bucket == "handoff":
@@ -928,6 +928,13 @@ def write_daily_stats(
     day = str(values.get("date", ""))
     if not day:
         raise ValueError("daily stats row requires a date")
+    expected_day = datetime.fromtimestamp(day_start).date().isoformat()
+    if day != expected_day:
+        logging.getLogger(__name__).warning(
+            "daily stats row date %s is not today (%s); skipping write",
+            day, expected_day,
+        )
+        return target
     owned = DAILY_STATS_COLUMNS if owned_columns is None else owned_columns
     source_columns = list(DAILY_STATS_COLUMNS)
     columns = list(DAILY_STATS_COLUMNS)
