@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo
 from rich.markup import escape
 from rich.text import Text
 
+import tok_speed
+
 # Textual imports (conditional for --once flag speed)
 try:
     from textual.app import App, ComposeResult
@@ -59,6 +61,8 @@ ARCHITECTURE_PATH = _env_path(
     "AGENT_WATCH_ARCH", Path(__file__).with_name("arch.json")
 )
 MAGPIE_COMMAND = os.environ.get("AGENT_WATCH_MAGPIE", "magpie")
+# Daily tok/s per model/tier, long format (see tok_speed.py).
+DEFAULT_TOKS_TSV = _env_path("AGENT_WATCH_TOKS_TSV", ROOT_DIR / "agent-watch-toks.tsv")
 
 
 def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -4544,7 +4548,7 @@ def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
 
 def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False,
                     bucket: Optional[str] = None, history_label: str = "",
-                    answered_by: str = "") -> Text:
+                    answered_by: str = "", toks_text: str = "") -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
     bucket = bucket or board_bucket(agent, now)
@@ -4606,6 +4610,14 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
             wait_text = "  " + format_question_wait(wait_seconds)
         if answered_by and agent.status != "escalated":
             detail = "由 %s 回答 · %s" % (answered_by, detail)
+    if toks_text and bucket == "running":
+        # A running card's subtitle leads with its tok/s; the progress text keeps what is left.
+        speed = truncate_display("  " + toks_text, width)
+        result.append("\n" + speed, style="#7dcfff")
+        rest = width - display_width(speed)
+        if rest > 4:
+            result.append(truncate_display(" · " + detail, rest), style="#a9b1bd")
+        return result
     detail_width = max(1, width - display_width(wait_text))
     result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
     if wait_text:
@@ -5296,6 +5308,22 @@ class RunDataService:
         return True
 
 
+def toks_anchor(agent: AgentInfo) -> tok_speed.CardAnchor:
+    """What tok_speed needs to join magpie rows to this card; reading the log is left to its worker."""
+    end = agent.completion_time
+    if end is None and agent.status != "running" and agent.log_mtime:
+        end = agent.log_mtime
+    log_path = str(agent.log_path)
+    return tok_speed.CardAnchor(
+        key=agent.key,
+        agent=tok_speed.magpie_agent_name(agent.harness),
+        alias="" if agent.model == UNKNOWN_IDENTITY else agent.model,
+        start=agent.start_time,
+        end=end,
+        log_path="" if log_path == "/dev/null" else log_path,
+    )
+
+
 class NavTab(Static):
     def __init__(self, label: str, tab_id: str):
         super().__init__(label, classes="nav-tab", markup=False)
@@ -5343,6 +5371,7 @@ class TaskRow(Static, can_focus=True):
             agent, self.content_size.width, self.now, self.selected, bucket,
             self.app.state.stale_info(agent, self.now),
             self.app.state.answered_by(agent),
+            self.app.toks_text(agent, bucket),
         )
 
     def on_focus(self) -> None:
@@ -5726,6 +5755,7 @@ class AgentWatchApp(App):
         done_path: Path = DEFAULT_DONE_TSV,
         state_path: Optional[Path] = None,
         decisions_path: Optional[Path] = None,
+        toks_svc: Optional[tok_speed.TokSpeedService] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
@@ -5736,6 +5766,10 @@ class AgentWatchApp(App):
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.decision_svc = DecisionService(decisions_path)
+        # tok/s is off unless main() passes a service, so tests never run magpie
+        # or write the live daily TSV by accident.
+        self.toks_svc = toks_svc
+        self._toks_version = -1
         self.notified_keys: Set[str] = set()
         self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
@@ -6442,6 +6476,30 @@ class AgentWatchApp(App):
         self.update_tree_display(force=True)
         self.set_interval(2.0, self.poll_data)
         self.set_interval(float(DECISIONS_REFRESH_SECONDS), self.refresh_decisions)
+        if self.toks_svc is not None:
+            self.set_interval(1.0, self.poll_toks)
+
+    def toks_text(self, agent: AgentInfo, bucket: str) -> str:
+        """Running rows' tok/s subtitle; empty when tok/s is off or the card is not running."""
+        if self.toks_svc is None or bucket != "running":
+            return ""
+        try:
+            return tok_speed.format_card_speed(self.toks_svc.result(agent.key))
+        except Exception:
+            return tok_speed.DASH + " tok/s"
+
+    def poll_toks(self) -> None:
+        """Checked every second; the service itself caches the magpie read and runs it off the UI thread."""
+        if self.toks_svc is None or not self._ui_ready:
+            return
+        try:
+            self.toks_svc.refresh_in_background([toks_anchor(a) for a in self.current_agents])
+            if self.toks_svc.version != self._toks_version:
+                self._toks_version = self.toks_svc.version
+                for widget in self._row_widgets.values():
+                    widget.refresh()
+        except Exception as e:
+            self.ui_error = f"tok/s 更新失敗：{e}"
 
     def refresh_decisions(self) -> None:
         """60 秒一次的專案樹重讀；新增的決策檔不用改設定就會出現。"""
@@ -6672,7 +6730,10 @@ def main():
     if args.once:
         return run_once_summary(runs_p, done_p)
 
-    app = AgentWatchApp(runs_path=runs_p, done_path=done_p)
+    app = AgentWatchApp(
+        runs_path=runs_p, done_path=done_p,
+        toks_svc=tok_speed.TokSpeedService(tsv_path=DEFAULT_TOKS_TSV),
+    )
     app.run()
     return 0
 
