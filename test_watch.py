@@ -1371,7 +1371,9 @@ class TestAgentWatch(IsolatedState, unittest.TestCase):
             set(data["projects"]),
             {"personal-ai-os", "agent-watch", "ios-shortcuts", "c1-runtime",
              "m5-coding-canary", "M5-setup", "agentq-canary", "K1", "hermes",
-             "night", "other"},
+             "hermes-webui", "medical-tools", "medknowledge", "clinical-notes",
+             "textbook-to-note", "namerun", "ai-status", "personal-capture",
+             "kudi68-domain-infra", "agent-ops-pinned", "night", "other"},
         )
         self.assertEqual(
             set(data["projects"]["night"]),
