@@ -1,5 +1,8 @@
 """N9: unknown dispatch hints keep inferring, `其他` ratio, and the daily TSV."""
+import fcntl
 import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -7,6 +10,24 @@ from pathlib import Path
 from unittest.mock import patch
 
 import watch
+
+# A second process that reads the TSV slowly, so two writers that do not share
+# a lock both build their row from the same stale snapshot.
+RACE_WRITER = """
+import sys, time
+from pathlib import Path
+import watch
+
+plain = Path.read_text
+Path.read_text = lambda self, *a, **k: (plain(self, *a, **k), time.sleep(0.3))[0]
+print("ready", flush=True)
+sys.stdin.readline()
+watch.write_daily_stats(
+    Path(sys.argv[1]), [],
+    row={"date": time.strftime("%Y-%m-%d"), sys.argv[2]: sys.argv[3]},
+    owned_columns=(sys.argv[2],),
+)
+"""
 
 
 def add_project(test, project_id, **config):
@@ -363,6 +384,58 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(len(lines), 2)  # header + one day
             self.assertEqual(lines[0].split("\t"), list(watch.DAILY_STATS_COLUMNS))
             self.assertEqual(lines[1].split("\t")[0], "2026-10-28")
+
+    def test_two_writers_in_two_processes_keep_both_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "daily" / "agent-watch-daily.tsv"
+            procs = [
+                subprocess.Popen(
+                    [sys.executable, "-B", "-c", RACE_WRITER, str(target), column, value],
+                    cwd=str(Path(__file__).resolve().parent), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                for column, value in (("writer_a", "a1"), ("writer_b", "b1"))
+            ]
+            try:
+                for proc in procs:
+                    self.assertEqual(proc.stdout.readline().strip(), b"ready")
+                for proc in procs:
+                    proc.stdin.write(b"\n")
+                    proc.stdin.flush()
+                for proc in procs:
+                    _, errors = proc.communicate(timeout=60)
+                    self.assertEqual(proc.returncode, 0, errors.decode("utf-8"))
+            finally:
+                for proc in procs:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+            self.assertTrue(target.with_name(target.name + ".lock").is_file())
+            header, *rows = target.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rows), 1)
+            values = dict(zip(header.split("\t"), rows[0].split("\t")))
+            self.assertEqual((values.get("writer_a"), values.get("writer_b")), ("a1", "b1"))
+
+    def test_writer_skips_the_round_while_another_process_holds_the_lock(self):
+        day = self.day_start()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "daily" / "agent-watch-daily.tsv"
+            watch.write_daily_stats(
+                target, [self.agent("other", "未判斷", day + 3600)],
+                day_start=day, now=day + 86400,
+            )
+            before = target.read_text(encoding="utf-8")
+            lock_path = target.with_name(target.name + ".lock")
+            with open(lock_path, "a+") as held:
+                fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(watch, "DAILY_STATS_LOCK_TIMEOUT", 0.05), \
+                        self.assertLogs("watch", level="WARNING") as logged:
+                    watch.write_daily_stats(
+                        target, [self.agent("agent-watch", "標籤", day + 7200)],
+                        day_start=day, now=day + 86400,
+                    )
+            self.assertIn("lock busy", logged.output[0])
+            self.assertEqual(target.read_text(encoding="utf-8"), before)
 
     def test_daily_attention_classifies_today_and_empty_ratio(self):
         day = self.day_start()

@@ -4,6 +4,7 @@
 import argparse
 import calendar
 import copy
+import fcntl
 import json
 import logging
 import math
@@ -904,7 +905,7 @@ def _default_file_mode() -> int:
     return 0o666 & ~mask
 
 
-def write_daily_stats(
+def _merge_daily_stats(
     path: Path,
     agents: List["AgentInfo"],
     day_start: Optional[float] = None,
@@ -993,6 +994,47 @@ def write_daily_stats(
         raise
     return target
 
+
+DAILY_STATS_LOCK_TIMEOUT = 2.0
+
+
+def _acquire_daily_stats_lock(target: Path, timeout: Optional[float] = None):
+    """Take the `flock` next to the TSV, or return None when the budget runs out."""
+    budget = DAILY_STATS_LOCK_TIMEOUT if timeout is None else timeout
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(target.with_name(target.name + ".lock"), "a+")
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                return None
+            time.sleep(0.02)
+
+
+def write_daily_stats(
+    path: Path,
+    agents: List["AgentInfo"],
+    day_start: Optional[float] = None,
+    now: Optional[float] = None,
+    *,
+    row: Optional[Dict[str, Any]] = None,
+    owned_columns: Optional[Tuple[str, ...]] = None,
+) -> Path:
+    """Merge today's row under `<tsv>.lock`; a busy lock skips the round, not the TUI."""
+    target = Path(path)
+    handle = _acquire_daily_stats_lock(target)
+    if handle is None:
+        logging.getLogger(__name__).warning("daily stats lock busy at %s; skipped", target)
+        return target
+    try:
+        return _merge_daily_stats(target, agents, day_start, now, row=row, owned_columns=owned_columns)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def project_label(project_id: str) -> str:
