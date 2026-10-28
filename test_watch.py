@@ -2576,6 +2576,85 @@ class SupersessionTests(unittest.TestCase):
         self.assertEqual(state.bucket(old, 310), "attention")
         self.assertEqual(state.stale_info(old, 310), "")
 
+    def test_multi_digit_phase_and_version_normalization(self):
+        for name, family in (
+            ("awv10-p12fix", "awv10-p12"),
+            ("awv10-p12-fix2", "awv10-p12"),
+            ("xxx-v10-fix", "xxx-v10"),
+            ("xxx-v10fix", "xxx-v10"),
+            ("awv10-p12", "awv10-p12"),
+            ("xxx-v10", "xxx-v10"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(watch._normalized_task_name(name), family)
+
+    def test_multi_digit_phase_repair_hands_off_failed_card(self):
+        for old_name, new_name in (
+            ("awv10-p12", "awv10-p12fix"),
+            ("awv10-p12", "awv10-p12-fix2"),
+            ("xxx-v10", "xxx-v10-fix"),
+            ("xxx-v10", "xxx-v10fix"),
+        ):
+            with self.subTest(old=old_name, new=new_name):
+                old = self.make_agent(old_name, "failed", start=100, completion=200)
+                replacement = self.make_agent(new_name, "running", start=300)
+                state = self.make_state()
+                state.reconcile([old, replacement], 310)
+                self.assertEqual(
+                    watch.compute_superseded([old, replacement]),
+                    {old.key: replacement.key},
+                )
+                self.assertEqual(state.bucket(old, 310), "history")
+
+    def test_multi_digit_phase_siblings_and_other_phase_fixes_do_not_handoff(self):
+        for old_name, new_name in (
+            ("awv10-p1", "awv10-p12"),
+            ("awv10-p12", "awv10-p13"),
+            ("awv10-p1", "awv10-p12fix"),
+            ("awv10-p1", "awv10-p12-fix2"),
+            ("xxx-v1", "xxx-v10"),
+            ("xxx-v1", "xxx-v10-fix"),
+            ("xxx-v10", "xxx-v11fix"),
+        ):
+            with self.subTest(old=old_name, new=new_name):
+                old = self.make_agent(old_name, "failed", start=100, completion=200)
+                sibling = self.make_agent(new_name, "running", start=300)
+                state = self.make_state()
+                state.reconcile([old, sibling], 310)
+                self.assertNotIn(old.key, watch.compute_superseded([old, sibling]))
+                self.assertEqual(state.bucket(old, 310), "attention")
+                self.assertEqual(state.stale_info(old, 310), "")
+
+    def test_glued_repair_word_strips_without_hyphen(self):
+        # A repair word glued onto a p/v number is stripped even without a
+        # hyphen (`wp6fix` -> `wp6`); bare numbered names keep their identity.
+        for name, family in (
+            ("wp6fix", "wp6"),
+            ("wp6fix2", "wp6"),
+            ("wp6", "wp6"),
+            ("wp7", "wp7"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(watch._normalized_task_name(name), family)
+        old = self.make_agent("wp6", "failed", start=100, completion=200)
+        repair = self.make_agent("wp6fix", "running", start=300)
+        sibling_repair = self.make_agent("wp7fix", "running", start=301)
+        self.assertEqual(
+            watch.compute_superseded([old, repair, sibling_repair]),
+            {old.key: repair.key},
+        )
+
+    def test_glued_phase_fix_no_longer_hands_off_unphased_parent(self):
+        # Behaviour change in fix2: `-p2` is identity, so `task-p2fix`
+        # belongs to `task-p2`, not to a bare `task`.
+        self.assertNotEqual(
+            watch._normalized_task_name("task"),
+            watch._normalized_task_name("task-p2fix"),
+        )
+        old = self.make_agent("task", "failed", start=100, completion=200)
+        replacement = self.make_agent("task-p2fix", "running", start=300)
+        self.assertNotIn(old.key, watch.compute_superseded([old, replacement]))
+
     def test_bare_number_suffix_is_not_a_handoff(self):
         old = self.make_agent("na2-n3", "failed", start=100, completion=200)
         renamed = self.make_agent("na2-n3-2", "running", start=300)

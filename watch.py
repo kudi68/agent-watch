@@ -4078,22 +4078,26 @@ SUPERSEDED_HANDOFF_WORD = (
     r"(?:fix|retry|rerun|redo|rereview|recheck|rework|claude|resume)"
 )
 # SPEC §A name rule: only an explicit hand-off suffix links an old card to a
-# newer one. Phase/version markers stay part of the card's identity; a repair
-# word attached to one can still be stripped (`awv10-p2fix` -> `awv10-p2`).
+# newer one. Phase/version markers (`-p12`, `-v10`) stay part of the card's
+# identity; a repair word glued straight onto one is still stripped and the
+# marker kept via the `phase` group (`awv10-p12fix` -> `awv10-p12`). The glued
+# form needs no hyphen, so `wp6fix` -> `wp6` too; a bare `wp6` is untouched.
 SUPERSEDED_SUFFIX_RE = re.compile(
-    r"(?:"
-    r"-" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?"     # -fix, -fix2, -retry-3
-    r"|(?<=[pv]\d)" + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?"  # p2fix2; keep -p2
-    r")$",
+    r"(?:-|(?P<phase>[pv]\d+))"                          # -fix / p12fix
+    + SUPERSEDED_HANDOFF_WORD + r"(?:\d+|-\d+)?$",       # fix, fix2, retry-3
     re.IGNORECASE,
 )
+
+
+def _strip_handoff_suffix(match: "re.Match[str]") -> str:
+    return match.group("phase") or ""
 
 
 def _normalized_task_name(name: str) -> str:
     """Strip repeated hand-off suffixes; a name without one is its own family."""
     normalized = name.casefold()
     while True:
-        stripped = SUPERSEDED_SUFFIX_RE.sub("", normalized)
+        stripped = SUPERSEDED_SUFFIX_RE.sub(_strip_handoff_suffix, normalized)
         if stripped == normalized:
             return normalized.strip()
         normalized = stripped
