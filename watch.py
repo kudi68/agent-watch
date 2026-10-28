@@ -203,6 +203,9 @@ QUOTA_BURN_AHEAD_PERCENT = 15
 QUOTA_CRITICAL_PERCENT = 85
 # SPEC §3.3: a question left unanswered for 30 minutes turns red and notifies.
 QUESTION_OVERDUE_SECONDS = 30 * 60
+QUESTION_CLEARABLE_SECONDS = 24 * 3600
+
+
 def _stale_attention_seconds_from_env() -> int:
     try:
         hours = float(os.environ.get("AGENT_WATCH_STALE_HOURS", "24"))
@@ -1491,7 +1494,7 @@ def question_escalated(question: Optional[Dict[str, Any]],
 def question_wait_seconds(question: Optional[Dict[str, Any]], now: float) -> int:
     if not question:
         return 0
-    asked = question.get("asked_at_ts") or question.get("mtime") or now
+    asked = question.get("mtime") or question.get("asked_at_ts") or now
     return max(0, int(now - asked))
 
 
@@ -4660,6 +4663,11 @@ class WatchState:
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
+            if (
+                self._dismissed(agent)
+                and question_wait_seconds(agent.question, now) >= QUESTION_CLEARABLE_SECONDS
+            ):
+                return "已清除"
             return ""
         if agent.status == "running":
             return ""
@@ -4804,7 +4812,8 @@ class WatchState:
                 )
                 if rerun:
                     entry.update(hidden=False, done_manual=False, restored=False, read=False,
-                                 dismissed=False, escalate_qid="", escalate_to="",
+                                 dismissed=False, dismissed_reason="",
+                                 escalate_qid="", escalate_to="",
                                  run_start=agent.start_time, updated_at=self.stamp())
                     changed = True
             question = agent.question or {}
@@ -4832,7 +4841,11 @@ class WatchState:
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
         if question_is_active(agent.question, agent.completion_time):
-            return "attention"
+            if (
+                not self._dismissed(agent)
+                or question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
+            ):
+                return "attention"
         if agent.status == "running":
             return "running"
         if agent.key in self._review_failures and not self._dismissed(agent):
@@ -4852,26 +4865,91 @@ class WatchState:
             return "history"
         return "recent" if entry.get("restored") else bucket
 
+    def dismiss_refusal(
+        self, agent: AgentInfo, now: float,
+    ) -> str:
+        """Return the existing refusal message, or an empty string if x is allowed."""
+        bucket = self.bucket(agent, now)
+        disposition = self.stale_info(agent, now)
+        if (
+            question_is_active(agent.question, agent.completion_time)
+            and question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
+        ):
+            return "尚未收到這題的有效 ANSWER.md，不能清除"
+        if agent.status == "running" or bucket == "running":
+            return "進行中的任務不能清除"
+        if bucket == "handoff":
+            return "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
+        if bucket != "attention" and disposition not in ("已過期", "已被取代"):
+            return "目前項目不在需處理區，也不是已過期或被取代項目"
+        return ""
+
+    @staticmethod
+    def _dismiss_reason_extend(character: str) -> bool:
+        return unicodedata.category(character).startswith("M") or 0x1F3FB <= ord(character) <= 0x1F3FF
+
+    @staticmethod
+    def _dismiss_reason_regional_indicator(character: str) -> bool:
+        return 0x1F1E6 <= ord(character) <= 0x1F1FF
+
+    @staticmethod
+    def _dismiss_reason_prefix(text: str, limit: int) -> str:
+        end = min(len(text), limit)
+        while 0 < end < len(text):
+            previous, following = text[end - 1], text[end]
+            if (
+                WatchState._dismiss_reason_extend(following)
+                or previous == "\u200d"
+                or following == "\u200d"
+            ):
+                end -= 1
+                continue
+            if (
+                WatchState._dismiss_reason_regional_indicator(previous)
+                and WatchState._dismiss_reason_regional_indicator(following)
+            ):
+                start = end - 1
+                while (
+                    start > 0
+                    and WatchState._dismiss_reason_regional_indicator(text[start - 1])
+                ):
+                    start -= 1
+                if (end - start) % 2:
+                    end -= 1
+                    continue
+            break
+        return text[:end]
+
+    @staticmethod
+    def clean_dismiss_reason(reason: Optional[str]) -> str:
+        if not isinstance(reason, str):
+            return ""
+        characters = []
+        for character in reason:
+            category = unicodedata.category(character)
+            if category in ("Cc", "Zl", "Zp") or (
+                category == "Cf" and character != "\u200d"
+            ):
+                continue
+            characters.append(character)
+        cleaned = "".join(characters).strip()
+        return WatchState._dismiss_reason_prefix(cleaned, 200)
+
     def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
-              tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+              tags: Optional[List[str]] = None,
+              reason: Optional[str] = None) -> Tuple[bool, str]:
         entry = self.task(agent.key)
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
-            if question_is_active(agent.question, agent.completion_time):
-                return False, "尚未收到這題的有效 ANSWER.md，不能清除"
-            if agent.status == "running" or bucket == "running":
-                return False, "進行中的任務不能清除"
-            if bucket == "handoff":
-                return False, "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
-            if bucket != "attention" and disposition not in ("已過期", "已被取代"):
-                return False, "目前項目不在需處理區，也不是已過期或被取代項目"
-            if disposition == "已清除":
-                return False, "此項目已清除"
+            refusal = self.dismiss_refusal(agent, now)
+            if refusal:
+                return False, refusal
             ok = self.update_task(
                 agent.key,
                 dismissed=True,
                 dismissed_at=self.stamp(),
+                dismissed_reason=self.clean_dismiss_reason(reason),
                 dismissed_sig=self.dismissed_signature(agent),
                 run_start=agent.start_time,
             )
@@ -4896,8 +4974,10 @@ class WatchState:
             changes: Dict[str, Any] = {
                 "hide": dict(hidden=True, restored=False),
                 "done": dict(done_manual=True, restored=False),
-                "restore": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
-                "undismiss": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
+                "restore": dict(hidden=False, done_manual=False, restored=True, dismissed=False,
+                                dismissed_reason=""),
+                "undismiss": dict(hidden=False, done_manual=False, restored=True, dismissed=False,
+                                  dismissed_reason=""),
                 "read": dict(read=not entry.get("read", False)),
                 "pin": dict(pinned=not entry.get("pinned", False)),
                 "tags": dict(tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip()))),
@@ -4919,6 +4999,7 @@ class WatchState:
         """Clear eligible stale or review-failed tasks after the caller confirms."""
         count = 0
         for agent in agents:
+            # Aged unanswered questions require a deliberate single-card x action.
             if question_is_active(agent.question, agent.completion_time):
                 continue
             if self.stale_info(agent, now) not in DISMISS_STALE_LABELS:
@@ -5571,6 +5652,17 @@ TagScreen {
     background: #101216;
     padding: 0 1;
 }
+DismissReasonScreen {
+    align: center middle;
+}
+#dismiss-reason-panel {
+    width: 70;
+    max-width: 100%;
+    height: 7;
+    border: solid #9ece6a;
+    background: #101216;
+    padding: 0 1;
+}
 HelpScreen {
     background: #101216;
 }
@@ -5839,6 +5931,28 @@ class TagScreen(ModalScreen):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss([tag.strip() for tag in re.split("[,，]", event.value) if tag.strip()])
+
+
+class DismissReasonScreen(ModalScreen):
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dismiss-reason-panel") as panel:
+            panel.border_title = "清除原因"
+            yield Label("選填；留空仍會清除。Enter 確認，Esc 取消。")
+            yield Input(
+                placeholder="最多 200 字", max_length=200,
+                id="dismiss-reason-input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class HelpScreen(ModalScreen):
@@ -6160,6 +6274,7 @@ class AgentWatchApp(App):
         ("h", "hide_task", "隱藏"),
         ("d", "finish_task", "歸到已完成"),
         ("x", "dismiss_task", "清除需處理項目"),
+        ("X", "dismiss_stale", "清除過期／取代項目"),
         ("shift+x", "dismiss_stale", "清除過期／取代項目"),
         ("c", "collapse_project", "收起專案"),
         ("i", "toggle_pin", "釘選"),
@@ -6511,12 +6626,15 @@ class AgentWatchApp(App):
         return next((a for a in self.current_agents if a.key == key), None)
 
     def operate(self, operation: str, tags: Optional[List[str]] = None,
-                task: Optional[AgentInfo] = None) -> None:
+                task: Optional[AgentInfo] = None,
+                reason: Optional[str] = None) -> None:
         agent = task or self.selected_task()
         if agent is None:
             self.show_state_message("請先選擇一筆任務")
             return
-        ok, message = self.state.apply(operation, agent, self.current_agents, self._now, tags)
+        ok, message = self.state.apply(
+            operation, agent, self.current_agents, self._now, tags, reason=reason,
+        )
         self.show_state_message(message)
         if ok:
             if operation == "read":
@@ -6534,7 +6652,22 @@ class AgentWatchApp(App):
         self.operate("done")
 
     def action_dismiss_task(self) -> None:
-        self.operate("dismiss")
+        agent = self.selected_task()
+        if agent is None:
+            self.operate("dismiss")
+            return
+        refusal = self.state.dismiss_refusal(agent, self._now)
+        if refusal:
+            self.show_state_message(refusal)
+            return
+
+        def dismissed(reason: Optional[str]) -> None:
+            if reason is None:
+                self.show_state_message("已取消清除")
+                return
+            self.operate("dismiss", task=agent, reason=reason)
+
+        self.push_screen(DismissReasonScreen(), dismissed)
 
     def action_dismiss_stale(self) -> None:
         if self.query_one("#main-tabs", TabbedContent).active != "tab-work":

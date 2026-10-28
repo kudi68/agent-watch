@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import html
 import io
+import inspect
 import json
 import os
 import re
@@ -1809,6 +1810,11 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             "- B: 先修 B\n",
             encoding="utf-8",
         )
+        question_path = question_root / "QUESTION.md"
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS - 60),
+        )
         agent = self.fixture_agents()[4]
         agent.status = "question"
         agent.completion_time = self.now - 60
@@ -1819,8 +1825,16 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                23 * 3600 + 59 * 60,
+            )
             await pilot.press("x")
             await pilot.pause()
+            self.assertEqual(
+                app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
+            )
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
             self.assertFalse(app.state.task(agent.key).get("dismissed", False))
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
@@ -1833,6 +1847,62 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             agent.status = "complete"
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
+
+    async def test_x_clears_overdue_question_but_shift_x_leaves_it_alone(self):
+        question_dir = tempfile.TemporaryDirectory(prefix="aw-question-overdue-x-")
+        self.addCleanup(question_dir.cleanup)
+        question_root = Path(question_dir.name)
+        question_path = question_root / "QUESTION.md"
+        answer_path = question_root / "ANSWER.md"
+        question_path.write_text(
+            "# QUESTION\nid: q1\nquestion: 要先修 A 還是 B？\n"
+            "options:\n- A: 先修 A\n- B: 先修 B\n",
+            encoding="utf-8",
+        )
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS + 60),
+        )
+        answer_path.write_text(
+            "# ANSWER\nid: old-question\nanswered_at: 2026-10-24T00:00:00Z\n"
+            "choice: A\n",
+            encoding="utf-8",
+        )
+        paths = (question_path, answer_path)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths
+        }
+        agent = self.fixture_agents()[4]
+        agent.status = "question"
+        agent.completion_time = self.now - 60
+        agent.question = watch.read_task_question(question_root)
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                24 * 3600 + 60,
+            )
+            await pilot.press("shift+x")
+            await pilot.pause()
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.state.task(agent.key)["dismissed"])
+            self.assertEqual(app.state.bucket(agent, self.now), "history")
+            self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
+
+        self.assertEqual(
+            before,
+            {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths},
+        )
 
     async def test_x_clears_malformed_question_after_showing_why(self):
         question_dir = tempfile.TemporaryDirectory(prefix="aw-question-malformed-")
@@ -1856,11 +1926,85 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIn("malformed", self.screen_text(app))
             await pilot.press("x")
             await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
             self.assertEqual(app.state.bucket(agent, self.now), "history")
             self.assertEqual(
                 question_path.read_text(encoding="utf-8"), "# QUESTION\nid: q1\n",
                 "clearing the card never edits QUESTION.md",
             )
+
+    async def test_x_optional_reason_text_empty_and_cancel(self):
+        cases = (
+            (("r", "e", "t", "r", "y"), "retry"),
+            ((), ""),
+            ((), None),
+        )
+        for index, (keys, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                agent = self.fixture_agents()[0]
+                agent.key += "-" + str(index)
+                app = self.fixture_app([agent])
+                before = app.state.data.copy()
+                async with app.run_test(size=(80, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("x")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+                    if keys:
+                        await pilot.press(*keys)
+                    await pilot.press("enter" if expected is not None else "escape")
+                    await pilot.pause()
+                    if expected is None:
+                        self.assertEqual(app.state.data, before)
+                    else:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(
+                            app.state.task(agent.key)["dismissed_reason"], expected,
+                        )
+
+    async def test_x_reason_input_stops_at_200_characters(self):
+        agent = self.fixture_agents()[0]
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            reason_input = app.screen.query_one("#dismiss-reason-input", watch.Input)
+            reason_input.insert_text_at_cursor("a" * 200)
+            reason_input.insert_text_at_cursor("a")
+            self.assertEqual(len(reason_input.value), 200)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                app.state.task(agent.key)["dismissed_reason"], "a" * 200,
+            )
+
+    async def test_x_refuses_running_and_already_cleared_without_modal(self):
+        running, cleared = self.fixture_agents()[5], self.fixture_agents()[0]
+        agents = [running, cleared]
+        app = self.fixture_app(agents)
+        app.state.reconcile(agents, self.now)
+        self.assertTrue(app.state.apply(
+            "dismiss", cleared, agents, self.now, reason="previous",
+        )[0])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            for agent, message in (
+                (running, "進行中的任務不能清除"),
+                (cleared, "目前項目不在需處理區，也不是已過期或被取代項目"),
+            ):
+                app.selected_key = agent.key
+                before = app.state.data.copy()
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+                self.assertEqual(app.state_message, message)
+                self.assertEqual(app.state.data, before)
 
     async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
         agents = self.fixture_agents()[5:7]
@@ -2133,6 +2277,25 @@ class V10StateTests(unittest.TestCase):
 
     def apply(self, operation, agent=None, **values):
         return self.state.apply(operation, agent or self.finished, self.agents, self.now, **values)
+
+    def test_dismiss_refusal_only_needs_agent_and_time(self):
+        self.assertEqual(self.state.dismiss_refusal(self.finished, self.now),
+                         "目前項目不在需處理區，也不是已過期或被取代項目")
+
+    def test_dismiss_refusal_has_no_unreachable_cleared_message_branch(self):
+        self.assertNotIn('return "此項目已清除"',
+                         inspect.getsource(watch.WatchState.dismiss_refusal))
+
+    def test_clean_dismiss_reason_removes_control_characters(self):
+        self.assertEqual(watch.WatchState.clean_dismiss_reason(
+            "A\x1b\x00\u2028\x0b\x0c\x85\u2029B"), "AB")
+
+    def test_clean_dismiss_reason_does_not_split_zwj_sequences(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466"
+        self.assertEqual(
+            watch.WatchState.clean_dismiss_reason(family * 60),
+            family * 28,
+        )
 
     def test_running_and_attention_cannot_hide_or_finish(self):
         for agent in self.agents[:7]:
@@ -2604,6 +2767,27 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.bucket(old, self.now), "history")
             self.assertEqual(app.state.stale_info(old, self.now), "已清除")
 
+    async def test_uppercase_x_and_shift_x_confirm_batch_without_reasons(self):
+        for key in ("X", "shift+x"):
+            with self.subTest(key=key):
+                agents = [
+                    self.agent("stale-a", "failed", completion_time=self.now - 172800),
+                    self.agent("stale-b", "failed", completion_time=self.now - 172800),
+                ]
+                app = self.handoff_app(agents)
+                async with app.run_test(size=(100, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press(key)
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissConfirmScreen)
+                    self.assertEqual(app.screen.count, 2)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    for agent in agents:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(app.state.task(agent.key)["dismissed_reason"], "")
+                    self.assertFalse(app.ui_error)
+
     def test_running_review_keeps_old_card_in_handoff(self):
         old, _, _, _, state = self.review_case(status="running", review="PASS\n")
         self.assertEqual(state.bucket(old, self.now), "handoff")
@@ -2722,6 +2906,7 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             app.action_dismiss_task()  # x
             await pilot.pause()
             self.assertIn("已接手的任務不能清除", app.state_message)
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
             self.assertEqual(app.state.bucket(old, self.now), "handoff")
 
         app = self.handoff_app([failed, recent])
