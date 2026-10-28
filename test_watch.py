@@ -1831,6 +1831,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
             )
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
             self.assertFalse(app.state.task(agent.key).get("dismissed", False))
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
@@ -1888,6 +1889,9 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
             await pilot.press("x")
             await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
             self.assertTrue(app.state.task(agent.key)["dismissed"])
             self.assertEqual(app.state.bucket(agent, self.now), "history")
             self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
@@ -1919,11 +1923,66 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIn("malformed", self.screen_text(app))
             await pilot.press("x")
             await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
             self.assertEqual(app.state.bucket(agent, self.now), "history")
             self.assertEqual(
                 question_path.read_text(encoding="utf-8"), "# QUESTION\nid: q1\n",
                 "clearing the card never edits QUESTION.md",
             )
+
+    async def test_x_optional_reason_text_empty_and_cancel(self):
+        cases = (
+            (("r", "e", "t", "r", "y"), "retry"),
+            ((), ""),
+            ((), None),
+        )
+        for index, (keys, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                agent = self.fixture_agents()[0]
+                agent.key += "-" + str(index)
+                app = self.fixture_app([agent])
+                before = app.state.data.copy()
+                async with app.run_test(size=(80, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("x")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+                    if keys:
+                        await pilot.press(*keys)
+                    await pilot.press("enter" if expected is not None else "escape")
+                    await pilot.pause()
+                    if expected is None:
+                        self.assertEqual(app.state.data, before)
+                    else:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(
+                            app.state.task(agent.key)["dismissed_reason"], expected,
+                        )
+
+    async def test_x_refuses_running_and_already_cleared_without_modal(self):
+        running, cleared = self.fixture_agents()[5], self.fixture_agents()[0]
+        agents = [running, cleared]
+        app = self.fixture_app(agents)
+        app.state.reconcile(agents, self.now)
+        self.assertTrue(app.state.apply(
+            "dismiss", cleared, agents, self.now, reason="previous",
+        )[0])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            for agent, message in (
+                (running, "進行中的任務不能清除"),
+                (cleared, "目前項目不在需處理區，也不是已過期或被取代項目"),
+            ):
+                app.selected_key = agent.key
+                before = app.state.data.copy()
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+                self.assertEqual(app.state_message, message)
+                self.assertEqual(app.state.data, before)
 
     async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
         agents = self.fixture_agents()[5:7]
@@ -2733,6 +2792,7 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             app.action_dismiss_task()  # x
             await pilot.pause()
             self.assertIn("已接手的任務不能清除", app.state_message)
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
             self.assertEqual(app.state.bucket(old, self.now), "handoff")
 
         app = self.handoff_app([failed, recent])

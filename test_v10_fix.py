@@ -267,15 +267,23 @@ class AttentionStateTests(unittest.TestCase):
         agent = self.agent("failed", "fresh-failure", "failed",
                            completion=self.now - 60)
         self.state.reconcile([agent], self.now)
-        ok, _ = self.state.apply("dismiss", agent, [agent], self.now)
+        raw_reason = "  retry\tfailed\nagain\r" + "x" * 210
+        ok, _ = self.state.apply(
+            "dismiss", agent, [agent], self.now, reason=raw_reason,
+        )
         self.assertTrue(ok)
         self.assertTrue(self.state.task(agent.key)["dismissed"])
+        self.assertEqual(len(self.state.task(agent.key)["dismissed_reason"]), 200)
+        self.assertTrue(
+            self.state.task(agent.key)["dismissed_reason"].startswith("retryfailedagain"),
+        )
         reloaded = watch.WatchState(self.state_path)
         reloaded.reconcile([agent], self.now)
         self.assertEqual(reloaded.bucket(agent, self.now), "history")
         self.assertEqual(reloaded.stale_info(agent, self.now), "已清除")
         self.assertTrue(reloaded.apply("restore", agent, [agent], self.now)[0])
         self.assertFalse(reloaded.task(agent.key)["dismissed"])
+        self.assertEqual(reloaded.task(agent.key)["dismissed_reason"], "")
         self.assertEqual(reloaded.bucket(agent, self.now), "attention")
 
     def test_new_question_id_clears_old_dismissal_signature(self):
@@ -309,12 +317,16 @@ class AttentionStateTests(unittest.TestCase):
         agent = self.agent("rerun", "rerun-task", "failed", start=self.now - 500,
                            completion=self.now - 400)
         self.state.reconcile([agent], self.now)
-        self.assertTrue(self.state.apply("dismiss", agent, [agent], self.now)[0])
+        self.assertTrue(self.state.apply(
+            "dismiss", agent, [agent], self.now, reason="rerun reason",
+        )[0])
+        self.assertEqual(self.state.task(agent.key)["dismissed_reason"], "rerun reason")
         agent.status = "running"
         agent.start_time = self.now
         agent.process_alive = True
         self.state.reconcile([agent], self.now)
         self.assertFalse(self.state.task(agent.key)["dismissed"])
+        self.assertEqual(self.state.task(agent.key)["dismissed_reason"], "")
         self.assertEqual(self.state.bucket(agent, self.now), "running")
         ok, _ = self.state.apply("dismiss", agent, [agent], self.now)
         self.assertFalse(ok)
