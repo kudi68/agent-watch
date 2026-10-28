@@ -29,6 +29,27 @@ watch.write_daily_stats(
 )
 """
 
+# Logs every TSV read and lock call; "paused" waits on stdin after its read.
+RACE_IPC_WRITER = """
+import fcntl, sys, time
+from pathlib import Path
+import watch
+mode, target, column, value = sys.argv[1:5]
+read, lock = Path.read_text, fcntl.flock
+def read_text(self, *args, **kwargs):
+    text = read(self, *args, **kwargs)
+    print("read", time.time(), flush=True)
+    if mode == "paused":
+        sys.stdin.readline()
+    return text
+def flock(fd, operation):
+    print("flock", operation, time.time(), flush=True)
+    return lock(fd, operation)
+Path.read_text, fcntl.flock = read_text, flock
+watch.write_daily_stats(Path(target), [], owned_columns=(column,),
+                        row={"date": time.strftime("%Y-%m-%d"), column: value})
+"""
+
 
 def add_project(test, project_id, **config):
     """Register a throwaway project for one test and always remove it again."""
@@ -415,6 +436,94 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             values = dict(zip(header.split("\t"), rows[0].split("\t")))
             self.assertEqual((values.get("writer_a"), values.get("writer_b")), ("a1", "b1"))
+
+    def test_second_writer_reads_only_after_the_first_writer_unlocks(self):
+        now = self.day_start() + 8 * 3600
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "daily.tsv"
+            watch.write_daily_stats(
+                target, [], owned_columns=("base",),
+                row={"date": time.strftime("%Y-%m-%d", time.localtime(now)), "base": "b0"},
+            )
+
+            def line(proc):
+                return proc.stdout.readline().decode().split()
+
+            def start(mode, column, value):
+                return subprocess.Popen(
+                    [sys.executable, "-B", "-c", RACE_IPC_WRITER,
+                     mode, str(target), column, value],
+                    cwd=str(Path(__file__).resolve().parent), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+            paused = start("paused", "writer_a", "a1")
+            live = None
+            try:
+                self.assertEqual(line(paused)[0], "flock")
+                self.assertEqual(line(paused)[0], "read")
+                live = start("live", "writer_b", "b1")
+                self.assertEqual(line(live)[0], "flock", "the second writer read while locked")
+                self.assertEqual(line(live)[0], "flock")
+                rest = {}
+                for proc in (paused, live):
+                    output, errors = proc.communicate(timeout=60)
+                    self.assertEqual(proc.returncode, 0, errors.decode("utf-8"))
+                    rest[proc] = output.decode().splitlines()
+            finally:
+                for proc in (paused, live):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+            unlock = [float(l.split()[2]) for l in rest[paused]
+                      if l.split()[:2] == ["flock", str(fcntl.LOCK_UN)]]
+            read_at = [float(l.split()[1]) for l in rest[live] if l.split()[:1] == ["read"]]
+            self.assertTrue(unlock and read_at, rest)
+            self.assertGreater(read_at[0], unlock[0])
+            header, *rows = target.read_text(encoding="utf-8").splitlines()
+            values = dict(zip(header.split("\t"), rows[0].split("\t")))
+            self.assertEqual([values.get(k) for k in ("base", "writer_a", "writer_b")],
+                             ["b0", "a1", "b1"])
+
+    def test_update_data_does_not_wait_for_a_lock_held_by_another_process(self):
+        now = self.day_start() + 8 * 3600
+        agent = self.agent("other", "未判斷", now)
+        agent.start_source = "tsv"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "agent-watch-daily.tsv"
+            app = watch.AgentWatchApp(
+                runs_path=root / "runs.tsv", done_path=root / "done.tsv",
+                state_path=root / "state.json", decisions_path=root / "decisions",
+                daily_stats_path=target,
+            )
+            def round(now_at):
+                with patch.object(watch, "load_all_agents", return_value=([agent], [])), \
+                        patch.object(watch, "notify_completion"):
+                    return app.update_data(now=now_at)
+
+            self.assertTrue(round(now))
+            before = target.read_bytes()
+            holder = subprocess.Popen(
+                [sys.executable, "-B", "-c", RACE_IPC_WRITER, "paused", str(target), "base", "b0"],
+                cwd=str(Path(__file__).resolve().parent), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(holder.stdout.readline().decode().split()[0], "flock")
+                self.assertEqual(holder.stdout.readline().decode().split()[0], "read")
+                with self.assertLogs("watch", level="WARNING") as logged:
+                    started = time.monotonic()
+                    round(now + 1)
+                    elapsed = time.monotonic() - started
+                self.assertTrue(logged.output[0].endswith("skipped"), logged.output[0])
+                self.assertLess(elapsed, 0.2)
+                self.assertEqual(target.read_bytes(), before)
+            finally:
+                holder.communicate(timeout=60)
+            released = target.read_bytes()
+            agent.status = "blocked"
+            self.assertTrue(round(now + 2))
+            self.assertNotEqual(target.read_bytes(), released)
 
     def test_writer_skips_the_round_while_another_process_holds_the_lock(self):
         day = self.day_start()

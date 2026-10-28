@@ -999,7 +999,10 @@ DAILY_STATS_LOCK_TIMEOUT = 2.0
 
 
 def _acquire_daily_stats_lock(target: Path, timeout: Optional[float] = None):
-    """Take the `flock` next to the TSV, or return None when the budget runs out."""
+    """Take the `flock` next to the TSV, or return None when the budget runs out.
+
+    A budget of 0 already counts as expired: one try, no sleep, no TUI stall.
+    """
     budget = DAILY_STATS_LOCK_TIMEOUT if timeout is None else timeout
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = open(target.with_name(target.name + ".lock"), "a+")
@@ -1023,10 +1026,11 @@ def write_daily_stats(
     *,
     row: Optional[Dict[str, Any]] = None,
     owned_columns: Optional[Tuple[str, ...]] = None,
+    timeout: Optional[float] = None,
 ) -> Path:
     """Merge today's row under `<tsv>.lock`; a busy lock skips the round, not the TUI."""
     target = Path(path)
-    handle = _acquire_daily_stats_lock(target)
+    handle = _acquire_daily_stats_lock(target, timeout)
     if handle is None:
         logging.getLogger(__name__).warning("daily stats lock busy at %s; skipped", target)
         return target
@@ -7370,6 +7374,8 @@ class AgentWatchApp(App):
                     now=now,
                     row=row,
                     owned_columns=N7_DAILY_STATS_COLUMNS,
+                    # TUI thread: one non-blocking try, the next poll retries.
+                    timeout=0,
                 )
             except Exception as exc:
                 logging.getLogger(__name__).warning(
