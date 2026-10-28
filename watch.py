@@ -4075,6 +4075,7 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+DISMISS_STALE_LABELS = frozenset({"已過期", "已被取代", "修正卡審查 FAIL"})
 SUPERSEDED_HANDOFF_WORD = (
     r"(?:fix|retry|rerun|redo|rework|claude|resume)"
 )
@@ -4267,7 +4268,7 @@ class WatchState:
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
         self._superseded: Dict[str, str] = {}
-        # Old task key -> name of the replacement that is still running.
+        # Old task key -> replacement name for a handed-off task.
         self._handoff: Dict[str, str] = {}
         self._auto_clear_labels: Dict[str, str] = {}
         self._review_failures: Set[str] = set()
@@ -4380,7 +4381,7 @@ class WatchState:
         return ""
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
-        """Return the history label for a dismissed, expired, or replaced task."""
+        """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
             return ""
         if agent.status == "running":
@@ -4403,7 +4404,7 @@ class WatchState:
         return ""
 
     def handoff_label(self, agent: AgentInfo) -> str:
-        """Name the running replacement of a handed-off task."""
+        """Name the replacement associated with a handed-off task."""
         target = self._handoff.get(agent.key)
         return "已接手 → " + target if target else ""
 
@@ -4557,7 +4558,7 @@ class WatchState:
             return "attention"
         if agent.status == "running":
             return "running"
-        if agent.key in self._review_failures:
+        if agent.key in self._review_failures and not self._dismissed(agent):
             return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
@@ -4638,12 +4639,12 @@ class WatchState:
         return ok, "已儲存" if ok else self.warning
 
     def dismiss_stale(self, agents: List[AgentInfo], now: float) -> int:
-        """Clear only expired or superseded tasks after the caller confirms."""
+        """Clear eligible stale or review-failed tasks after the caller confirms."""
         count = 0
         for agent in agents:
             if question_is_active(agent.question, agent.completion_time):
                 continue
-            if self.stale_info(agent, now) not in ("已過期", "已被取代"):
+            if self.stale_info(agent, now) not in DISMISS_STALE_LABELS:
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)
             count += int(ok)
@@ -5555,7 +5556,7 @@ class HelpScreen(ModalScreen):
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  x            清除所選需處理項目；不會刪除問題檔\n"
-                "  X            確認後清除已過期／已被取代項目\n"
+                "  X            確認後清除過期／被取代／審查 FAIL 項目\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
                 "  i            釘選／取消釘選（最多 5 個）\n"
                 "  t            編輯自訂標籤（逗號分隔）\n"
@@ -5815,7 +5816,7 @@ class DismissConfirmScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dismiss-confirm-panel"):
             yield Static(
-                f"清除 {self.count} 筆已過期／已被取代任務？\nEnter 確認；Esc 取消。",
+                f"清除 {self.count} 筆可清除項目？\nEnter 確認；Esc 取消。",
                 id="dismiss-confirm-text", markup=False,
             )
 
@@ -6226,12 +6227,12 @@ class AgentWatchApp(App):
             return
         candidates = [
             agent for agent in self.current_agents
-            if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
+            if self.state.stale_info(agent, self._now) in DISMISS_STALE_LABELS
         ]
         if not candidates:
             handoff = sum(self.state.bucket(a, self._now) == "handoff" for a in self.current_agents)
             note = f"；已接手 {handoff} 筆不能清除" if handoff else ""
-            self.show_state_message("目前沒有已過期或已被取代的項目" + note)
+            self.show_state_message("目前沒有可批次清除的項目" + note)
             return
 
         def confirmed(accepted: Optional[bool]) -> None:
@@ -6239,7 +6240,7 @@ class AgentWatchApp(App):
                 self.show_state_message("已取消清除")
                 return
             count = self.state.dismiss_stale(self.current_agents, self._now)
-            self.show_state_message(f"已清除 {count} 筆已過期／已被取代任務")
+            self.show_state_message(f"已清除 {count} 筆項目")
             self.last_snapshot = None
             self.update_data()
 
