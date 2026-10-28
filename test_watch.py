@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import html
 import io
+import inspect
 import json
 import os
 import re
@@ -1788,7 +1789,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 40)) as pilot:
             await pilot.pause()
             self.assertEqual(len(app.query_one("#attention-list").query(watch.TaskRow)), 5)
-            self.assertIn("需處理 5 │ 進行中 0 │ 剛完成 0 │ 歷史 0 │ 隱藏 0 │ 總計 5", self.screen_text(app))
+            self.assertIn("需處理 5 │ 已接手 0 │ 進行中 0 │ 剛完成 0 │ 歷史 0 │ 隱藏 0 │ 總計 5", self.screen_text(app))
             await pilot.press("2")
             await pilot.pause()
             self.assertIn("目前沒有歷史任務", self.screen_text(app))
@@ -1809,6 +1810,11 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             "- B: 先修 B\n",
             encoding="utf-8",
         )
+        question_path = question_root / "QUESTION.md"
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS - 60),
+        )
         agent = self.fixture_agents()[4]
         agent.status = "question"
         agent.completion_time = self.now - 60
@@ -1819,8 +1825,16 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                23 * 3600 + 59 * 60,
+            )
             await pilot.press("x")
             await pilot.pause()
+            self.assertEqual(
+                app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
+            )
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
             self.assertEqual(app.state.bucket(agent, self.now), "attention")
             self.assertFalse(app.state.task(agent.key).get("dismissed", False))
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
@@ -1833,6 +1847,62 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             agent.status = "complete"
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
+
+    async def test_x_clears_overdue_question_but_shift_x_leaves_it_alone(self):
+        question_dir = tempfile.TemporaryDirectory(prefix="aw-question-overdue-x-")
+        self.addCleanup(question_dir.cleanup)
+        question_root = Path(question_dir.name)
+        question_path = question_root / "QUESTION.md"
+        answer_path = question_root / "ANSWER.md"
+        question_path.write_text(
+            "# QUESTION\nid: q1\nquestion: 要先修 A 還是 B？\n"
+            "options:\n- A: 先修 A\n- B: 先修 B\n",
+            encoding="utf-8",
+        )
+        set_mtime(
+            question_path,
+            self.now - (watch.QUESTION_CLEARABLE_SECONDS + 60),
+        )
+        answer_path.write_text(
+            "# ANSWER\nid: old-question\nanswered_at: 2026-10-24T00:00:00Z\n"
+            "choice: A\n",
+            encoding="utf-8",
+        )
+        paths = (question_path, answer_path)
+        before = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths
+        }
+        agent = self.fixture_agents()[4]
+        agent.status = "question"
+        agent.completion_time = self.now - 60
+        agent.question = watch.read_task_question(question_root)
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(watch.question_is_active(agent.question, agent.completion_time))
+            self.assertEqual(
+                watch.question_wait_seconds(agent.question, self.now),
+                24 * 3600 + 60,
+            )
+            await pilot.press("shift+x")
+            await pilot.pause()
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.state.task(agent.key)["dismissed"])
+            self.assertEqual(app.state.bucket(agent, self.now), "history")
+            self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
+
+        self.assertEqual(
+            before,
+            {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths},
+        )
 
     async def test_x_clears_malformed_question_after_showing_why(self):
         question_dir = tempfile.TemporaryDirectory(prefix="aw-question-malformed-")
@@ -1856,11 +1926,85 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertIn("malformed", self.screen_text(app))
             await pilot.press("x")
             await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            await pilot.press("enter")
+            await pilot.pause()
             self.assertEqual(app.state.bucket(agent, self.now), "history")
             self.assertEqual(
                 question_path.read_text(encoding="utf-8"), "# QUESTION\nid: q1\n",
                 "clearing the card never edits QUESTION.md",
             )
+
+    async def test_x_optional_reason_text_empty_and_cancel(self):
+        cases = (
+            (("r", "e", "t", "r", "y"), "retry"),
+            ((), ""),
+            ((), None),
+        )
+        for index, (keys, expected) in enumerate(cases):
+            with self.subTest(expected=expected):
+                agent = self.fixture_agents()[0]
+                agent.key += "-" + str(index)
+                app = self.fixture_app([agent])
+                before = app.state.data.copy()
+                async with app.run_test(size=(80, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press("x")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+                    if keys:
+                        await pilot.press(*keys)
+                    await pilot.press("enter" if expected is not None else "escape")
+                    await pilot.pause()
+                    if expected is None:
+                        self.assertEqual(app.state.data, before)
+                    else:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(
+                            app.state.task(agent.key)["dismissed_reason"], expected,
+                        )
+
+    async def test_x_reason_input_stops_at_200_characters(self):
+        agent = self.fixture_agents()[0]
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            reason_input = app.screen.query_one("#dismiss-reason-input", watch.Input)
+            reason_input.insert_text_at_cursor("a" * 200)
+            reason_input.insert_text_at_cursor("a")
+            self.assertEqual(len(reason_input.value), 200)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                app.state.task(agent.key)["dismissed_reason"], "a" * 200,
+            )
+
+    async def test_x_refuses_running_and_already_cleared_without_modal(self):
+        running, cleared = self.fixture_agents()[5], self.fixture_agents()[0]
+        agents = [running, cleared]
+        app = self.fixture_app(agents)
+        app.state.reconcile(agents, self.now)
+        self.assertTrue(app.state.apply(
+            "dismiss", cleared, agents, self.now, reason="previous",
+        )[0])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            for agent, message in (
+                (running, "進行中的任務不能清除"),
+                (cleared, "目前項目不在需處理區，也不是已過期或被取代項目"),
+            ):
+                app.selected_key = agent.key
+                before = app.state.data.copy()
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+                self.assertEqual(app.state_message, message)
+                self.assertEqual(app.state.data, before)
 
     async def test_preview_tracks_keyboard_mouse_and_refresh_without_stealing_selection(self):
         agents = self.fixture_agents()[5:7]
@@ -2133,6 +2277,25 @@ class V10StateTests(unittest.TestCase):
 
     def apply(self, operation, agent=None, **values):
         return self.state.apply(operation, agent or self.finished, self.agents, self.now, **values)
+
+    def test_dismiss_refusal_only_needs_agent_and_time(self):
+        self.assertEqual(self.state.dismiss_refusal(self.finished, self.now),
+                         "目前項目不在需處理區，也不是已過期或被取代項目")
+
+    def test_dismiss_refusal_has_no_unreachable_cleared_message_branch(self):
+        self.assertNotIn('return "此項目已清除"',
+                         inspect.getsource(watch.WatchState.dismiss_refusal))
+
+    def test_clean_dismiss_reason_removes_control_characters(self):
+        self.assertEqual(watch.WatchState.clean_dismiss_reason(
+            "A\x1b\x00\u2028\x0b\x0c\x85\u2029B"), "AB")
+
+    def test_clean_dismiss_reason_does_not_split_zwj_sequences(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466"
+        self.assertEqual(
+            watch.WatchState.clean_dismiss_reason(family * 60),
+            family * 28,
+        )
 
     def test_running_and_attention_cannot_hide_or_finish(self):
         for agent in self.agents[:7]:
@@ -2470,6 +2633,302 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             print("v10-s3 fixture state isolated; TSV bytes and mtime_ns UNCHANGED")
 
 
+class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """N4: a failed card whose fix card is still running sits in 已接手."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = parse_timestamp("2026-10-25T10:00:00Z")
+        clock = patch("watch.time.time", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def agent(self, name, status, project="claude-perm", **values):
+        defaults = dict(
+            name=name, log_path=Path("/dev/null"), last_path=Path("/dev/null"),
+            status=status, model="fixture", harness="Claude", start_time=self.now - 900,
+            elapsed="00:15:00", latest=name + " 最新進度", key=name + "::" + project,
+            project=project, log_mtime=self.now - 1,
+        )
+        defaults.update(values)
+        return AgentInfo(**defaults)
+
+    def pair(self, replacement_status="running", **values):
+        old = self.agent("claude-perm-p2-fix", "failed", completion_time=self.now - 600)
+        new = self.agent("claude-perm-p2-fix2", replacement_status, start_time=self.now - 300, **values)
+        return old, new
+
+    def make_state(self, agents):
+        directory = tempfile.TemporaryDirectory(prefix="aw-handoff-state-")
+        self.addCleanup(directory.cleanup)
+        state = watch.WatchState(Path(directory.name) / "state.json")
+        state.reconcile(agents, self.now)
+        return state
+
+    def test_running_fix2_moves_old_card_to_handoff_and_failure_returns_it(self):
+        old, new = self.pair()
+        state = self.make_state([old, new])
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+        self.assertEqual(state.stale_info(old, self.now), "")
+        self.assertEqual(state.handoff_label(old), "已接手 → claude-perm-p2-fix2")
+        new.status, new.completion_time = "failed", self.now - 10
+        state.reconcile([old, new], self.now)
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.handoff_label(old), "")
+        for status, bucket in (("complete", "history"), ("reported", "handoff"),
+                               ("partial", "handoff")):
+            with self.subTest(status=status):
+                new.status, new.completion_time = status, self.now - 10
+                state.reconcile([old, new], self.now)
+                self.assertEqual(state.bucket(old, self.now), bucket)
+                if status == "complete":
+                    self.assertEqual(
+                        state.stale_info(old, self.now),
+                        "已接手完成 → claude-perm-p2-fix2",
+                    )
+
+    def review_case(self, status="complete", report=None, review=None, question=None):
+        old, fix = self.pair("complete", completion_time=self.now - 10)
+        directory = tempfile.TemporaryDirectory(prefix="aw-review-card-")
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        if report is not None:
+            (folder / "REPORT.md").write_text(report, encoding="utf-8")
+        if review is not None:
+            (folder / "REVIEW.md").write_text(review, encoding="utf-8")
+        reviewer = self.agent(
+            fix.name + "-review", status, last_path=folder / "task.log",
+            completion_time=self.now - 5, question=question,
+        )
+        agents = [old, fix, reviewer]
+        return old, fix, reviewer, agents, self.make_state(agents)
+
+    def test_review_pass_clears_old_card(self):
+        old, _, _, _, state = self.review_case(review="Review notes\nverdict: PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(
+            state.stale_info(old, self.now), "已接手完成 → claude-perm-p2-fix2",
+        )
+
+    def test_review_fail_returns_old_card_to_attention(self):
+        old, _, _, _, state = self.review_case(review="FAIL\n")
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_review_fail_can_be_dismissed_without_clearing_another_failure(self):
+        old, _, reviewer, agents, state = self.review_case(review="FAIL\n")
+        other_old = self.agent("independent-task-fix", "failed",
+                               completion_time=self.now - 600)
+        other_fix = self.agent("independent-task-fix2", "complete",
+                               start_time=self.now - 300, completion_time=self.now - 10)
+        directory = tempfile.TemporaryDirectory(prefix="aw-review-card-")
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        (folder / "REVIEW.md").write_text("FAIL\n", encoding="utf-8")
+        other_review = self.agent(
+            other_fix.name + "-review", "complete", last_path=folder / "task.log",
+            completion_time=self.now - 5,
+        )
+        agents.extend((other_old, other_fix, other_review))
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(other_old, self.now), "attention")
+        self.assertEqual(state.stale_info(other_old, self.now), "修正卡審查 FAIL")
+
+        self.assertEqual(state.apply("dismiss", old, agents, self.now), (True, "已清除"))
+        self.assertTrue(state.task(old.key)["dismissed"])
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.stale_info(old, self.now), "已清除")
+        row = watch.render_task_row(
+            old, 100, self.now, bucket=state.bucket(old, self.now),
+            history_label=state.stale_info(old, self.now),
+        )
+        self.assertIn("已清除", row.plain)
+        self.assertEqual(state.bucket(other_old, self.now), "attention")
+        self.assertEqual(state.stale_info(other_old, self.now), "修正卡審查 FAIL")
+
+        (reviewer.last_path.parent / "REVIEW.md").write_text(
+            "FAIL\nreview details changed\n", encoding="utf-8",
+        )
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.stale_info(old, self.now), "已清除")
+
+    async def test_shift_x_confirms_and_clears_review_fail(self):
+        old, _, _, agents, _ = self.review_case(review="FAIL\n")
+        app = self.handoff_app(agents)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.action_dismiss_stale()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissConfirmScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(app.state.task(old.key)["dismissed"])
+            self.assertEqual(app.state.bucket(old, self.now), "history")
+            self.assertEqual(app.state.stale_info(old, self.now), "已清除")
+
+    async def test_uppercase_x_and_shift_x_confirm_batch_without_reasons(self):
+        for key in ("X", "shift+x"):
+            with self.subTest(key=key):
+                agents = [
+                    self.agent("stale-a", "failed", completion_time=self.now - 172800),
+                    self.agent("stale-b", "failed", completion_time=self.now - 172800),
+                ]
+                app = self.handoff_app(agents)
+                async with app.run_test(size=(100, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press(key)
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, watch.DismissConfirmScreen)
+                    self.assertEqual(app.screen.count, 2)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    for agent in agents:
+                        self.assertTrue(app.state.task(agent.key)["dismissed"])
+                        self.assertEqual(app.state.task(agent.key)["dismissed_reason"], "")
+                    self.assertFalse(app.ui_error)
+
+    def test_running_review_keeps_old_card_in_handoff(self):
+        old, _, _, _, state = self.review_case(status="running", review="PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+
+    def test_unreadable_verdict_clears_with_note(self):
+        old, _, _, _, state = self.review_case(report="DONE\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertIn("（審查讀不到，DONE 即清）", state.stale_info(old, self.now))
+
+    def test_done_fail_report_first_line_parses_as_fail(self):
+        old, _, _, _, state = self.review_case(
+            report="DONE — FAIL（P2 × 2、P3 × 4）\n",
+        )
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_auto_clear_recomputes_when_review_flips_to_fail(self):
+        old, _, reviewer, agents, state = self.review_case(review="PASS\n")
+        self.assertEqual(state.bucket(old, self.now), "history")
+        self.assertEqual(state.task(old.key), {})
+        (reviewer.last_path.parent / "REVIEW.md").write_text("FAIL\n", encoding="utf-8")
+        state.reconcile(agents, self.now)
+        self.assertEqual(state.bucket(old, self.now), "attention")
+        self.assertEqual(state.stale_info(old, self.now), "修正卡審查 FAIL")
+
+    def test_active_review_question_keeps_old_card_handed_off(self):
+        old, _, _, _, state = self.review_case(
+            question={"id": "q1", "answered": False},
+        )
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+
+    def test_review_inputs_are_read_only(self):
+        old, _, reviewer, agents, _ = self.review_case(
+            report="DONE — FAIL（P2 × 2、P3 × 4）\n", review="FAIL\n",
+        )
+        folder = reviewer.last_path.parent
+        paths = [folder / name for name in (
+            "agent-runs.tsv", "agent-runs-done.tsv", "REPORT.md",
+            "REVIEW.md", "QUESTION.md", "ANSWER.md",
+        )]
+        for path in paths:
+            path.touch(exist_ok=True)
+        (folder / "QUESTION.md").write_text(
+            "# QUESTION\nid: q1\noptions:\n- A: A\n", encoding="utf-8",
+        )
+        before = [(path.stat().st_mtime_ns, path.read_bytes()) for path in paths]
+        state = watch.WatchState(folder / "state.json")
+        state.reconcile(agents, self.now)
+        self.assertEqual(
+            before, [(path.stat().st_mtime_ns, path.read_bytes()) for path in paths],
+        )
+
+    def test_handoff_row_names_replacement_in_teal(self):
+        old, new = self.pair()
+        state = self.make_state([old, new])
+        row = watch.render_task_row(
+            old, 100, self.now, bucket=state.bucket(old, self.now),
+            history_label=state.handoff_label(old),
+        )
+        self.assertIn("已接手 → claude-perm-p2-fix2", row.plain)
+        self.assertEqual(row.style, "#73daca")
+        self.assertIn("[#73daca]● 已接手[/]", watch.ATTENTION_LEGEND)
+        self.assertEqual(
+            watch.count_buckets([old], self.now, lambda _agent, _now: "handoff")["handoff"], 1
+        )
+
+    def test_handoff_cards_refuse_x_shift_x_hide_and_collapse(self):
+        old, new = self.pair()
+        stale = self.agent("stale-task", "failed", project="other-project",
+                           completion_time=self.now - 48 * 3600)
+        agents = [old, new, stale]
+        state = self.make_state(agents)
+        ok, message = state.apply("dismiss", old, agents, self.now)
+        self.assertFalse(ok)
+        self.assertIn("已接手的任務不能清除", message)
+        for operation in ("hide", "done"):
+            self.assertFalse(state.apply(operation, old, agents, self.now)[0])
+        self.assertEqual(state.dismiss_stale(agents, self.now), 1)
+        self.assertFalse(state.task(old.key).get("dismissed", False))
+        self.assertTrue(state.task(stale.key)["dismissed"])
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+        # A project with a handed-off card still has open work.
+        self.assertFalse(state.apply("collapse", old, [old], self.now)[0])
+
+    def handoff_app(self, agents):
+        return V10MainPageTests.fixture_app(self, agents)
+
+    async def test_handoff_section_sits_between_attention_and_pins(self):
+        old, new = self.pair()
+        failed = self.agent("other-failure", "failed", project="agent-watch",
+                            completion_time=self.now - 60)
+        recent = self.agent("done-task", "complete", project="agent-watch",
+                            completion_time=self.now - 60)
+        archived = self.agent("old-task", "complete", project="agent-watch",
+                              completion_time=self.now - 9000)
+        app = self.handoff_app([old, new, failed, recent, archived])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            attention, handoff, pinned = (
+                app.query_one(selector) for selector in ("#attention-box", "#handoff-box", "#pinned-box")
+            )
+            self.assertTrue(handoff.display)
+            self.assertLessEqual(attention.region.bottom, handoff.region.y)
+            self.assertLessEqual(handoff.region.bottom, pinned.region.y)
+            self.assertEqual([row.agent.key for row in handoff.query(watch.TaskRow)], [old.key])
+            self.assertNotIn(old.key, [row.agent.key for row in attention.query(watch.TaskRow)])
+            screen = V10MainPageTests.screen_text(app)
+            self.assertIn("● 已接手", screen)
+            self.assertIn("已接手 → claude-perm-p2-fix2", screen)
+            self.assertIn("需處理 1 │ 已接手 1 │ 進行中 1 │ 剛完成 1 │ 歷史 1 │ 隱藏 0 │ 總計 5", screen)
+            self.assertFalse(app.ui_error)
+            app.action_dismiss_stale()  # Shift+X
+            await pilot.pause()
+            self.assertIn("已接手 1 筆不能清除", app.state_message)
+            app.selected_key = old.key
+            app.action_dismiss_task()  # x
+            await pilot.pause()
+            self.assertIn("已接手的任務不能清除", app.state_message)
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+            self.assertEqual(app.state.bucket(old, self.now), "handoff")
+
+        app = self.handoff_app([failed, recent])
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertFalse(app.query_one("#handoff-box").display)
+            self.assertNotIn("已接手 →", V10MainPageTests.screen_text(app))
+
+    async def test_handoff_screenshot_100x35(self):
+        old, new = self.pair()
+        app = self.handoff_app([old, new])
+        with tempfile.TemporaryDirectory(prefix="agent-watch-handoff-shot-") as tmp:
+            shots = snapshot_dir(Path(tmp) / "shots")
+            async with app.run_test(size=(100, 35)) as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                self.assertEqual(app.query_one("#main-tabs").active, "tab-work")
+                svg = app.export_screenshot(title="work-handoff-100x35.svg")
+            (shots / "work-handoff-100x35.svg").write_text(svg, encoding="utf-8")
+        self.assertIn("已接手 →", html.unescape(svg).replace("\xa0", " "))
+
+
 class SupersessionTests(unittest.TestCase):
     def make_agent(self, name, status, *, project="agent-watch", start=100,
                    completion=None, question=None):
@@ -2506,7 +2965,6 @@ class SupersessionTests(unittest.TestCase):
             ("awv10-p2", "awv10-p2fix"),
             ("task", "task-fix"),
             ("task-p2", "task-p2fix"),
-            ("task", "task-rereview"),
             ("task-fix", "task-fix2-retry-3"),
         ):
             with self.subTest(old=old_name, new=new_name):
@@ -2514,6 +2972,13 @@ class SupersessionTests(unittest.TestCase):
                     watch._normalized_task_name(old_name),
                     watch._normalized_task_name(new_name),
                 )
+
+    def test_review_card_names_do_not_supersede_original_card(self):
+        old = self.make_agent("task", "failed", start=100, completion=200)
+        for name in ("task-review", "task-rereview"):
+            with self.subTest(name=name):
+                review = self.make_agent(name, "running", start=300)
+                self.assertNotIn(old.key, watch.compute_superseded([old, review]))
 
     def test_numbered_sibling_cards_keep_their_own_status(self):
         for old_name, new_name in (
@@ -2554,7 +3019,7 @@ class SupersessionTests(unittest.TestCase):
             watch.compute_superseded([old, replacement]),
             {old.key: replacement.key},
         )
-        self.assertEqual(state.bucket(old, 310), "history")
+        self.assertEqual(state.bucket(old, 310), "handoff")
 
     def test_phase_versioned_fix2_hands_off_matching_failed_card(self):
         old = self.make_agent(
@@ -2606,7 +3071,7 @@ class SupersessionTests(unittest.TestCase):
                     watch.compute_superseded([old, replacement]),
                     {old.key: replacement.key},
                 )
-                self.assertEqual(state.bucket(old, 310), "history")
+                self.assertEqual(state.bucket(old, 310), "handoff")
 
     def test_multi_digit_phase_siblings_and_other_phase_fixes_do_not_handoff(self):
         for old_name, new_name in (
@@ -2687,8 +3152,8 @@ class SupersessionTests(unittest.TestCase):
         self.assertEqual(watch.compute_superseded([old, replacement]), {
             old.key: replacement.key,
         })
-        self.assertEqual(state.stale_info(old, 210), "已被取代")
-        self.assertEqual(state.bucket(old, 210), "history")
+        self.assertEqual(state.stale_info(old, 210), "")
+        self.assertEqual(state.bucket(old, 210), "handoff")
 
     def test_failed_fix2_does_not_hide_old_failed_card(self):
         old = self.make_agent(
@@ -2712,7 +3177,7 @@ class SupersessionTests(unittest.TestCase):
         state = self.make_state()
         state.reconcile([old, replacement], 310)
         self.assertEqual(state.bucket(old, 310), "history")
-        self.assertEqual(state.stale_info(old, 310), "已被取代")
+        self.assertEqual(state.stale_info(old, 310), "已接手完成 → claude-perm-p2-fix2")
 
     def test_name_matching_never_crosses_project_boundary(self):
         old = self.make_agent(
