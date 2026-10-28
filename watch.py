@@ -5,6 +5,7 @@ import argparse
 import calendar
 import copy
 import json
+import logging
 import math
 import os
 import re
@@ -25,6 +26,8 @@ from zoneinfo import ZoneInfo
 
 from rich.markup import escape
 from rich.text import Text
+
+import tok_speed
 
 # Textual imports (conditional for --once flag speed)
 try:
@@ -59,6 +62,13 @@ ARCHITECTURE_PATH = _env_path(
     "AGENT_WATCH_ARCH", Path(__file__).with_name("arch.json")
 )
 MAGPIE_COMMAND = os.environ.get("AGENT_WATCH_MAGPIE", "magpie")
+# Daily tok/s per model/tier, long format (see tok_speed.py).
+DEFAULT_TOKS_TSV = _env_path("AGENT_WATCH_TOKS_TSV", ROOT_DIR / "agent-watch-toks.tsv")
+
+
+def daily_stats_path_from_env() -> Path:
+    """Resolve the daily stats path without making tests write to the live root."""
+    return _env_path("AGENT_WATCH_DAILY", ROOT_DIR / "agent-watch-daily.tsv")
 
 
 def load_architecture_data(path: Optional[Path] = None) -> Dict[str, Any]:
@@ -182,6 +192,9 @@ PROJECT_PATH_FORBIDDEN_RE = re.compile(
     r"不[要]?改|不[要]?動|禁止|不[要]?碰|沒有碰|未碰|forbidden", re.IGNORECASE
 )
 PROJECT_PATH_MENTION_MIN = 3
+# `~/Projects/status` is the status dashboard every task updates, so it is meta
+# evidence like the runs root: mentioning it must never decide a card's project.
+PROJECT_META_PATH_NAMES = frozenset({"status"})
 PROJECT_SIGNAL_READ_BYTES = 128 * 1024
 PROJECT_SIGNAL_CACHE_LIMIT = 800
 _PROJECT_LABEL_CACHE: Dict[str, Any] = {}
@@ -248,11 +261,18 @@ def keyword_matches(keyword: str, text: str) -> bool:
 
 
 def resolve_project(value: str) -> Tuple[str, str]:
+    """Resolve a configured project id or alias; repo names are not labels.
+
+    `repo_names` describe a checkout, not a label. They are resolved only where
+    a value is known to be a repository name (`_project_for_repo_name`), so a
+    repo name that collides with another project's alias can never reroute
+    label or path statistics.
+    """
     ensure_architecture_data()
+    wanted = value.casefold()
     for project_id, config in ARCHITECTURE_DATA["projects"].items():
-        if value.casefold() in [project_id.casefold()] + [
-            alias.casefold() for alias in config.get("aliases", [])
-        ]:
+        names = [project_id, *config.get("aliases", [])]
+        if wanted in {str(name).casefold() for name in names}:
             return project_id, ""
     return PROJECT_OTHER, f"未知專案：{value}"
 
@@ -388,16 +408,92 @@ def _git_origin_name(root: Path) -> str:
 
 
 def _project_for_repo_name(name: str) -> str:
+    """Project whose id, alias, or repo_name is exactly `name`.
+
+    Two matching projects mean the name is ambiguous, so the answer is empty
+    rather than the first project in `arch.json` order.
+    """
     if not name:
         return ""
     ensure_architecture_data()
-    wanted = name.casefold()
+    wanted = str(name).casefold()
+    found = []
     for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
         if project_id == PROJECT_OTHER or not isinstance(config, dict):
             continue
         names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
         if wanted in {str(value).casefold() for value in names}:
-            return project_id
+            found.append(project_id)
+    return found[0] if len(found) == 1 else ""
+
+
+def _repo_key(value: str) -> str:
+    """Spelling-insensitive repo key: `MedKnowledge` == `med-knowledge`."""
+    return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
+
+
+# Only a task decoration that follows a name is dropped; a bare number (`c1-2`,
+# `pai-69`) is part of the name, so stripping it could pick an unrelated project.
+REPO_HINT_SUFFIX_RE = re.compile(
+    r"[-_](?:fix|review|retry|rerun)(?:[-_]?\d+)?$", re.IGNORECASE
+)
+
+
+def _projects_for_repo_key(key: str) -> List[str]:
+    """Every project whose id/alias/repo name/path ends in `key`; order is arch."""
+    ensure_architecture_data()
+    found: List[str] = []
+    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
+        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+            continue
+        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        names += [
+            str(path).strip("/").rsplit("/", 1)[-1]
+            for path in config.get("repo_paths", [])
+        ]
+        if key in {_repo_key(value) for value in names}:
+            found.append(project_id)
+    return found
+
+
+def _repo_hint_candidates(hint: str) -> List[str]:
+    """The hint text itself, then the same text without one task decoration."""
+    text = hint.strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
+    match = re.search(r"projects/([^/\s]+)", text, re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    text = text.rstrip("/")
+    if not text:
+        return []
+    values = [text]
+    stripped = REPO_HINT_SUFFIX_RE.sub("", text)
+    if stripped and stripped != text:
+        values.append(stripped)
+    return values
+
+
+def _project_for_repo_hint(hint: str) -> str:
+    """Map a dispatch hint that is not a project id onto a registered repo.
+
+    Hints are hand-written and often name the repo instead of the project
+    (`Projects/MedKnowledge/`, `personal_capture`, `agent-watch-fix2`), so the
+    comparison ignores separators and one trailing `-fix`/`-review` decoration.
+    The full name wins; if a name fits more than one project, nothing is
+    guessed and the hint simply does not classify the card.
+
+    Limits: `projects/…` only uses the first path segment, and non-ASCII names
+    normalize to an empty key, so a Chinese-only repo name never matches here
+    (the keyword stage may still place the card).
+    """
+    for candidate in _repo_hint_candidates(hint):
+        key = _repo_key(candidate)
+        if not key:
+            continue
+        matches = _projects_for_repo_key(key)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return ""
     return ""
 
 
@@ -496,10 +592,16 @@ def task_path_project(task_dir: Path) -> str:
         tallies: Dict[str, int] = {}
         for name, count in counts.items():
             # Every task folder lives under the runs root; that path is not evidence.
-            if name.casefold() == workspace:
+            if name.casefold() == workspace or name.casefold() in PROJECT_META_PATH_NAMES:
                 continue
             project_id, error = resolve_project(name)
             if error:
+                # A ~/Projects path component is a repository name, so keep that
+                # lookup explicit (and collision-safe) instead of widening every
+                # label lookup with repo_names.
+                project_id = _project_for_repo_name(name)
+                error = "" if project_id else error
+            if error or project_is_dispatch_only(project_id):
                 continue
             tallies[project_id] = tallies.get(project_id, 0) + count
         if not tallies:
@@ -573,17 +675,28 @@ def infer_project_details(
 ) -> Tuple[str, str, str]:
     """Group a task by explicit label, then location, paths, and finally keywords.
 
-    Returns `(project_id, evidence_source, warning)`. The warning is only set for
-    a malformed explicit project column, which keeps the historical data error.
+    Returns `(project_id, evidence_source, warning)`. A hint that is not in
+    `arch.json` is kept as a warning and inference carries on: it may name a repo,
+    and git / paths / keywords can still place the card. Only when every stage
+    fails is the card `other`, with basis `未判斷`.
+
+    The warning is only for a card that ends up in `other`: a card that was
+    classified successfully must not show a "資料有錯" row (PAST-REVIEW P2-1).
     """
     ensure_architecture_data()
     folder = task_dir if task_dir is not None else project_folder(log_path, last_path)
     weak_hint = ""
+    hint_warning = ""
     if project_hint:
         project_id, error = resolve_project(project_hint)
         if error:
-            return PROJECT_OTHER, PROJECT_SOURCE_NONE, error
-        if project_is_dispatch_only(project_id):
+            hint_warning = error
+            repo_project = _project_for_repo_hint(project_hint)
+            if repo_project and not project_is_dispatch_only(repo_project):
+                return repo_project, PROJECT_SOURCE_LABEL, ""
+            if repo_project:
+                weak_hint = repo_project
+        elif project_is_dispatch_only(project_id):
             # `--project night` records the dispatch system, not the project.
             weak_hint = project_id
         else:
@@ -608,7 +721,7 @@ def infer_project_details(
         return project_id, PROJECT_SOURCE_KEYWORD, ""
     if weak_hint:
         return weak_hint, PROJECT_SOURCE_DISPATCH, ""
-    return PROJECT_OTHER, PROJECT_SOURCE_NONE, ""
+    return PROJECT_OTHER, PROJECT_SOURCE_NONE, hint_warning
 
 
 def infer_project(
@@ -634,6 +747,251 @@ def project_source_summary(agents: List["AgentInfo"]) -> str:
     ordered = [source for source in PROJECT_SOURCE_ORDER if source in counts]
     ordered += [source for source in counts if source not in PROJECT_SOURCE_ORDER]
     return "／".join(f"{source} {counts[source]}" for source in ordered)
+
+
+PROJECT_OTHER_WINDOW_DAYS = 14
+
+
+def agent_activity_time(agent: "AgentInfo") -> float:
+    """Latest moment a card shows activity; 0 when it has no usable timestamp."""
+    return agent.completion_time or agent.start_time or agent.log_mtime or 0.0
+
+
+def project_other_summary(
+    agents: List["AgentInfo"],
+    now: Optional[float] = None,
+    window_days: int = PROJECT_OTHER_WINDOW_DAYS,
+) -> str:
+    """`其他 N（x%，近 14 天）` for the recent window, e.g. `其他 3（7.5%，近 14 天）`.
+
+    Cards without any usable timestamp stay in the window: they cannot be dated
+    out, and dropping them silently shrank the denominator. The window is not
+    the board's 總計 (which also holds older history), so the label spells the
+    denominator out instead of implying it matches.
+    """
+    current = time.time() if now is None else now
+    cutoff = current - window_days * 86400
+    window = [
+        agent for agent in agents
+        if agent_activity_time(agent) == 0 or agent_activity_time(agent) >= cutoff
+    ]
+    total = len(window)
+    other = sum(
+        1 for agent in window
+        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
+    )
+    ratio = (other / total * 100) if total else 0.0
+    return f"其他 {other}（{ratio:.1f}%，近 {window_days} 天）"
+
+
+DAILY_STATS_BASIS_SOURCES = (
+    PROJECT_SOURCE_LABEL,
+    PROJECT_SOURCE_DISPATCH,
+    PROJECT_SOURCE_KEYWORD,
+    PROJECT_SOURCE_GIT,
+    PROJECT_SOURCE_PATH,
+    PROJECT_SOURCE_NONE,
+)
+DAILY_STATS_COLUMNS = (
+    "date", "total", "other_count", "other_ratio",
+    *[f"basis_{source}" for source in DAILY_STATS_BASIS_SOURCES],
+)
+N7_DAILY_STATS_COLUMNS = (
+    "date", "total_cards", "q_waiting", "q_overdue", "escalated", "blocked",
+    "failed", "no_report", "attention_other", "handed_off", "manual_cleared",
+    "manual_with_reason", "attention_ratio",
+)
+
+
+def daily_stats_row(
+    agents: List["AgentInfo"],
+    day_start: float,
+    now: Optional[float] = None,
+) -> Dict[str, str]:
+    """One daily TSV row: totals, the `其他` share, and the basis distribution."""
+    day = datetime.fromtimestamp(day_start)
+    day_end = day_start + 86400
+    window = [
+        agent for agent in agents
+        if day_start <= agent_activity_time(agent) < day_end
+    ]
+    total = len(window)
+    other = sum(
+        1 for agent in window
+        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
+    )
+    row = {
+        "date": day.strftime("%Y-%m-%d"),
+        "total": str(total),
+        "other_count": str(other),
+        "other_ratio": f"{(other / total * 100) if total else 0.0:.1f}",
+    }
+    for source in DAILY_STATS_BASIS_SOURCES:
+        row[f"basis_{source}"] = str(sum(
+            1 for agent in window
+            if (agent.project_source or PROJECT_SOURCE_NONE) == source
+        ))
+    return row
+
+
+def daily_attention_row(
+    agents: List["AgentInfo"], state: "WatchState", now: float,
+) -> Dict[str, Any]:
+    today = datetime.fromtimestamp(now).date()
+    cards = []
+    for agent in agents:
+        stamp = agent.start_time if agent.start_source == "tsv" else agent.log_mtime
+        try:
+            if stamp and datetime.fromtimestamp(stamp).date() == today:
+                cards.append(agent)
+        except (OSError, OverflowError, ValueError):
+            continue
+    cleared = {}
+    for key, entry in state.data.get("tasks", {}).items():
+        if not entry.get("dismissed"):
+            continue
+        try:
+            stamp = datetime.fromisoformat(
+                str(entry.get("dismissed_at", "")).replace("Z", "+00:00")
+            ).astimezone()
+            if stamp.date() == today:
+                cleared[key] = entry
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+    counts = {column: 0 for column in N7_DAILY_STATS_COLUMNS[2:10]}
+    for agent in cards:
+        if state._dismissed(agent):
+            continue
+        bucket = state.bucket(agent, now)
+        if bucket == "handoff":
+            counts["handed_off"] += 1
+        elif bucket == "attention":
+            question = agent.question
+            if question_is_malformed(question):
+                counts["attention_other"] += 1
+            elif question_is_active(question, agent.completion_time):
+                if question_escalated(question, agent.completion_time):
+                    counts["escalated"] += 1
+                elif question_wait_seconds(question, now) >= QUESTION_OVERDUE_SECONDS:
+                    counts["q_overdue"] += 1
+                else:
+                    counts["q_waiting"] += 1
+            elif agent.status in ("blocked", "failed", "no_report"):
+                counts[agent.status] += 1
+            else:
+                counts["attention_other"] += 1
+    numerator = sum(counts[key] for key in (
+        "q_waiting", "q_overdue", "escalated", "blocked", "failed",
+        "no_report", "attention_other",
+    ))
+    total = len(cards)
+    return {
+        "date": today.isoformat(), "total_cards": total, **counts,
+        "manual_cleared": len(cleared),
+        "manual_with_reason": sum(bool(item.get("dismissed_reason")) for item in cleared.values()),
+        "attention_ratio": f"{numerator / total * 100:.1f}" if total else "",
+    }
+
+
+def _default_file_mode() -> int:
+    """Mode a plain `open(..., "w")` gives a new file: 0o666 minus the umask.
+
+    Reading the umask means setting it for a moment; the dashboard is a
+    single-process CLI/TUI, so the window is not observable by another writer.
+    """
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def write_daily_stats(
+    path: Path,
+    agents: List["AgentInfo"],
+    day_start: Optional[float] = None,
+    now: Optional[float] = None,
+    *,
+    row: Optional[Dict[str, Any]] = None,
+    owned_columns: Optional[Tuple[str, ...]] = None,
+) -> Path:
+    """Merge only the caller's columns into today's row; other days are preserved.
+
+    The caller owns the path so tests (and alternate runs roots) never touch the
+    live daily TSV. Caller-owned columns merge by header name.
+    """
+    target = Path(path)
+    current = time.time() if now is None else now
+    if day_start is None:
+        day_start = datetime.fromtimestamp(current).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).timestamp()
+    values = daily_stats_row(agents, day_start, current) if row is None else row
+    day = str(values.get("date", ""))
+    if not day:
+        raise ValueError("daily stats row requires a date")
+    expected_day = datetime.fromtimestamp(day_start).date().isoformat()
+    if day != expected_day:
+        logging.getLogger(__name__).warning(
+            "daily stats row date %s is not today (%s); skipping write",
+            day, expected_day,
+        )
+        return target
+    owned = DAILY_STATS_COLUMNS if owned_columns is None else owned_columns
+    source_columns = list(DAILY_STATS_COLUMNS)
+    columns = list(DAILY_STATS_COLUMNS)
+    preserved: List[str] = []
+    today: Dict[str, str] = {}
+    existing_text: Optional[str] = None
+    if target.is_file():
+        existing_text = target.read_text(encoding="utf-8")
+        for line in existing_text.splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if parts[0] == "date":
+                source_columns = parts
+                columns = list(dict.fromkeys(source_columns + list(DAILY_STATS_COLUMNS)))
+                continue
+            if parts[0] == day:
+                today.update(dict(zip(source_columns, parts)))
+            else:
+                preserved.append(line)
+    for column in owned:
+        if column not in columns:
+            columns.append(column)
+    today["date"] = day
+    today.update({key: str(values[key]) for key in owned if key in values})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    dated = [(line.split("\t", 1)[0], line) for line in preserved]
+    dated.append((day, "\t".join(today.get(column, "") for column in columns)))
+    dated.sort(key=lambda item: item[0])
+    body = ["\t".join(columns)] + [line for _, line in dated]
+    content = "\n".join(body) + "\n"
+    if existing_text == content:
+        return target
+    try:
+        existing_mode: Optional[int] = target.stat().st_mode & 0o777
+    except OSError:
+        existing_mode = None
+    # A unique temp name in the same directory: two writers cannot share the
+    # fixed `<name>.tmp` and interleave their rows.
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=target.name + ".", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(content)
+        # `mkstemp` always creates 0600; hand the file the mode a normal write
+        # would have used, so a reader that could open the old TSV still can.
+        os.chmod(
+            temporary,
+            existing_mode if existing_mode is not None else _default_file_mode(),
+        )
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
 
 
 
@@ -2287,6 +2645,7 @@ def format_bucket_counts(
         f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
         f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ "
         f"{handoff}總計 {counts['total']}"
+        f" │ {project_other_summary(agents, now)}"
     )
 
 
@@ -4080,6 +4439,7 @@ ATTENTION_FAILURE_STATUSES = frozenset({
 })
 SUPERSEDED_SUCCESS_STATUSES = frozenset({"complete", "reported", "partial"})
 SUPERSEDED_REPLACEMENT_STATUSES = SUPERSEDED_SUCCESS_STATUSES | {"running"}
+DISMISS_STALE_LABELS = frozenset({"已過期", "已被取代", "修正卡審查 FAIL"})
 SUPERSEDED_HANDOFF_WORD = (
     r"(?:fix|retry|rerun|redo|rework|claude|resume)"
 )
@@ -4272,7 +4632,7 @@ class WatchState:
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
         self._superseded: Dict[str, str] = {}
-        # Old task key -> name of the replacement that is still running.
+        # Old task key -> replacement name for a handed-off task.
         self._handoff: Dict[str, str] = {}
         self._auto_clear_labels: Dict[str, str] = {}
         self._review_failures: Set[str] = set()
@@ -4385,7 +4745,7 @@ class WatchState:
         return ""
 
     def stale_info(self, agent: AgentInfo, now: float) -> str:
-        """Return the history label for a dismissed, expired, or replaced task."""
+        """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
             if (
                 self._dismissed(agent)
@@ -4413,7 +4773,7 @@ class WatchState:
         return ""
 
     def handoff_label(self, agent: AgentInfo) -> str:
-        """Name the running replacement of a handed-off task."""
+        """Name the replacement associated with a handed-off task."""
         target = self._handoff.get(agent.key)
         return "已接手 → " + target if target else ""
 
@@ -4536,7 +4896,8 @@ class WatchState:
                 )
                 if rerun:
                     entry.update(hidden=False, done_manual=False, restored=False, read=False,
-                                 dismissed=False, escalate_qid="", escalate_to="",
+                                 dismissed=False, dismissed_reason="",
+                                 escalate_qid="", escalate_to="",
                                  run_start=agent.start_time, updated_at=self.stamp())
                     changed = True
             question = agent.question or {}
@@ -4571,7 +4932,7 @@ class WatchState:
                 return "attention"
         if agent.status == "running":
             return "running"
-        if agent.key in self._review_failures:
+        if agent.key in self._review_failures and not self._dismissed(agent):
             return "attention"
         disposition = self.stale_info(agent, now)
         if disposition:
@@ -4588,29 +4949,91 @@ class WatchState:
             return "history"
         return "recent" if entry.get("restored") else bucket
 
+    def dismiss_refusal(
+        self, agent: AgentInfo, now: float,
+    ) -> str:
+        """Return the existing refusal message, or an empty string if x is allowed."""
+        bucket = self.bucket(agent, now)
+        disposition = self.stale_info(agent, now)
+        if (
+            question_is_active(agent.question, agent.completion_time)
+            and question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
+        ):
+            return "尚未收到這題的有效 ANSWER.md，不能清除"
+        if agent.status == "running" or bucket == "running":
+            return "進行中的任務不能清除"
+        if bucket == "handoff":
+            return "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
+        if bucket != "attention" and disposition not in ("已過期", "已被取代"):
+            return "目前項目不在需處理區，也不是已過期或被取代項目"
+        return ""
+
+    @staticmethod
+    def _dismiss_reason_extend(character: str) -> bool:
+        return unicodedata.category(character).startswith("M") or 0x1F3FB <= ord(character) <= 0x1F3FF
+
+    @staticmethod
+    def _dismiss_reason_regional_indicator(character: str) -> bool:
+        return 0x1F1E6 <= ord(character) <= 0x1F1FF
+
+    @staticmethod
+    def _dismiss_reason_prefix(text: str, limit: int) -> str:
+        end = min(len(text), limit)
+        while 0 < end < len(text):
+            previous, following = text[end - 1], text[end]
+            if (
+                WatchState._dismiss_reason_extend(following)
+                or previous == "\u200d"
+                or following == "\u200d"
+            ):
+                end -= 1
+                continue
+            if (
+                WatchState._dismiss_reason_regional_indicator(previous)
+                and WatchState._dismiss_reason_regional_indicator(following)
+            ):
+                start = end - 1
+                while (
+                    start > 0
+                    and WatchState._dismiss_reason_regional_indicator(text[start - 1])
+                ):
+                    start -= 1
+                if (end - start) % 2:
+                    end -= 1
+                    continue
+            break
+        return text[:end]
+
+    @staticmethod
+    def clean_dismiss_reason(reason: Optional[str]) -> str:
+        if not isinstance(reason, str):
+            return ""
+        characters = []
+        for character in reason:
+            category = unicodedata.category(character)
+            if category in ("Cc", "Zl", "Zp") or (
+                category == "Cf" and character != "\u200d"
+            ):
+                continue
+            characters.append(character)
+        cleaned = "".join(characters).strip()
+        return WatchState._dismiss_reason_prefix(cleaned, 200)
+
     def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
-              tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+              tags: Optional[List[str]] = None,
+              reason: Optional[str] = None) -> Tuple[bool, str]:
         entry = self.task(agent.key)
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
-            if (
-                question_is_active(agent.question, agent.completion_time)
-                and question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
-            ):
-                return False, "尚未收到這題的有效 ANSWER.md，不能清除"
-            if agent.status == "running" or bucket == "running":
-                return False, "進行中的任務不能清除"
-            if bucket == "handoff":
-                return False, "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
-            if bucket != "attention" and disposition not in ("已過期", "已被取代"):
-                return False, "目前項目不在需處理區，也不是已過期或被取代項目"
-            if disposition == "已清除":
-                return False, "此項目已清除"
+            refusal = self.dismiss_refusal(agent, now)
+            if refusal:
+                return False, refusal
             ok = self.update_task(
                 agent.key,
                 dismissed=True,
                 dismissed_at=self.stamp(),
+                dismissed_reason=self.clean_dismiss_reason(reason),
                 dismissed_sig=self.dismissed_signature(agent),
                 run_start=agent.start_time,
             )
@@ -4635,8 +5058,10 @@ class WatchState:
             changes: Dict[str, Any] = {
                 "hide": dict(hidden=True, restored=False),
                 "done": dict(done_manual=True, restored=False),
-                "restore": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
-                "undismiss": dict(hidden=False, done_manual=False, restored=True, dismissed=False),
+                "restore": dict(hidden=False, done_manual=False, restored=True, dismissed=False,
+                                dismissed_reason=""),
+                "undismiss": dict(hidden=False, done_manual=False, restored=True, dismissed=False,
+                                  dismissed_reason=""),
                 "read": dict(read=not entry.get("read", False)),
                 "pin": dict(pinned=not entry.get("pinned", False)),
                 "tags": dict(tags=list(dict.fromkeys(tag.strip() for tag in (tags or []) if tag.strip()))),
@@ -4655,13 +5080,13 @@ class WatchState:
         return ok, "已儲存" if ok else self.warning
 
     def dismiss_stale(self, agents: List[AgentInfo], now: float) -> int:
-        """Clear only expired or superseded tasks after the caller confirms."""
+        """Clear eligible stale or review-failed tasks after the caller confirms."""
         count = 0
         for agent in agents:
             # Aged unanswered questions require a deliberate single-card x action.
             if question_is_active(agent.question, agent.completion_time):
                 continue
-            if self.stale_info(agent, now) not in ("已過期", "已被取代"):
+            if self.stale_info(agent, now) not in DISMISS_STALE_LABELS:
                 continue
             ok, _ = self.apply("dismiss", agent, agents, now)
             count += int(ok)
@@ -4693,7 +5118,7 @@ def history_tasks(agents: List[AgentInfo], state: WatchState, now: float,
 
 def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = False,
                     bucket: Optional[str] = None, history_label: str = "",
-                    answered_by: str = "") -> Text:
+                    answered_by: str = "", toks_text: str = "") -> Text:
     """Reserve separate elapsed/status columns before fitting task identity."""
     width = max(1, width)
     bucket = bucket or board_bucket(agent, now)
@@ -4761,6 +5186,14 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
             wait_text = "  " + format_question_wait(wait_seconds)
         if answered_by and agent.status != "escalated":
             detail = "由 %s 回答 · %s" % (answered_by, detail)
+    if toks_text and bucket == "running":
+        # A running card's subtitle leads with its tok/s; the progress text keeps what is left.
+        speed = truncate_display("  " + toks_text, width)
+        result.append("\n" + speed, style="#7dcfff")
+        rest = width - display_width(speed)
+        if rest > 4:
+            result.append(truncate_display(" · " + detail, rest), style="#a9b1bd")
+        return result
     detail_width = max(1, width - display_width(wait_text))
     result.append("\n" + truncate_display("  " + detail, detail_width), style="#a9b1bd")
     if wait_text:
@@ -5055,11 +5488,18 @@ def notify_question_overdue(agent: AgentInfo):
 def run_once_summary(
     runs_path: Path = DEFAULT_RUNS_TSV,
     done_path: Path = DEFAULT_DONE_TSV,
+    daily_stats_path: Optional[Path] = None,
 ) -> int:
     """Print one-time plain text summary to stdout and exit 0."""
     now = time.time()
     log_parser = LogParser()
     agents, errors = load_all_agents(runs_path, done_path, log_parser, now)
+    if daily_stats_path is not None:
+        # The daily TSV is opt-in: a caller that names a path owns the write.
+        try:
+            write_daily_stats(daily_stats_path, agents, now=now)
+        except OSError as exc:
+            errors.append(f"每日統計寫入失敗：{exc}")
     quota_svc = QuotaService()
     quota_text, quota_raw = quota_svc.fetch(force=True)
     _, _, quota_stale, _ = quota_svc.snapshot()
@@ -5296,6 +5736,17 @@ TagScreen {
     background: #101216;
     padding: 0 1;
 }
+DismissReasonScreen {
+    align: center middle;
+}
+#dismiss-reason-panel {
+    width: 70;
+    max-width: 100%;
+    height: 7;
+    border: solid #9ece6a;
+    background: #101216;
+    padding: 0 1;
+}
 HelpScreen {
     background: #101216;
 }
@@ -5455,6 +5906,22 @@ class RunDataService:
         return True
 
 
+def toks_anchor(agent: AgentInfo) -> tok_speed.CardAnchor:
+    """What tok_speed needs to join magpie rows to this card; reading the log is left to its worker."""
+    end = agent.completion_time
+    if end is None and agent.status != "running" and agent.log_mtime:
+        end = agent.log_mtime
+    log_path = str(agent.log_path)
+    return tok_speed.CardAnchor(
+        key=agent.key,
+        agent=tok_speed.magpie_agent_name(agent.harness),
+        alias="" if agent.model == UNKNOWN_IDENTITY else tok_speed.normalize_model_name(agent.model),
+        start=agent.start_time,
+        end=end,
+        log_path="" if log_path == "/dev/null" else log_path,
+    )
+
+
 class NavTab(Static):
     def __init__(self, label: str, tab_id: str):
         super().__init__(label, classes="nav-tab", markup=False)
@@ -5502,6 +5969,7 @@ class TaskRow(Static, can_focus=True):
             agent, self.content_size.width, self.now, self.selected, bucket,
             self.app.state.stale_info(agent, self.now) or self.app.state.handoff_label(agent),
             self.app.state.answered_by(agent),
+            self.app.toks_text(agent, bucket),
         )
 
     def on_focus(self) -> None:
@@ -5549,6 +6017,28 @@ class TagScreen(ModalScreen):
         self.dismiss([tag.strip() for tag in re.split("[,，]", event.value) if tag.strip()])
 
 
+class DismissReasonScreen(ModalScreen):
+    BINDINGS = [("escape", "cancel", "取消")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dismiss-reason-panel") as panel:
+            panel.border_title = "清除原因"
+            yield Label("選填；留空仍會清除。Enter 確認，Esc 取消。")
+            yield Input(
+                placeholder="最多 200 字", max_length=200,
+                id="dismiss-reason-input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HelpScreen(ModalScreen):
     BINDINGS = [
         ("escape", "dismiss", "返回"),
@@ -5573,7 +6063,7 @@ class HelpScreen(ModalScreen):
                 "  e            展開／收起各專案的剛完成清單\n\n"
                 "  h / d        隱藏／歸到已完成（僅已結束且無需處理）\n"
                 "  x            清除所選需處理項目；不會刪除問題檔\n"
-                "  X            確認後清除已過期／已被取代項目\n"
+                "  X            確認後清除過期／被取代／審查 FAIL 項目\n"
                 "  c            收起所選任務的專案（有進行中／需處理時拒絕）\n"
                 "  i            釘選／取消釘選（最多 5 個）\n"
                 "  t            編輯自訂標籤（逗號分隔）\n"
@@ -5833,7 +6323,7 @@ class DismissConfirmScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dismiss-confirm-panel"):
             yield Static(
-                f"清除 {self.count} 筆已過期／已被取代任務？\nEnter 確認；Esc 取消。",
+                f"清除 {self.count} 筆可清除項目？\nEnter 確認；Esc 取消。",
                 id="dismiss-confirm-text", markup=False,
             )
 
@@ -5868,6 +6358,7 @@ class AgentWatchApp(App):
         ("h", "hide_task", "隱藏"),
         ("d", "finish_task", "歸到已完成"),
         ("x", "dismiss_task", "清除需處理項目"),
+        ("X", "dismiss_stale", "清除過期／取代項目"),
         ("shift+x", "dismiss_stale", "清除過期／取代項目"),
         ("c", "collapse_project", "收起專案"),
         ("i", "toggle_pin", "釘選"),
@@ -5888,6 +6379,8 @@ class AgentWatchApp(App):
         done_path: Path = DEFAULT_DONE_TSV,
         state_path: Optional[Path] = None,
         decisions_path: Optional[Path] = None,
+        toks_svc: Optional[tok_speed.TokSpeedService] = None,
+        daily_stats_path: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
@@ -5898,6 +6391,13 @@ class AgentWatchApp(App):
         self.data_svc = RunDataService(runs_path, done_path, self.log_parser)
         self.quota_svc = QuotaService()
         self.decision_svc = DecisionService(decisions_path)
+        self.daily_stats_path = (
+            Path(daily_stats_path) if daily_stats_path is not None else None
+        )
+        # tok/s is off unless main() passes a service, so tests never run magpie
+        # or write the live daily TSV by accident.
+        self.toks_svc = toks_svc
+        self._toks_version = -1
         self.notified_keys: Set[str] = set()
         self.notified_questions: Set[str] = set()
         self.previous_status: Dict[str, str] = {}
@@ -6214,12 +6714,15 @@ class AgentWatchApp(App):
         return next((a for a in self.current_agents if a.key == key), None)
 
     def operate(self, operation: str, tags: Optional[List[str]] = None,
-                task: Optional[AgentInfo] = None) -> None:
+                task: Optional[AgentInfo] = None,
+                reason: Optional[str] = None) -> None:
         agent = task or self.selected_task()
         if agent is None:
             self.show_state_message("請先選擇一筆任務")
             return
-        ok, message = self.state.apply(operation, agent, self.current_agents, self._now, tags)
+        ok, message = self.state.apply(
+            operation, agent, self.current_agents, self._now, tags, reason=reason,
+        )
         self.show_state_message(message)
         if ok:
             if operation == "read":
@@ -6237,19 +6740,34 @@ class AgentWatchApp(App):
         self.operate("done")
 
     def action_dismiss_task(self) -> None:
-        self.operate("dismiss")
+        agent = self.selected_task()
+        if agent is None:
+            self.operate("dismiss")
+            return
+        refusal = self.state.dismiss_refusal(agent, self._now)
+        if refusal:
+            self.show_state_message(refusal)
+            return
+
+        def dismissed(reason: Optional[str]) -> None:
+            if reason is None:
+                self.show_state_message("已取消清除")
+                return
+            self.operate("dismiss", task=agent, reason=reason)
+
+        self.push_screen(DismissReasonScreen(), dismissed)
 
     def action_dismiss_stale(self) -> None:
         if self.query_one("#main-tabs", TabbedContent).active != "tab-work":
             return
         candidates = [
             agent for agent in self.current_agents
-            if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
+            if self.state.stale_info(agent, self._now) in DISMISS_STALE_LABELS
         ]
         if not candidates:
             handoff = sum(self.state.bucket(a, self._now) == "handoff" for a in self.current_agents)
             note = f"；已接手 {handoff} 筆不能清除" if handoff else ""
-            self.show_state_message("目前沒有已過期或已被取代的項目" + note)
+            self.show_state_message("目前沒有可批次清除的項目" + note)
             return
 
         def confirmed(accepted: Optional[bool]) -> None:
@@ -6257,7 +6775,7 @@ class AgentWatchApp(App):
                 self.show_state_message("已取消清除")
                 return
             count = self.state.dismiss_stale(self.current_agents, self._now)
-            self.show_state_message(f"已清除 {count} 筆已過期／已被取代任務")
+            self.show_state_message(f"已清除 {count} 筆項目")
             self.last_snapshot = None
             self.update_data()
 
@@ -6617,6 +7135,30 @@ class AgentWatchApp(App):
         self.update_tree_display(force=True)
         self.set_interval(2.0, self.poll_data)
         self.set_interval(float(DECISIONS_REFRESH_SECONDS), self.refresh_decisions)
+        if self.toks_svc is not None:
+            self.set_interval(1.0, self.poll_toks)
+
+    def toks_text(self, agent: AgentInfo, bucket: str) -> str:
+        """Running rows' tok/s subtitle; empty when tok/s is off or the card is not running."""
+        if self.toks_svc is None or bucket != "running":
+            return ""
+        try:
+            return tok_speed.format_card_speed(self.toks_svc.result(agent.key))
+        except Exception:
+            return tok_speed.DASH + " tok/s"
+
+    def poll_toks(self) -> None:
+        """Checked every second; the service itself caches the magpie read and runs it off the UI thread."""
+        if self.toks_svc is None or not self._ui_ready:
+            return
+        try:
+            self.toks_svc.refresh_in_background([toks_anchor(a) for a in self.current_agents])
+            if self.toks_svc.version != self._toks_version:
+                self._toks_version = self.toks_svc.version
+                for widget in self._row_widgets.values():
+                    widget.refresh()
+        except Exception as e:
+            self.ui_error = f"tok/s 更新失敗：{e}"
 
     def refresh_decisions(self) -> None:
         """60 秒一次的專案樹重讀；新增的決策檔不用改設定就會出現。"""
@@ -6776,6 +7318,23 @@ class AgentWatchApp(App):
             now,
         )
         data_changed = current_snapshot != self.last_snapshot
+        counts = {key: 0 for key in ("attention", "handoff", "running", "recent", "history", "hidden")}
+        for agent in agents:
+            counts[self.state.bucket(agent, now)] += 1
+        if self.daily_stats_path is not None:
+            try:
+                row = daily_attention_row(agents, self.state, now)
+                write_daily_stats(
+                    self.daily_stats_path,
+                    agents,
+                    now=now,
+                    row=row,
+                    owned_columns=N7_DAILY_STATS_COLUMNS,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "daily stats update failed: %s", exc
+                )
         if not data_changed:
             if self._ui_ready:
                 self.update_quota_charts(quota_raw, quota_stale, now)
@@ -6789,13 +7348,11 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        counts = {key: 0 for key in ("attention", "handoff", "running", "recent", "history", "hidden")}
-        for agent in agents:
-            counts[self.state.bucket(agent, now)] += 1
         stats_str = (
             f"需處理 {counts['attention']} │ 已接手 {counts['handoff']} │ 進行中 {counts['running']} │ "
             f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
             f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
+            f" │ {project_other_summary(agents, now)}"
         )
         width = self.size.width if self._ui_ready else 80
 
@@ -6847,7 +7404,11 @@ def main():
     if args.once:
         return run_once_summary(runs_p, done_p)
 
-    app = AgentWatchApp(runs_path=runs_p, done_path=done_p)
+    app = AgentWatchApp(
+        runs_path=runs_p, done_path=done_p,
+        toks_svc=tok_speed.TokSpeedService(tsv_path=DEFAULT_TOKS_TSV),
+        daily_stats_path=daily_stats_path_from_env(),
+    )
     app.run()
     return 0
 
