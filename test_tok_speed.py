@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -180,10 +180,47 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(result["oc"].requests, 5)
         self.assertEqual(result["oc"].tier, "group/night-flash")
 
+    def test_time_window_join_normalizes_magpie_provider_prefix(self):
+        anchor = CardAnchor("oc", agent="opencode", alias="magpie/group/night-flash",
+                            start=BASE_EPOCH - 60, end=None)
+        result = tok_speed.compute_all([anchor], self.all_rows(), BASE_EPOCH + 30)
+        self.assertIn("oc", result)
+        self.assertEqual(result["oc"].requests, 5)
+        self.assertAlmostEqual(result["oc"].rate, 176 / 3107 * 1000, places=6)
+
+    def test_model_name_normalizer_strips_repeated_case_insensitive_wrapper(self):
+        self.assertEqual(
+            tok_speed.normalize_model_name("  MaGpIe/magpie/group/night-flash  "),
+            "group/night-flash",
+        )
+        self.assertEqual(tok_speed.normalize_model_name("group/night-flash"),
+                         "group/night-flash")
+
     def test_overlapping_windows_are_ambiguous(self):
         anchors = [CardAnchor(key, agent="opencode", alias="group/night-flash",
                               start=BASE_EPOCH - 60, end=BASE_EPOCH + 60) for key in ("a", "b")]
         self.assertEqual(tok_speed.compute_all(anchors, self.all_rows(), BASE_EPOCH), {})
+
+    def test_completed_window_drops_only_overlapping_rows(self):
+        old = CardAnchor("old", agent="opencode", alias="group/night-flash",
+                         start=BASE_EPOCH - 120, end=BASE_EPOCH + 200)
+        new = CardAnchor("new", agent="opencode", alias="group/night-flash",
+                         start=BASE_EPOCH + 150, end=None)
+
+        def at(offset):
+            when = (datetime.fromisoformat(BASE) + timedelta(seconds=offset)).isoformat()
+            return csv_row(when=when, session="")
+
+        lines = [at(0) for _ in range(5)]
+        lines.append(at(160))  # Inside both cards' time windows.
+        lines.extend(at(offset) for offset in range(210, 215))
+        result = tok_speed.compute_all([old, new], rows_of(*lines), BASE_EPOCH + 300)
+
+        self.assertEqual(set(result), {"old", "new"})
+        self.assertEqual(result["old"].requests, 5)
+        self.assertEqual(result["old"].output_tokens, 176 * 5)
+        self.assertEqual(result["new"].requests, 5)
+        self.assertEqual(result["new"].output_tokens, 176 * 5)
 
     def test_window_skips_rows_owned_by_a_session_card(self):
         anchors = [
@@ -203,6 +240,11 @@ class JoinTests(unittest.TestCase):
         self.assertEqual(tok_speed.extract_session_ids(claude, "claude"), (CLAUDE_SESSION,))
         self.assertEqual(tok_speed.extract_session_ids("printed %s once" % OPENCODE_SESSION, "opencode"),
                          (OPENCODE_SESSION,))
+        # Cross-harness markers and copied non-init JSON must not claim another card's session.
+        self.assertEqual(tok_speed.extract_session_ids(codex, "claude"), ())
+        self.assertEqual(tok_speed.extract_session_ids(claude, "codex"), ())
+        copied = '{"type":"assistant","session_id":"%s"}\n' % CLAUDE_SESSION
+        self.assertEqual(tok_speed.extract_session_ids(copied, "claude"), ())
         two = "ses_aaaaaaaaaaaa and ses_bbbbbbbbbbbb"
         self.assertEqual(tok_speed.extract_session_ids(two, "opencode"), ())
         self.assertEqual(tok_speed.extract_session_ids("ses_aaaaaaaaaaaa", "codex"), ())
@@ -416,6 +458,19 @@ class WatchIntegrationTests(unittest.IsolatedAsyncioTestCase):
         agent.status, agent.completion_time = "complete", self.now
         anchor = watch.toks_anchor(agent)
         self.assertEqual((anchor.alias, anchor.end), ("", self.now))
+
+    def test_prefixed_agent_model_is_normalized_before_join(self):
+        agent = self.running_agent()
+        agent.harness = "OpenCode"
+        agent.model = "magpie/group/night-flash"
+        agent.start_time = BASE_EPOCH - 60
+        anchor = watch.toks_anchor(agent)
+        self.assertEqual(anchor.alias, "group/night-flash")
+
+        result = tok_speed.compute_all([anchor], rows_of(*OPENCODE_ROWS), BASE_EPOCH + 30)
+        self.assertIn("tok-card", result)
+        self.assertEqual(result["tok-card"].requests, 5)
+        self.assertAlmostEqual(result["tok-card"].rate, 176 / 3107 * 1000, places=6)
 
     def test_render_task_row_subtitle(self):
         agent = self.running_agent()

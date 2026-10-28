@@ -47,8 +47,12 @@ REQUIRED_COLUMNS = ("time", "output_tokens", "duration_ms", "status")
 TSV_HEADER = ("date", "group", "name", "cards", "mean", "median", "p10", "p90")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-CODEX_SESSION_RE = re.compile(r"\bsession id:\s*([0-9A-Za-z][0-9A-Za-z_-]{15,})", re.IGNORECASE)
+CODEX_SESSION_RE = re.compile(
+    r"^[ \t]*session id:[ \t]*([0-9A-Za-z][0-9A-Za-z_-]{15,})[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 OPENCODE_SESSION_RE = re.compile(r"\b(ses_[A-Za-z0-9]{8,})")
+MODEL_WRAPPER_PREFIXES = ("magpie/",)
 FALSE_WORDS = {"", "0", "false", "no", "none", "null"}
 
 
@@ -122,6 +126,16 @@ def _timestamp(value: Any) -> Optional[float]:
 
 def _text(row: Dict[str, Any], key: str) -> str:
     return str(row.get(key) or "").strip()
+
+
+def normalize_model_name(value: Any) -> str:
+    """Remove known source wrappers while preserving the model/group namespace."""
+    name = str(value or "").strip().casefold()
+    while True:
+        prefix = next((item for item in MODEL_WRAPPER_PREFIXES if name.startswith(item)), None)
+        if prefix is None:
+            return name
+        name = name[len(prefix):]
 
 
 def row_is_counted(row: Dict[str, Any]) -> bool:
@@ -244,22 +258,22 @@ def assign_rows(
             continue
         start = anchor.start - WINDOW_SLACK_SECONDS
         end = (now if anchor.end is None else anchor.end) + WINDOW_SLACK_SECONDS
-        alias = anchor.alias.casefold()
+        alias = normalize_model_name(anchor.alias)
         hits = [
             index for index, row in enumerate(rows)
             if row.time is not None and start <= row.time <= end
             and row.agent == anchor.agent
-            and row.requested_model.casefold() == alias
+            and normalize_model_name(row.requested_model) == alias
             and not (row.session and row.session in claimed)
         ]
         window_hits[anchor.key] = hits
         for index in hits:
             owners.setdefault(index, []).append(anchor.key)
     for key, hits in window_hits.items():
-        # Two cards running side by side with the same agent and alias cannot
-        # be told apart by time alone; neither gets a number (N2 §3.3).
-        if hits and all(len(owners[index]) == 1 for index in hits):
-            joined[key] = [rows[index] for index in hits]
+        # Drop only rows that fit multiple cards; keep the unambiguous samples.
+        unique_hits = [index for index in hits if len(owners[index]) == 1]
+        if unique_hits:
+            joined[key] = [rows[index] for index in unique_hits]
     return joined
 
 
@@ -276,24 +290,33 @@ def compute_all(
 
 
 def extract_session_ids(text: str, agent: str = "") -> Tuple[str, ...]:
-    """Session ids a run.log names for itself (Codex header, Claude stream-json, OpenCode ses_)."""
+    """Read only session markers native to the card's harness."""
     text = ANSI_RE.sub("", text)
     found: List[str] = []
-    match = CODEX_SESSION_RE.search(text)
-    if match:
-        found.append(match.group(1))
-    for line in text.splitlines():
-        line = line.strip()
-        if not (line.startswith("{") and '"session_id"' in line):
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        value = record.get("session_id") if isinstance(record, dict) else None
-        if isinstance(value, str) and value.strip() and value.strip() not in found:
-            found.append(value.strip())
-    if not found and agent == "opencode":
+    harness = magpie_agent_name(agent)
+    if harness == "codex":
+        match = CODEX_SESSION_RE.search(text)
+        if match:
+            found.append(match.group(1))
+    elif harness == "claude":
+        for line in text.splitlines():
+            line = line.strip()
+            if not (line.startswith("{") and '"session_id"' in line):
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            # Only Claude's init event identifies the session; later event
+            # payloads may contain copied logs or tool output.
+            if record.get("type") != "system" or record.get("subtype") != "init":
+                continue
+            value = record.get("session_id")
+            if isinstance(value, str) and value.strip() and value.strip() not in found:
+                found.append(value.strip())
+    elif harness == "opencode":
         candidates = list(dict.fromkeys(OPENCODE_SESSION_RE.findall(text)))
         # An OpenCode log prints ses_ ids only incidentally; more than one is
         # not evidence of which one is this card's own session.

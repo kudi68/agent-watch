@@ -5317,7 +5317,7 @@ def toks_anchor(agent: AgentInfo) -> tok_speed.CardAnchor:
     return tok_speed.CardAnchor(
         key=agent.key,
         agent=tok_speed.magpie_agent_name(agent.harness),
-        alias="" if agent.model == UNKNOWN_IDENTITY else agent.model,
+        alias="" if agent.model == UNKNOWN_IDENTITY else tok_speed.normalize_model_name(agent.model),
         start=agent.start_time,
         end=end,
         log_path="" if log_path == "/dev/null" else log_path,
