@@ -790,6 +790,11 @@ DAILY_STATS_COLUMNS = (
     "date", "total", "other_count", "other_ratio",
     *[f"basis_{source}" for source in DAILY_STATS_BASIS_SOURCES],
 )
+N7_DAILY_STATS_COLUMNS = (
+    "date", "total_cards", "q_waiting", "q_overdue", "escalated", "blocked",
+    "failed", "no_report", "attention_other", "handed_off", "manual_cleared",
+    "manual_with_reason", "attention_ratio",
+)
 
 
 def daily_stats_row(
@@ -823,6 +828,65 @@ def daily_stats_row(
     return row
 
 
+def daily_attention_row(
+    agents: List["AgentInfo"], state: "WatchState", now: float,
+) -> Dict[str, Any]:
+    today = datetime.fromtimestamp(now).date()
+    cards = []
+    for agent in agents:
+        stamp = agent.start_time if agent.start_source == "tsv" else agent.log_mtime
+        try:
+            if stamp and datetime.fromtimestamp(stamp).date() == today:
+                cards.append(agent)
+        except (OSError, OverflowError, ValueError):
+            continue
+    cleared = {}
+    for key, entry in state.data.get("tasks", {}).items():
+        if not entry.get("dismissed"):
+            continue
+        try:
+            stamp = datetime.fromisoformat(
+                str(entry.get("dismissed_at", "")).replace("Z", "+00:00")
+            ).astimezone()
+            if stamp.date() == today:
+                cleared[key] = entry
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+    counts = {column: 0 for column in N7_DAILY_STATS_COLUMNS[2:10]}
+    for agent in cards:
+        if agent.key in cleared:
+            continue
+        bucket = state.bucket(agent, now)
+        if bucket == "handoff":
+            counts["handed_off"] += 1
+        elif bucket == "attention":
+            question = agent.question
+            if question_is_malformed(question):
+                counts["attention_other"] += 1
+            elif question_is_active(question, agent.completion_time):
+                if question_escalated(question, agent.completion_time):
+                    counts["escalated"] += 1
+                elif question_wait_seconds(question, now) >= QUESTION_OVERDUE_SECONDS:
+                    counts["q_overdue"] += 1
+                else:
+                    counts["q_waiting"] += 1
+            elif agent.status in ("blocked", "failed", "no_report"):
+                counts[agent.status] += 1
+            else:
+                counts["attention_other"] += 1
+    numerator = sum(counts[key] for key in (
+        "q_waiting", "q_overdue", "escalated", "blocked", "failed",
+        "no_report", "attention_other",
+    ))
+    total = len(cards)
+    return {
+        "date": today.isoformat(), "total_cards": total, **counts,
+        "manual_cleared": len(cleared),
+        "manual_with_reason": sum(bool(item.get("dismissed_reason")) for item in cleared.values()),
+        "attention_ratio": f"{numerator / total * 100:.1f}" if total else "",
+    }
+
+
 def _default_file_mode() -> int:
     """Mode a plain `open(..., "w")` gives a new file: 0o666 minus the umask.
 
@@ -839,17 +903,14 @@ def write_daily_stats(
     agents: List["AgentInfo"],
     day_start: Optional[float] = None,
     now: Optional[float] = None,
+    *,
+    row: Optional[Dict[str, Any]] = None,
+    owned_columns: Optional[Tuple[str, ...]] = None,
 ) -> Path:
-    """Rewrite today's row in the daily stats TSV; other days are preserved.
+    """Merge only the caller's columns into today's row; other days are preserved.
 
     The caller owns the path so tests (and alternate runs roots) never touch the
-    live `~/Projects/night/agent-watch-daily.tsv`.
-
-    Rows keep their date order across schema changes: an older column set is
-    written back verbatim, but a row for a day that also has a current-schema
-    row is dropped, because the current-schema row was just recomputed from the
-    same cards (PAST-REVIEW P3-2). The replaced file keeps its previous mode, so
-    an atomic rewrite does not silently turn a 0644 TSV into 0600 (P3-3).
+    live daily TSV. Caller-owned columns merge by header name.
     """
     target = Path(path)
     current = time.time() if now is None else now
@@ -857,35 +918,38 @@ def write_daily_stats(
         day_start = datetime.fromtimestamp(current).replace(
             hour=0, minute=0, second=0, microsecond=0,
         ).timestamp()
-    row = daily_stats_row(agents, day_start, current)
-    rows: Dict[str, List[str]] = {}
-    legacy: List[str] = []
+    values = daily_stats_row(agents, day_start, current) if row is None else row
+    day = str(values.get("date", ""))
+    if not day:
+        raise ValueError("daily stats row requires a date")
+    owned = DAILY_STATS_COLUMNS if owned_columns is None else owned_columns
+    source_columns = list(DAILY_STATS_COLUMNS)
+    columns = list(DAILY_STATS_COLUMNS)
+    preserved: List[str] = []
+    today: Dict[str, str] = {}
     if target.is_file():
         for line in target.read_text(encoding="utf-8").splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) != len(DAILY_STATS_COLUMNS):
-                # A row from an older column set is kept verbatim instead of
-                # being dropped when the schema grows.
-                if parts[0] != "date":
-                    legacy.append(line)
-                continue
             if parts[0] == "date":
+                source_columns = parts
+                columns = list(dict.fromkeys(source_columns + list(DAILY_STATS_COLUMNS)))
                 continue
-            rows[parts[0]] = parts
-    rows[row["date"]] = [row[column] for column in DAILY_STATS_COLUMNS]
-    # A legacy row for a day the current schema just wrote would put the same
-    # date in the file twice, so it is superseded rather than kept (P3-2).
-    legacy = [line for line in legacy if line.split("\t")[0] not in rows]
+            if parts[0] == day:
+                today.update(dict(zip(source_columns, parts)))
+            else:
+                preserved.append(line)
+    for column in owned:
+        if column not in columns:
+            columns.append(column)
+    today["date"] = day
+    today.update({key: str(values[key]) for key in owned if key in values})
     target.parent.mkdir(parents=True, exist_ok=True)
-    dated: List[Tuple[str, str]] = [
-        (day, "\t".join(rows[day])) for day in rows
-    ]
-    dated += [(line.split("\t")[0], line) for line in legacy]
+    dated = [(line.split("\t", 1)[0], line) for line in preserved]
+    dated.append((day, "\t".join(today.get(column, "") for column in columns)))
     dated.sort(key=lambda item: item[0])
-    body = ["\t".join(DAILY_STATS_COLUMNS)]
-    body += [line for _, line in dated]
+    body = ["\t".join(columns)] + [line for _, line in dated]
     try:
         existing_mode: Optional[int] = target.stat().st_mode & 0o777
     except OSError:

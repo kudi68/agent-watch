@@ -364,6 +364,86 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual(lines[0].split("\t"), list(watch.DAILY_STATS_COLUMNS))
             self.assertEqual(lines[1].split("\t")[0], "2026-10-28")
 
+    def test_daily_attention_classifies_today_and_empty_ratio(self):
+        day = self.day_start()
+        now = day + 8 * 3600
+
+        def card(name, status, started, question=None, source="tsv", mtime=None):
+            agent = self.agent("p", name, started)
+            agent.key, agent.status = name, status
+            agent.start_source = source
+            agent.log_mtime = started if mtime is None else mtime
+            agent.question, agent.completion_time = question, None
+            return agent
+
+        def question(age, escalated=False):
+            return {"mtime": now - age, "answered": False, "escalated": escalated}
+
+        agents = [
+            card("waiting-q", "question", now, question(60)),
+            card("overdue-q", "question", now, question(watch.QUESTION_OVERDUE_SECONDS)),
+            card("escalated-q", "question", now, question(60, True)),
+            card("blocked", "blocked", now), card("failed", "failed", now),
+            card("no-report", "no_report", now), card("waiting", "waiting", now),
+            card("malformed", "error", now, {"error": "bad"}),
+            card("handed", "failed", now), card("clear-reason", "failed", now),
+            card("clear", "blocked", now), card("done", "complete", now),
+            card("mtime-fallback", "complete", day - 86400, source="pid", mtime=now),
+            card("old-mtime", "failed", now, source="log", mtime=day - 86400),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            state = watch.WatchState(Path(tmp) / "state.json")
+            state._handoff["handed"] = "replacement"
+            for key, reason in (("clear-reason", "reason"), ("clear", "")):
+                state.data["tasks"][key] = {
+                    "dismissed": True,
+                    "dismissed_at": watch.datetime.fromtimestamp(now).astimezone().isoformat(timespec="seconds"),
+                    "dismissed_reason": reason,
+                }
+            row = watch.daily_attention_row(agents, state, now)
+            self.assertEqual(
+                {key: row[key] for key in watch.N7_DAILY_STATS_COLUMNS[1:]},
+                {
+                    "total_cards": 13, "q_waiting": 1, "q_overdue": 1,
+                    "escalated": 1, "blocked": 1, "failed": 1, "no_report": 1,
+                    "attention_other": 2, "handed_off": 1, "manual_cleared": 2,
+                    "manual_with_reason": 1, "attention_ratio": "61.5",
+                },
+            )
+            empty = watch.daily_attention_row([], state, now)
+            self.assertEqual((empty["total_cards"], empty["attention_ratio"]), (0, ""))
+
+    def test_daily_writer_merges_n7_n9_columns_and_keeps_older_row(self):
+        day = self.day_start()
+        older = day - 86400
+        now = day + 8 * 3600
+        old_agent = self.agent("other", "old", older + 60)
+        today_agent = self.agent("other", "today", day + 60)
+        today_agent.start_source = "tsv"
+        for order in (("n7", "n9"), ("n9", "n7")):
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "daily.tsv"
+                state = watch.WatchState(Path(tmp) / "state.json")
+                n7_row = watch.daily_attention_row([today_agent], state, now)
+                watch.write_daily_stats(target, [old_agent], older, now)
+                old_line = target.read_text(encoding="utf-8").splitlines()[1]
+                for writer in order:
+                    if writer == "n7":
+                        watch.write_daily_stats(
+                            target, [today_agent], day, now, row=n7_row,
+                            owned_columns=watch.N7_DAILY_STATS_COLUMNS,
+                        )
+                    else:
+                        watch.write_daily_stats(target, [today_agent], day, now)
+                lines = target.read_text(encoding="utf-8").splitlines()
+                header = lines[0].split("\t")
+                values = dict(zip(header, lines[-1].split("\t")))
+                self.assertEqual(lines[1], old_line)
+                self.assertTrue(set(watch.N7_DAILY_STATS_COLUMNS) <= set(header))
+                self.assertEqual(values["total_cards"], "1")
+                self.assertEqual(values["other_count"], "1")
+                self.assertEqual(sum(line.startswith("2026-10-28\t") for line in lines), 1)
+
     def test_other_days_are_preserved_and_sorted(self):
         day = self.day_start()
         older = day - 86400
