@@ -8,6 +8,20 @@ from unittest.mock import patch
 import watch
 
 
+def add_project(test, project_id, **config):
+    """Register a throwaway project for one test and always remove it again."""
+    watch.ensure_architecture_data()
+    watch.ARCHITECTURE_DATA["projects"][project_id] = {
+        "label": project_id,
+        "aliases": [],
+        "repo_paths": [],
+        "repo_names": [],
+        "default_view": "now",
+        **config,
+    }
+    test.addCleanup(watch.ARCHITECTURE_DATA["projects"].pop, project_id, None)
+
+
 class UnknownHintInferenceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -43,24 +57,44 @@ class UnknownHintInferenceTests(unittest.TestCase):
             project_hint=hint,
         )
 
-    def test_unknown_hint_falls_through_to_git(self):
+    def test_arch_json_names_are_globally_unique(self):
+        """No id/alias/repo name is shared, so inference can never be ambiguous."""
+        watch.ensure_architecture_data()
+        owners = {}
+        for project_id, config in watch.ARCHITECTURE_DATA["projects"].items():
+            if not isinstance(config, dict):
+                continue
+            names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+            names += [
+                str(path).strip("/").rsplit("/", 1)[-1]
+                for path in config.get("repo_paths", [])
+            ]
+            for name in names:
+                key = watch._repo_key(name)
+                if key:
+                    owners.setdefault(key, set()).add(project_id)
+        collisions = {key: sorted(ids) for key, ids in owners.items() if len(ids) > 1}
+        self.assertEqual(collisions, {})
+
+    def test_unknown_hint_falls_through_to_git_without_a_warning(self):
         folder = self.task_dir("aw-cleanup")
         self.add_worktree(folder, "agent-watch")
         project, source, warning = self.infer(folder, "aw-cleanup", hint="DONE")
         self.assertEqual((project, source), ("agent-watch", "git"))
-        self.assertIn("未知專案", warning)
+        # Classified cards must not keep the "資料有錯" row (P2-1).
+        self.assertEqual(warning, "")
 
-    def test_unknown_hint_falls_through_to_keywords(self):
+    def test_unknown_hint_falls_through_to_keywords_without_a_warning(self):
         folder = self.task_dir("medtool-import")
         project, source, warning = self.infer(folder, "medtool-import", hint="foo")
         self.assertEqual((project, source), ("medical-tools", "關鍵字"))
-        self.assertIn("foo", warning)
+        self.assertEqual(warning, "")
 
     def test_unknown_hint_without_evidence_stays_other(self):
         folder = self.task_dir("misc")
         project, source, warning = self.infer(folder, "misc", hint="foo")
         self.assertEqual((project, source), ("other", "未判斷"))
-        self.assertIn("未知專案", warning)
+        self.assertEqual(warning, "未知專案：foo")
 
     def test_unknown_hint_naming_a_repo_is_classified(self):
         cases = {
@@ -69,13 +103,71 @@ class UnknownHintInferenceTests(unittest.TestCase):
             "personal_capture": "personal-capture",
             "agent-ops-host-pinned-bb7a091": "agent-ops-pinned",
         }
-        for hint, expected in cases.items():
+        for index, (hint, expected) in enumerate(cases.items()):
             with self.subTest(hint=hint):
-                folder = self.task_dir(f"task-{expected}-{abs(hash(hint))}")
+                folder = self.task_dir(f"task-{index}")
                 project, source, warning = self.infer(folder, "沒有語意的任務名", hint=hint)
                 self.assertEqual((project, source), (expected, "標籤"))
-                # A hint spelling that is not a registered id keeps its warning.
-                self.assertTrue(warning == "" or "未知專案" in warning)
+                # A repo-name hint that placed the card is not a data error.
+                self.assertEqual(warning, "")
+
+    def test_repo_suffix_is_stripped_once(self):
+        self.assertEqual(watch._project_for_repo_hint("agent-watch-fix2"), "agent-watch")
+        self.assertEqual(watch._project_for_repo_hint("agent-watch-review"), "agent-watch")
+
+    def test_numbered_suffix_is_part_of_the_name(self):
+        # The old rule also dropped `-\\d+` / `-v\\d+`, which turned these into
+        # the aliases `c1` / `aw` and misclassified them (P2-3).
+        self.assertEqual(watch._project_for_repo_hint("c1-2"), "")
+        self.assertEqual(watch._project_for_repo_hint("aw-v2"), "")
+        folder = self.task_dir("misc-numbered")
+        project, source, warning = self.infer(folder, "misc-numbered", hint="c1-2")
+        self.assertEqual((project, source), ("other", "未判斷"))
+        self.assertEqual(warning, "未知專案：c1-2")
+
+    def test_full_repo_name_wins_over_the_stripped_name(self):
+        add_project(self, "plain-repo", repo_names=["shadow"])
+        add_project(self, "decorated-repo", repo_names=["shadow-fix"])
+        self.assertEqual(watch._project_for_repo_hint("shadow"), "plain-repo")
+        # Full name first: `shadow-fix` is its own repo, not `shadow` plus a suffix.
+        self.assertEqual(watch._project_for_repo_hint("shadow-fix"), "decorated-repo")
+
+    def test_repo_name_shared_by_two_projects_is_not_guessed(self):
+        add_project(self, "twin-one", repo_names=["twin-repo"])
+        add_project(self, "twin-two", repo_names=["twin-repo"])
+        self.assertEqual(watch._project_for_repo_name("twin-repo"), "")
+        self.assertEqual(watch._project_for_repo_hint("twin-repo"), "")
+        folder = self.task_dir("twin-task")
+        project, source, warning = self.infer(folder, "twin-task", hint="twin-repo")
+        self.assertEqual((project, source), ("other", "未判斷"))
+        self.assertEqual(warning, "未知專案：twin-repo")
+
+    def test_repo_name_colliding_with_another_alias_does_not_reroute_labels(self):
+        # `pai` is personal-ai-os' alias; a repo of that name must not steal it.
+        add_project(self, "pai-copy", repo_names=["pai"])
+        self.assertEqual(watch.resolve_project("pai")[0], "personal-ai-os")
+        self.assertEqual(watch._project_for_repo_name("pai"), "")
+        self.assertEqual(watch._project_for_repo_hint("pai"), "")
+
+    def test_repo_names_are_not_labels(self):
+        add_project(
+            self, "repo-only", repo_names=["only-in-repo"],
+            repo_paths=["Projects/only-in-repo"],
+        )
+        # The global label lookup no longer eats repo names (P2-2)…
+        project, error = watch.resolve_project("only-in-repo")
+        self.assertEqual(project, "other")
+        self.assertIn("未知專案", error)
+        # …the explicit repo lookup still finds it…
+        self.assertEqual(watch._project_for_repo_name("only-in-repo"), "repo-only")
+        # …and a ~/Projects path keeps working through the path stage.
+        folder = self.task_dir("repo-only-task")
+        (folder / "REPORT.md").write_text(
+            "改 ~/Projects/only-in-repo/a.py\n" * 3, encoding="utf-8"
+        )
+        project, source, warning = self.infer(folder, "repo-only-task")
+        self.assertEqual((project, source), ("repo-only", "路徑"))
+        self.assertEqual(warning, "")
 
     def test_valid_hint_is_unchanged(self):
         folder = self.task_dir("shortcut")
@@ -94,13 +186,9 @@ class UnknownHintInferenceTests(unittest.TestCase):
         self.assertEqual((project, source), ("agent-watch", "路徑"))
 
     def test_status_stays_meta_even_if_someone_registers_it(self):
-        watch.ensure_architecture_data()
-        watch.ARCHITECTURE_DATA["projects"]["status"] = {
-            "label": "status", "aliases": [], "repo_paths": ["Projects/status"],
-            "repo_names": ["status"], "default_view": "now",
-        }
-        self.addCleanup(
-            lambda: watch.ARCHITECTURE_DATA["projects"].pop("status", None)
+        add_project(
+            self, "status",
+            repo_paths=["Projects/status"], repo_names=["status"],
         )
         watch._PROJECT_PATH_CACHE.clear()
         folder = self.task_dir("看板筆記")
@@ -120,7 +208,7 @@ class UnknownHintInferenceTests(unittest.TestCase):
 
 
 class OtherRatioTextTests(unittest.TestCase):
-    def agent(self, project, source, age_seconds=0, now=None):
+    def agent(self, project, source, age_seconds=0, now=None, start=True):
         current = time.time() if now is None else now
         return watch.AgentInfo(
             name=f"{project}-{source or 'none'}",
@@ -128,7 +216,7 @@ class OtherRatioTextTests(unittest.TestCase):
             last_path=Path("/tmp/a"),
             status="running",
             model="m",
-            start_time=current - age_seconds,
+            start_time=(current - age_seconds) if start else None,
             elapsed="0",
             latest="l",
             project=project,
@@ -143,7 +231,9 @@ class OtherRatioTextTests(unittest.TestCase):
             self.agent("other", "未判斷", now=now),
             self.agent("other", "未判斷", now=now),
         ]
-        self.assertEqual(watch.project_other_summary(agents, now), "其他 2（50.0%）")
+        self.assertEqual(
+            watch.project_other_summary(agents, now), "其他 2（50.0%，近 14 天）"
+        )
 
     def test_other_summary_ignores_cards_older_than_the_window(self):
         now = time.time()
@@ -151,7 +241,31 @@ class OtherRatioTextTests(unittest.TestCase):
             self.agent("agent-watch", "標籤", now=now),
             self.agent("other", "未判斷", age_seconds=20 * 86400, now=now),
         ]
-        self.assertEqual(watch.project_other_summary(agents, now), "其他 0（0.0%）")
+        self.assertEqual(
+            watch.project_other_summary(agents, now), "其他 0（0.0%，近 14 天）"
+        )
+
+    def test_other_summary_keeps_cards_without_any_timestamp(self):
+        # An undated card cannot be aged out, so it stays in the denominator (P3-2).
+        now = time.time()
+        agents = [
+            self.agent("agent-watch", "標籤", now=now),
+            self.agent("other", "未判斷", now=now, start=False),
+        ]
+        self.assertEqual(
+            watch.project_other_summary(agents, now), "其他 1（50.0%，近 14 天）"
+        )
+
+    def test_other_summary_names_its_window(self):
+        now = time.time()
+        agents = [
+            self.agent("agent-watch", "標籤", now=now),
+            self.agent("other", "未判斷", now=now),
+        ]
+        self.assertEqual(
+            watch.project_other_summary(agents, now, window_days=7),
+            "其他 1（50.0%，近 7 天）",
+        )
 
     def test_other_summary_is_in_the_plain_summary_text(self):
         now = time.time()
@@ -160,7 +274,7 @@ class OtherRatioTextTests(unittest.TestCase):
             self.agent("other", "未判斷", now=now),
         ]
         text = watch.format_bucket_counts(agents, now)
-        self.assertIn("其他 1（50.0%）", text)
+        self.assertIn("其他 1（50.0%，近 14 天）", text)
 
 
 class DailyStatsTests(unittest.TestCase):
@@ -233,6 +347,38 @@ class DailyStatsTests(unittest.TestCase):
             self.assertEqual([row.split("\t")[0] for row in rows], ["2026-10-27", "2026-10-28"])
             self.assertEqual(rows[0].split("\t")[watch.DAILY_STATS_COLUMNS.index("other_count")], "1")
             self.assertEqual(rows[1].split("\t")[watch.DAILY_STATS_COLUMNS.index("other_count")], "0")
+
+    def test_older_column_rows_are_kept_verbatim(self):
+        # A column-set upgrade must not erase earlier days (P3-3).
+        legacy = "2026-10-20\t5\t1\t20.0"
+        day = self.day_start()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            target.write_text(
+                "\t".join(watch.DAILY_STATS_COLUMNS) + "\n" + legacy + "\n",
+                encoding="utf-8",
+            )
+            agents = [self.agent("other", "未判斷", day + 3600)]
+            watch.write_daily_stats(target, agents, day_start=day, now=day + 86400)
+            watch.write_daily_stats(target, agents, day_start=day, now=day + 86400)
+            lines = target.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0].split("\t"), list(watch.DAILY_STATS_COLUMNS))
+            self.assertEqual(lines[1].split("\t")[0], "2026-10-28")
+            self.assertEqual(lines[2], legacy)
+            self.assertEqual(sum(1 for line in lines if line == legacy), 1)
+
+    def test_write_does_not_reuse_a_fixed_temp_name(self):
+        day = self.day_start()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "agent-watch-daily.tsv"
+            stale = target.with_name(target.name + ".tmp")
+            stale.write_text("another writer's file\n", encoding="utf-8")
+            watch.write_daily_stats(
+                target, [self.agent("other", "未判斷", day + 3600)],
+                day_start=day, now=day + 86400,
+            )
+            self.assertEqual(stale.read_text(encoding="utf-8"), "another writer's file\n")
+            self.assertTrue(target.is_file())
 
 
 if __name__ == "__main__":

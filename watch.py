@@ -248,10 +248,17 @@ def keyword_matches(keyword: str, text: str) -> bool:
 
 
 def resolve_project(value: str) -> Tuple[str, str]:
+    """Resolve a configured project id or alias; repo names are not labels.
+
+    `repo_names` describe a checkout, not a label. They are resolved only where
+    a value is known to be a repository name (`_project_for_repo_name`), so a
+    repo name that collides with another project's alias can never reroute
+    label or path statistics.
+    """
     ensure_architecture_data()
     wanted = value.casefold()
     for project_id, config in ARCHITECTURE_DATA["projects"].items():
-        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        names = [project_id, *config.get("aliases", [])]
         if wanted in {str(name).casefold() for name in names}:
             return project_id, ""
     return PROJECT_OTHER, f"未知專案：{value}"
@@ -388,17 +395,23 @@ def _git_origin_name(root: Path) -> str:
 
 
 def _project_for_repo_name(name: str) -> str:
+    """Project whose id, alias, or repo_name is exactly `name`.
+
+    Two matching projects mean the name is ambiguous, so the answer is empty
+    rather than the first project in `arch.json` order.
+    """
     if not name:
         return ""
     ensure_architecture_data()
-    wanted = name.casefold()
+    wanted = str(name).casefold()
+    found = []
     for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
         if project_id == PROJECT_OTHER or not isinstance(config, dict):
             continue
         names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
         if wanted in {str(value).casefold() for value in names}:
-            return project_id
-    return ""
+            found.append(project_id)
+    return found[0] if len(found) == 1 else ""
 
 
 def _repo_key(value: str) -> str:
@@ -406,36 +419,68 @@ def _repo_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).casefold())
 
 
+# Only a task decoration that follows a name is dropped; a bare number (`c1-2`,
+# `pai-69`) is part of the name, so stripping it could pick an unrelated project.
+REPO_HINT_SUFFIX_RE = re.compile(
+    r"[-_](?:fix|review|retry|rerun)(?:[-_]?\d+)?$", re.IGNORECASE
+)
+
+
+def _projects_for_repo_key(key: str) -> List[str]:
+    """Every project whose id/alias/repo name/path ends in `key`; order is arch."""
+    ensure_architecture_data()
+    found: List[str] = []
+    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
+        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+            continue
+        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
+        names += [
+            str(path).strip("/").rsplit("/", 1)[-1]
+            for path in config.get("repo_paths", [])
+        ]
+        if key in {_repo_key(value) for value in names}:
+            found.append(project_id)
+    return found
+
+
+def _repo_hint_candidates(hint: str) -> List[str]:
+    """The hint text itself, then the same text without one task decoration."""
+    text = hint.strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
+    match = re.search(r"projects/([^/\s]+)", text, re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    text = text.rstrip("/")
+    if not text:
+        return []
+    values = [text]
+    stripped = REPO_HINT_SUFFIX_RE.sub("", text)
+    if stripped and stripped != text:
+        values.append(stripped)
+    return values
+
+
 def _project_for_repo_hint(hint: str) -> str:
     """Map a dispatch hint that is not a project id onto a registered repo.
 
     Hints are hand-written and often name the repo instead of the project
     (`Projects/MedKnowledge/`, `personal_capture`, `agent-watch-fix2`), so the
-    comparison ignores separators and a common task-suffix decoration.
+    comparison ignores separators and one trailing `-fix`/`-review` decoration.
+    The full name wins; if a name fits more than one project, nothing is
+    guessed and the hint simply does not classify the card.
+
+    Limits: `projects/…` only uses the first path segment, and non-ASCII names
+    normalize to an empty key, so a Chinese-only repo name never matches here
+    (the keyword stage may still place the card).
     """
-    if not hint:
-        return ""
-    text = hint.strip().strip(PROJECT_LABEL_STRIP_CHARS).strip()
-    if not text:
-        return ""
-    match = re.search(r"projects/([^/\s]+)", text, re.IGNORECASE)
-    if match:
-        text = match.group(1)
-    text = text.rstrip("/")
-    candidates = {text}
-    candidates.add(re.sub(r"(?:[-_](?:fix|review|retry|rerun|v\d+|\d+))+$", "", text, flags=re.IGNORECASE))
-    ensure_architecture_data()
-    keys = {_repo_key(value) for value in candidates if _repo_key(value)}
-    if not keys:
-        return ""
-    for project_id, config in ARCHITECTURE_DATA.get("projects", {}).items():
-        if project_id == PROJECT_OTHER or not isinstance(config, dict):
+    for candidate in _repo_hint_candidates(hint):
+        key = _repo_key(candidate)
+        if not key:
             continue
-        names = [project_id, *config.get("aliases", []), *config.get("repo_names", [])]
-        for path in config.get("repo_paths", []):
-            names.append(str(path).strip("/").rsplit("/", 1)[-1])
-        if any(_repo_key(name) in keys for name in names):
-            return project_id
+        matches = _projects_for_repo_key(key)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return ""
     return ""
 
 
@@ -537,6 +582,12 @@ def task_path_project(task_dir: Path) -> str:
             if name.casefold() == workspace or name.casefold() in PROJECT_META_PATH_NAMES:
                 continue
             project_id, error = resolve_project(name)
+            if error:
+                # A ~/Projects path component is a repository name, so keep that
+                # lookup explicit (and collision-safe) instead of widening every
+                # label lookup with repo_names.
+                project_id = _project_for_repo_name(name)
+                error = "" if project_id else error
             if error or project_is_dispatch_only(project_id):
                 continue
             tallies[project_id] = tallies.get(project_id, 0) + count
@@ -615,6 +666,9 @@ def infer_project_details(
     `arch.json` is kept as a warning and inference carries on: it may name a repo,
     and git / paths / keywords can still place the card. Only when every stage
     fails is the card `other`, with basis `未判斷`.
+
+    The warning is only for a card that ends up in `other`: a card that was
+    classified successfully must not show a "資料有錯" row (PAST-REVIEW P2-1).
     """
     ensure_architecture_data()
     folder = task_dir if task_dir is not None else project_folder(log_path, last_path)
@@ -626,11 +680,7 @@ def infer_project_details(
             hint_warning = error
             repo_project = _project_for_repo_hint(project_hint)
             if repo_project and not project_is_dispatch_only(repo_project):
-                return (
-                    repo_project,
-                    PROJECT_SOURCE_LABEL,
-                    f"{error}（以 repo 名歸類為 {project_label(repo_project)}）",
-                )
+                return repo_project, PROJECT_SOURCE_LABEL, ""
             if repo_project:
                 weak_hint = repo_project
         elif project_is_dispatch_only(project_id):
@@ -646,18 +696,18 @@ def infer_project_details(
                 if project_is_dispatch_only(project_id):
                     weak_hint = weak_hint or project_id
                 else:
-                    return project_id, PROJECT_SOURCE_LABEL, hint_warning
+                    return project_id, PROJECT_SOURCE_LABEL, ""
         project_id = task_git_project(folder)
         if project_id:
-            return project_id, PROJECT_SOURCE_GIT, hint_warning
+            return project_id, PROJECT_SOURCE_GIT, ""
         project_id = task_path_project(folder)
         if project_id:
-            return project_id, PROJECT_SOURCE_PATH, hint_warning
+            return project_id, PROJECT_SOURCE_PATH, ""
     project_id = keyword_project(name, log_path, last_path)
     if project_id:
-        return project_id, PROJECT_SOURCE_KEYWORD, hint_warning
+        return project_id, PROJECT_SOURCE_KEYWORD, ""
     if weak_hint:
-        return weak_hint, PROJECT_SOURCE_DISPATCH, hint_warning
+        return weak_hint, PROJECT_SOURCE_DISPATCH, ""
     return PROJECT_OTHER, PROJECT_SOURCE_NONE, hint_warning
 
 
@@ -699,17 +749,26 @@ def project_other_summary(
     now: Optional[float] = None,
     window_days: int = PROJECT_OTHER_WINDOW_DAYS,
 ) -> str:
-    """`其他 N（x%）` for the recent window, e.g. `其他 3（7.5%）`."""
+    """`其他 N（x%，近 14 天）` for the recent window, e.g. `其他 3（7.5%，近 14 天）`.
+
+    Cards without any usable timestamp stay in the window: they cannot be dated
+    out, and dropping them silently shrank the denominator. The window is not
+    the board's 總計 (which also holds older history), so the label spells the
+    denominator out instead of implying it matches.
+    """
     current = time.time() if now is None else now
     cutoff = current - window_days * 86400
-    window = [agent for agent in agents if agent_activity_time(agent) >= cutoff]
+    window = [
+        agent for agent in agents
+        if agent_activity_time(agent) == 0 or agent_activity_time(agent) >= cutoff
+    ]
     total = len(window)
     other = sum(
         1 for agent in window
         if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
     )
     ratio = (other / total * 100) if total else 0.0
-    return f"其他 {other}（{ratio:.1f}%）"
+    return f"其他 {other}（{ratio:.1f}%，近 {window_days} 天）"
 
 
 DAILY_STATS_BASIS_SOURCES = (
@@ -776,21 +835,39 @@ def write_daily_stats(
         ).timestamp()
     row = daily_stats_row(agents, day_start, current)
     rows: Dict[str, List[str]] = {}
+    legacy: List[str] = []
     if target.is_file():
         for line in target.read_text(encoding="utf-8").splitlines():
             if not line.strip() or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) != len(DAILY_STATS_COLUMNS) or parts[0] == "date":
+            if len(parts) != len(DAILY_STATS_COLUMNS):
+                # A row from an older column set is kept verbatim instead of
+                # being dropped when the schema grows.
+                if parts[0] != "date":
+                    legacy.append(line)
+                continue
+            if parts[0] == "date":
                 continue
             rows[parts[0]] = parts
     rows[row["date"]] = [row[column] for column in DAILY_STATS_COLUMNS]
     target.parent.mkdir(parents=True, exist_ok=True)
     body = ["\t".join(DAILY_STATS_COLUMNS)]
     body += ["\t".join(rows[day]) for day in sorted(rows)]
-    temporary = target.with_name(target.name + ".tmp")
-    temporary.write_text("\n".join(body) + "\n", encoding="utf-8")
-    os.replace(temporary, target)
+    body += legacy
+    # A unique temp name in the same directory: two writers cannot share the
+    # fixed `<name>.tmp` and interleave their rows.
+    handle, temporary_name = tempfile.mkstemp(
+        dir=target.parent, prefix=target.name + ".", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(body) + "\n")
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     return target
 
 
