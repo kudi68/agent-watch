@@ -4588,7 +4588,7 @@ class WatchState:
         return "recent" if entry.get("restored") else bucket
 
     def dismiss_refusal(
-        self, agent: AgentInfo, agents: List[AgentInfo], now: float,
+        self, agent: AgentInfo, now: float,
     ) -> str:
         """Return the existing refusal message, or an empty string if x is allowed."""
         bucket = self.bucket(agent, now)
@@ -4604,15 +4604,58 @@ class WatchState:
             return "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
         if bucket != "attention" and disposition not in ("已過期", "已被取代"):
             return "目前項目不在需處理區，也不是已過期或被取代項目"
-        if disposition == "已清除":
-            return "此項目已清除"
         return ""
+
+    @staticmethod
+    def _dismiss_reason_extend(character: str) -> bool:
+        return unicodedata.category(character).startswith("M") or 0x1F3FB <= ord(character) <= 0x1F3FF
+
+    @staticmethod
+    def _dismiss_reason_regional_indicator(character: str) -> bool:
+        return 0x1F1E6 <= ord(character) <= 0x1F1FF
+
+    @staticmethod
+    def _dismiss_reason_prefix(text: str, limit: int) -> str:
+        end = min(len(text), limit)
+        while 0 < end < len(text):
+            previous, following = text[end - 1], text[end]
+            if (
+                WatchState._dismiss_reason_extend(following)
+                or previous == "\u200d"
+                or following == "\u200d"
+            ):
+                end -= 1
+                continue
+            if (
+                WatchState._dismiss_reason_regional_indicator(previous)
+                and WatchState._dismiss_reason_regional_indicator(following)
+            ):
+                start = end - 1
+                while (
+                    start > 0
+                    and WatchState._dismiss_reason_regional_indicator(text[start - 1])
+                ):
+                    start -= 1
+                if (end - start) % 2:
+                    end -= 1
+                    continue
+            break
+        return text[:end]
 
     @staticmethod
     def clean_dismiss_reason(reason: Optional[str]) -> str:
         if not isinstance(reason, str):
             return ""
-        return re.sub(r"[\t\r\n]", "", reason).strip()[:200]
+        characters = []
+        for character in reason:
+            category = unicodedata.category(character)
+            if category in ("Cc", "Zl", "Zp") or (
+                category == "Cf" and character != "\u200d"
+            ):
+                continue
+            characters.append(character)
+        cleaned = "".join(characters).strip()
+        return WatchState._dismiss_reason_prefix(cleaned, 200)
 
     def apply(self, operation: str, agent: AgentInfo, agents: List[AgentInfo], now: float,
               tags: Optional[List[str]] = None,
@@ -4621,7 +4664,7 @@ class WatchState:
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
         if operation == "dismiss":
-            refusal = self.dismiss_refusal(agent, agents, now)
+            refusal = self.dismiss_refusal(agent, now)
             if refusal:
                 return False, refusal
             ok = self.update_task(
@@ -5587,7 +5630,10 @@ class DismissReasonScreen(ModalScreen):
         with Vertical(id="dismiss-reason-panel") as panel:
             panel.border_title = "清除原因"
             yield Label("選填；留空仍會清除。Enter 確認，Esc 取消。")
-            yield Input(placeholder="最多 200 字", id="dismiss-reason-input")
+            yield Input(
+                placeholder="最多 200 字", max_length=200,
+                id="dismiss-reason-input",
+            )
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
@@ -6294,7 +6340,7 @@ class AgentWatchApp(App):
         if agent is None:
             self.operate("dismiss")
             return
-        refusal = self.state.dismiss_refusal(agent, self.current_agents, self._now)
+        refusal = self.state.dismiss_refusal(agent, self._now)
         if refusal:
             self.show_state_message(refusal)
             return

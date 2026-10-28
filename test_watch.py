@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import html
 import io
+import inspect
 import json
 import os
 import re
@@ -1961,6 +1962,25 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
                             app.state.task(agent.key)["dismissed_reason"], expected,
                         )
 
+    async def test_x_reason_input_stops_at_200_characters(self):
+        agent = self.fixture_agents()[0]
+        app = self.fixture_app([agent])
+
+        async with app.run_test(size=(80, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("x")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
+            reason_input = app.screen.query_one("#dismiss-reason-input", watch.Input)
+            reason_input.insert_text_at_cursor("a" * 200)
+            reason_input.insert_text_at_cursor("a")
+            self.assertEqual(len(reason_input.value), 200)
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertEqual(
+                app.state.task(agent.key)["dismissed_reason"], "a" * 200,
+            )
+
     async def test_x_refuses_running_and_already_cleared_without_modal(self):
         running, cleared = self.fixture_agents()[5], self.fixture_agents()[0]
         agents = [running, cleared]
@@ -2255,6 +2275,25 @@ class V10StateTests(unittest.TestCase):
 
     def apply(self, operation, agent=None, **values):
         return self.state.apply(operation, agent or self.finished, self.agents, self.now, **values)
+
+    def test_dismiss_refusal_only_needs_agent_and_time(self):
+        self.assertEqual(self.state.dismiss_refusal(self.finished, self.now),
+                         "目前項目不在需處理區，也不是已過期或被取代項目")
+
+    def test_dismiss_refusal_has_no_unreachable_cleared_message_branch(self):
+        self.assertNotIn('return "此項目已清除"',
+                         inspect.getsource(watch.WatchState.dismiss_refusal))
+
+    def test_clean_dismiss_reason_removes_control_characters(self):
+        self.assertEqual(watch.WatchState.clean_dismiss_reason(
+            "A\x1b\x00\u2028\x0b\x0c\x85\u2029B"), "AB")
+
+    def test_clean_dismiss_reason_does_not_split_zwj_sequences(self):
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466"
+        self.assertEqual(
+            watch.WatchState.clean_dismiss_reason(family * 60),
+            family * 28,
+        )
 
     def test_running_and_attention_cannot_hide_or_finish(self):
         for agent in self.agents[:7]:
