@@ -2872,8 +2872,119 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         # A project with a handed-off card still has open work.
         self.assertFalse(state.apply("collapse", old, [old], self.now)[0])
 
+    def test_reconcile_expands_collapsed_project_for_handoff(self):
+        old = self.agent(
+            "claude-perm-p2-fix", "failed",
+            completion_time=self.now - watch.STALE_ATTENTION_SECONDS - 60,
+        )
+        new = self.agent(
+            "claude-perm-p2-fix2", "reported",
+            completion_time=self.now - 10,
+        )
+        state = self.make_state([old])
+        self.assertTrue(state.apply("collapse", old, [old], self.now)[0])
+        self.assertTrue(state.data["projects"][old.project]["collapsed"])
+
+        state.reconcile([old, new], self.now)
+
+        self.assertEqual(state.bucket(old, self.now), "handoff")
+        self.assertFalse(state.data["projects"][old.project]["collapsed"])
+
+    def test_count_buckets_counts_handoff_and_rejects_unknown_bucket(self):
+        old, new = self.pair()
+        state = self.make_state([old, new])
+        bucket_fn = lambda agent, _now: state.bucket(agent, self.now)
+
+        counts = watch.count_buckets([old], self.now, bucket_fn)
+        self.assertEqual(counts["handoff"], 1)
+        self.assertEqual(watch.count_buckets([], self.now)["handoff"], 0)
+        with self.assertRaises(KeyError):
+            watch.count_buckets([old], self.now, lambda _agent, _now: "unknown")
+
+        formatted = watch.format_bucket_counts([old], self.now, bucket_fn)
+        sections = formatted.split(" │ ")
+        total_index = next(i for i, section in enumerate(sections) if section.startswith("總計"))
+        displayed = [int(section.rsplit(" ", 1)[1]) for section in sections[:total_index]]
+        total = int(sections[total_index].rsplit(" ", 1)[1])
+        self.assertIn("已接手 1", formatted)
+        self.assertEqual(sum(displayed), total)
+        self.assertTrue(
+            watch.format_bucket_counts([old], self.now).startswith(
+                "需處理 1 │ 進行中 0 │ 剛完成(2h) 0 │ 歷史 0 │ 總計 1"
+            )
+        )
+
     def handoff_app(self, agents):
         return V10MainPageTests.fixture_app(self, agents)
+
+    async def test_unread_handoff_row_has_no_unread_dot(self):
+        old, new = self.pair()
+        app = self.handoff_app([old, new])
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.state.update_task(old.key, read=False, run_start=old.start_time)
+            row = app._row_widgets[old.key]
+            self.assertNotIn("● " + old.name, row.render().plain)
+
+    async def test_preview_does_not_mark_handoff_read(self):
+        old, new = self.pair()
+        app = self.handoff_app([old, new])
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            app.selected_key = old.key
+            app.update_preview()
+            await pilot.pause()
+            self.assertFalse(app.state.task(old.key).get("read", False))
+
+    async def test_pinned_handoff_card_only_appears_in_handoff_box(self):
+        old, new = self.pair()
+        app = self.handoff_app([old, new])
+        self.assertTrue(app.state.update_task(
+            old.key, pinned=True, run_start=old.start_time,
+        ))
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            handoff_keys = [
+                row.agent.key for row in app.query_one("#handoff-box").query(watch.TaskRow)
+            ]
+            pinned_keys = [
+                row.agent.key for row in app.query_one("#pinned-box").query(watch.TaskRow)
+            ]
+            self.assertIn(old.key, handoff_keys)
+            self.assertNotIn(old.key, pinned_keys)
+
+    async def test_history_card_moves_into_handoff_box_after_superseder_appears(self):
+        old = self.agent(
+            "claude-perm-p2-fix", "failed",
+            completion_time=self.now - 2 * watch.STALE_ATTENTION_SECONDS - 60,
+        )
+        new = self.agent("unrelated-running-task", "running", start_time=self.now - 300)
+        agents = [old, new]
+        app = self.handoff_app(agents)
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.state.bucket(old, self.now), "history")
+            self.assertFalse(app.query_one("#handoff-box").display)
+
+            before_structure = app._board_structure
+            new.name = "claude-perm-p2-fix2"
+            app.update_data(self.now)
+            await pilot.pause()
+
+            after_structure = app._board_structure
+            self.assertEqual(before_structure[0], after_structure[0])
+            self.assertNotEqual(before_structure[1], after_structure[1])
+            self.assertEqual(before_structure[2:], after_structure[2:])
+            self.assertEqual(app.state.bucket(old, self.now), "handoff")
+            self.assertTrue(app.query_one("#handoff-box").display)
+            self.assertEqual(
+                [row.agent.key for row in app.query_one("#handoff-box").query(watch.TaskRow)],
+                [old.key],
+            )
 
     async def test_handoff_section_sits_between_attention_and_pins(self):
         old, new = self.pair()

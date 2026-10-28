@@ -2628,10 +2628,10 @@ def count_buckets(
     bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
 ) -> Dict[str, int]:
     current = time.time() if now is None else now
-    counts = dict(attention=0, running=0, recent=0, history=0, total=len(agents))
+    counts = dict(attention=0, running=0, recent=0, history=0, handoff=0, total=len(agents))
     for agent in agents:
         bucket = bucket_fn(agent, current)
-        counts[bucket] = counts.get(bucket, 0) + 1
+        counts[bucket] += 1
     return counts
 
 
@@ -2640,9 +2640,11 @@ def format_bucket_counts(
     bucket_fn: Callable[[AgentInfo, float], str] = task_bucket,
 ) -> str:
     counts = count_buckets(agents, now, bucket_fn)
+    handoff = f"已接手 {counts['handoff']} │ " if counts["handoff"] else ""
     return (
         f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
-        f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ 總計 {counts['total']}"
+        f"剛完成(2h) {counts['recent']} │ 歷史 {counts['history']} │ "
+        f"{handoff}總計 {counts['total']}"
         f" │ {project_other_summary(agents, now)}"
     )
 
@@ -6018,7 +6020,7 @@ class TaskRow(Static, can_focus=True):
         agent = copy.copy(self.agent)
         entry = self.app.state.task(agent.key)
         bucket = self.app.state.bucket(agent, self.now)
-        if bucket not in ("running", "attention") and not entry.get("read"):
+        if bucket not in ("running", "attention", "handoff") and not entry.get("read"):
             agent.name = "● " + agent.name
         if entry.get("tags"):
             agent.name += " [" + ", ".join(entry["tags"]) + "]"
@@ -6739,7 +6741,7 @@ class AgentWatchApp(App):
         content.update("\n".join(lines[-limit:]) if lines else followed.latest or "尚無即時日誌")
         if (
             self.query_one("#main-tabs", TabbedContent).active == "tab-work"
-            and self.state.bucket(followed, self._now) not in ("running", "attention")
+            and self.state.bucket(followed, self._now) not in ("running", "attention", "handoff")
             and self._preview_read_key != followed.key
             and not self.state.task(followed.key).get("read")
         ):
