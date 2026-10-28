@@ -634,8 +634,11 @@ class BoardRegressions(unittest.TestCase):
         agents += [example_agent("old-%d" % i, ("complete", "failed", "blocked")[i % 3],
                                  now, completion_time=now - 8000 - i) for i in range(35)]
         counts = watch.count_buckets(agents, now)
-        self.assertEqual(counts, dict(attention=0, running=3, recent=26, history=35, total=64))
-        self.assertEqual(sum(counts[key] for key in ("attention", "running", "recent", "history")), 64)
+        self.assertEqual(counts, dict(attention=0, running=3, recent=26, history=35,
+                                      handoff=0, total=64))
+        self.assertEqual(sum(counts[key] for key in (
+            "attention", "running", "recent", "history", "handoff"
+        )), 64)
 
     def test_project_ties_use_last_finish_and_long_cards_keep_timer(self):
         now = 1_800_000_000
