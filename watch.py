@@ -2269,7 +2269,8 @@ def count_buckets(
     current = time.time() if now is None else now
     counts = dict(attention=0, running=0, recent=0, history=0, total=len(agents))
     for agent in agents:
-        counts[bucket_fn(agent, current)] += 1
+        bucket = bucket_fn(agent, current)
+        counts[bucket] = counts.get(bucket, 0) + 1
     return counts
 
 
@@ -4189,6 +4190,7 @@ BOARD_COLORS = {
     "recent": "#9ece6a",
     "history": "#737b91",
     "attention": "#f7768e",
+    "handoff": "#73daca",
 }
 BOARD_STATUS_LABELS = {
     "running": "進行中", "waiting": "等候中", "blocked": "卡住",
@@ -4199,7 +4201,7 @@ BOARD_STATUS_LABELS = {
 # Shown above the needs-attention rows so the colors explain themselves.
 ATTENTION_LEGEND = (
     "[#2ac3de]● 等博元回答[/]  [#f7768e]● 逾時未答[/]  "
-    "[#bb9af7]● 已轉介等上層[/]  [#f7768e]● 其他需處理[/]"
+    "[#bb9af7]● 已轉介等上層[/]  [#f7768e]● 其他需處理[/]  [#73daca]● 已接手[/]"
 )
 WIDE_BOARD_COLUMNS = 120
 
@@ -4223,6 +4225,8 @@ class WatchState:
         self.revision = 0
         self._observed: Dict[str, Tuple[str, Optional[float]]] = {}
         self._superseded: Dict[str, str] = {}
+        # Old task key -> name of the replacement that is still running.
+        self._handoff: Dict[str, str] = {}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self._validate(data)
@@ -4339,6 +4343,9 @@ class WatchState:
             return ""
         if self._dismissed(agent):
             return "已清除"
+        if agent.key in self._handoff:
+            # Still handed off, not finished: it must not expire into history.
+            return ""
         if agent.key in self._superseded:
             return "已被取代"
         if agent.status in ATTENTION_FAILURE_STATUSES:
@@ -4346,6 +4353,11 @@ class WatchState:
             if timestamp and now - timestamp > STALE_ATTENTION_SECONDS:
                 return "已過期"
         return ""
+
+    def handoff_label(self, agent: AgentInfo) -> str:
+        """Name the running replacement of a handed-off task."""
+        target = self._handoff.get(agent.key)
+        return "已接手 → " + target if target else ""
 
     def update_task(self, key: str, **values: Any) -> bool:
         data = copy.deepcopy(self.data)
@@ -4416,6 +4428,11 @@ class WatchState:
     ) -> None:
         """Reconcile run state after a complete registry snapshot."""
         self._superseded = compute_superseded(agents)
+        by_key = {agent.key: agent for agent in agents}
+        self._handoff = {
+            old: by_key[new].name for old, new in self._superseded.items()
+            if by_key[new].status == "running"
+        }
         data = copy.deepcopy(self.data)
         changed = False
         cleanup_warning = ""
@@ -4462,7 +4479,7 @@ class WatchState:
                     )
                     changed = True
             project = data["projects"].get(agent.project, {})
-            if project.get("collapsed") and self.bucket(agent, now) in ("running", "attention"):
+            if project.get("collapsed") and self.bucket(agent, now) in ("running", "attention", "handoff"):
                 project.update(collapsed=False, collapsed_at=self.stamp())
                 changed = True
         saved = not changed or self.save(data)
@@ -4479,6 +4496,8 @@ class WatchState:
         disposition = self.stale_info(agent, now)
         if disposition:
             return "history"
+        if agent.key in self._handoff:
+            return "handoff"
         bucket = board_bucket(agent, now)
         if bucket in ("attention", "running"):
             return bucket
@@ -4499,6 +4518,8 @@ class WatchState:
                 return False, "尚未收到這題的有效 ANSWER.md，不能清除"
             if agent.status == "running" or bucket == "running":
                 return False, "進行中的任務不能清除"
+            if bucket == "handoff":
+                return False, "已接手的任務不能清除；修正卡失敗時會自動回到需處理"
             if bucket != "attention" and disposition not in ("已過期", "已被取代"):
                 return False, "目前項目不在需處理區，也不是已過期或被取代項目"
             if disposition == "已清除":
@@ -4516,10 +4537,10 @@ class WatchState:
                 return True, "已清除；不會刪除或修改 QUESTION.md／ANSWER.md"
             return ok, "已清除" if ok else self.warning
 
-        if operation in ("hide", "done") and bucket in ("running", "attention"):
+        if operation in ("hide", "done") and bucket in ("running", "attention", "handoff"):
             return False, "進行中或需處理的任務不能隱藏／歸到已完成"
         if operation == "collapse":
-            if any(a.project == agent.project and self.bucket(a, now) in ("running", "attention") for a in agents):
+            if any(a.project == agent.project and self.bucket(a, now) in ("running", "attention", "handoff") for a in agents):
                 return False, "專案仍有進行中或需處理的任務，不能收起"
             data = copy.deepcopy(self.data)
             data["projects"][agent.project] = dict(collapsed=True, collapsed_at=self.stamp())
@@ -4607,7 +4628,9 @@ def render_task_row(agent: AgentInfo, width: int, now: float, selected: bool = F
     status = BOARD_STATUS_LABELS.get(agent.status, "待確認")
     if bucket in ("history", "hidden"):
         status = history_label or "已完成"
-    if bucket in ("recent", "history"):
+    elif bucket == "handoff":
+        status = history_label or "已接手"
+    if bucket in ("recent", "history", "handoff"):
         line = "{}{} {} │ {} │ {}".format(
             marker, format_completion_time(agent.completion_time, now),
             agent.name, status, agent.latest,
@@ -5078,7 +5101,7 @@ TabPane {
     height: auto;
     color: #f7768e;
 }
-#attention-box, .project-section, #pinned-box {
+#attention-box, .project-section, #pinned-box, #handoff-box {
     height: auto;
     border: solid #444b59;
     padding: 0 1;
@@ -5093,6 +5116,10 @@ TabPane {
 }
 #pinned-box {
     color: #737b91;
+}
+#handoff-box {
+    border: solid #73daca;
+    border-title-color: #73daca;
 }
 .empty-row, .more-recent, #top-stats, #history-summary {
     height: 1;
@@ -5387,7 +5414,7 @@ class TaskRow(Static, can_focus=True):
             agent.name += " [" + ", ".join(entry["tags"]) + "]"
         return render_task_row(
             agent, self.content_size.width, self.now, self.selected, bucket,
-            self.app.state.stale_info(agent, self.now),
+            self.app.state.stale_info(agent, self.now) or self.app.state.handoff_label(agent),
             self.app.state.answered_by(agent),
         )
 
@@ -5837,6 +5864,8 @@ class AgentWatchApp(App):
                         with Vertical(id="attention-box") as attention:
                             attention.border_title = "需處理"
                             yield Vertical(id="attention-list")
+                        with Vertical(id="handoff-box") as handoff:
+                            handoff.display = False
                         with Vertical(id="pinned-box") as pinned:
                             pinned.border_title = "釘選 · 0/5"
                             yield Static("尚無釘選", classes="empty-row")
@@ -5894,8 +5923,9 @@ class AgentWatchApp(App):
 
     def update_board(self, agents: List[AgentInfo], now: float, width: int) -> None:
         attention = [a for a in agents if self.state.bucket(a, now) == "attention"]
+        handoff = [a for a in agents if self.state.bucket(a, now) == "handoff"]
         pinned = [a for a in agents if self.state.task(a.key).get("pinned")
-                  and self.state.bucket(a, now) not in ("attention", "hidden")
+                  and self.state.bucket(a, now) not in ("attention", "handoff", "hidden")
                   and not self.state.task(a.key).get("done_manual")
                   and not self.state.data["projects"].get(a.project, {}).get("collapsed")]
         pinned_keys = {a.key for a in pinned}
@@ -5925,6 +5955,7 @@ class AgentWatchApp(App):
             )
         structure = (
             tuple(a.key for a in attention),
+            tuple(a.key for a in handoff),
             tuple(a.key for a in pinned),
             tuple(
                 (project, tuple(a.key for a in tasks), extra, recent_count, source)
@@ -5954,14 +5985,21 @@ class AgentWatchApp(App):
             self._row_widgets[agent.key] = widget
             return widget
 
-        attention_list.mount(*(
-            [Static(ATTENTION_LEGEND, classes="attention-legend"), *[row(a) for a in attention]]
+        legend = [Static(ATTENTION_LEGEND, classes="attention-legend")] if attention or handoff else []
+        attention_list.mount(*legend, *(
+            [row(a) for a in attention]
             if attention
             else [Static("目前沒有需處理任務", classes="empty-row")]
         ))
         self.query_one("#attention-box").border_title = (
             f"需處理 · {len(attention)} · 等回答／已轉介／卡住／失敗／無報告"
         )
+        handoff_box = self.query_one("#handoff-box", Vertical)
+        handoff_box.remove_children()
+        handoff_box.display = bool(handoff)
+        handoff_box.border_title = f"已接手 · {len(handoff)} · 修正卡進行中"
+        if handoff:
+            handoff_box.mount(*[row(a) for a in handoff])
         pinned_box.mount(*([row(a) for a in pinned] if pinned else [
             Static("尚無可顯示的釘選", classes="empty-row"),
         ]))
@@ -6020,7 +6058,7 @@ class AgentWatchApp(App):
             self.update_selection()
 
     def update_selection(self) -> None:
-        for widget in self.query(".project-section, #attention-box, #pinned-box"):
+        for widget in self.query(".project-section, #attention-box, #pinned-box, #handoff-box"):
             widget.remove_class("selected")
         for key, row in self._row_widgets.items():
             row.selected = key == self.selected_key
@@ -6123,7 +6161,9 @@ class AgentWatchApp(App):
             if self.state.stale_info(agent, self._now) in ("已過期", "已被取代")
         ]
         if not candidates:
-            self.show_state_message("目前沒有已過期或已被取代的項目")
+            handoff = sum(self.state.bucket(a, self._now) == "handoff" for a in self.current_agents)
+            note = f"；已接手 {handoff} 筆不能清除" if handoff else ""
+            self.show_state_message("目前沒有已過期或已被取代的項目" + note)
             return
 
         def confirmed(accepted: Optional[bool]) -> None:
@@ -6663,11 +6703,11 @@ class AgentWatchApp(App):
         self.last_snapshot = current_snapshot
         self.redraw_count += 1
 
-        counts = {key: 0 for key in ("attention", "running", "recent", "history", "hidden")}
+        counts = {key: 0 for key in ("attention", "handoff", "running", "recent", "history", "hidden")}
         for agent in agents:
             counts[self.state.bucket(agent, now)] += 1
         stats_str = (
-            f"需處理 {counts['attention']} │ 進行中 {counts['running']} │ "
+            f"需處理 {counts['attention']} │ 已接手 {counts['handoff']} │ 進行中 {counts['running']} │ "
             f"剛完成 {counts['recent']} │ 歷史 {counts['history']} │ "
             f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
         )
