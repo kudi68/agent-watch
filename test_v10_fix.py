@@ -339,6 +339,15 @@ class AttentionStateTests(unittest.TestCase):
         self.assertTrue(watch.question_is_active(question, agent.completion_time))
         self.assertEqual(self.state.bucket(agent, self.now), "attention")
         self.assertEqual(self.state.stale_info(agent, self.now), "")
+        self.state.update_task(
+            agent.key, dismissed=True,
+            dismissed_sig=self.state.dismissed_signature(agent),
+            run_start=agent.start_time,
+        )
+        self.assertEqual(self.state.bucket(agent, self.now), "attention")
+        self.assertEqual(self.state.stale_info(agent, self.now), "")
+        self.assertFalse(self.state.apply("dismiss", agent, [agent], self.now)[0])
+        self.assertEqual(self.state.dismiss_stale([agent], self.now), 0)
 
     def test_old_state_without_dismissed_and_corrupt_state_load_safely(self):
         self.state_path.write_text(
@@ -395,7 +404,7 @@ class AttentionStateTests(unittest.TestCase):
             ),
         )
 
-    def test_late_answer_and_rerun_after_overdue_manual_clear(self):
+    def test_overdue_question_needs_matching_answer_before_manual_clear(self):
         question_root, _, _, question = self.orphan_question(
             "question-late-answer", watch.QUESTION_CLEARABLE_SECONDS + 60,
         )
@@ -404,15 +413,19 @@ class AttentionStateTests(unittest.TestCase):
             start=self.now - 300, question=question,
         )
         self.state.reconcile([agent], self.now)
-        self.assertTrue(self.state.apply("dismiss", agent, [agent], self.now)[0])
-        self.assertTrue(self.state.task(agent.key)["dismissed"])
+        self.assertFalse(self.state.apply("dismiss", agent, [agent], self.now)[0])
+        self.assertFalse(self.state.task(agent.key).get("dismissed", False))
+        self.assertEqual(self.state.bucket(agent, self.now), "attention")
 
         self.assertTrue(watch.write_answer_file(
             question_root, agent.question, "A", now=self.now + 1,
         )[0])
         agent.question = watch.read_task_question(question_root)
+        agent.status = "failed"
+        agent.completion_time = self.now + 1
         self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
         self.state.reconcile([agent], self.now + 1)
+        self.assertTrue(self.state.apply("dismiss", agent, [agent], self.now + 1)[0])
         self.assertTrue(self.state.task(agent.key)["dismissed"])
         self.assertEqual(self.state.bucket(agent, self.now + 1), "history")
 

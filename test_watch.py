@@ -1848,7 +1848,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
 
-    async def test_x_clears_overdue_question_but_shift_x_leaves_it_alone(self):
+    async def test_x_and_shift_x_cannot_clear_overdue_unanswered_question(self):
         question_dir = tempfile.TemporaryDirectory(prefix="aw-question-overdue-x-")
         self.addCleanup(question_dir.cleanup)
         question_root = Path(question_dir.name)
@@ -1892,12 +1892,13 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
             await pilot.press("x")
             await pilot.pause()
-            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
-            await pilot.press("enter")
-            await pilot.pause()
-            self.assertTrue(app.state.task(agent.key)["dismissed"])
-            self.assertEqual(app.state.bucket(agent, self.now), "history")
-            self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+            self.assertEqual(
+                app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
+            )
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(app.state.stale_info(agent, self.now), "")
 
         self.assertEqual(
             before,
@@ -3038,6 +3039,47 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
                 svg = app.export_screenshot(title="work-handoff-100x35.svg")
             (shots / "work-handoff-100x35.svg").write_text(svg, encoding="utf-8")
         self.assertIn("已接手 →", html.unescape(svg).replace("\xa0", " "))
+
+
+class UpdateDataLifecycleTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """UI-only lifecycle coverage from bf7052b; no N9 daily-column assertions."""
+
+    def app_for(self):
+        fixtures = Path(__file__).parent / "tests" / "fixtures"
+        directory = tempfile.TemporaryDirectory(prefix="agent-watch-lifecycle-")
+        self.addCleanup(directory.cleanup)
+        app = AgentWatchApp(
+            fixtures / "not-read-runs.tsv", fixtures / "not-read-done.tsv",
+            state_path=Path(directory.name) / "state.json",
+            decisions_path=Path(directory.name) / "decisions",
+            daily_stats_path=Path(directory.name) / "daily.tsv",
+        )
+        app.data_svc._has_snapshot = True
+        app.data_svc.snapshot = lambda: ([], [])
+        app.data_svc.refresh_in_background = lambda: False
+        app.quota_svc.refresh_in_background = lambda force=False: False
+        app.quota_svc.cached_raw = []
+        return app
+
+    async def test_update_data_after_the_app_closed_does_not_raise(self):
+        app = self.app_for()
+        async with app.run_test(size=(80, 35)) as pilot:
+            await pilot.pause()
+        self.assertEqual(app.screen_stack, [])
+        app.update_data()
+        self.assertFalse(app.ui_error)
+
+    async def test_teardown_before_unmount_checks_tree_membership(self):
+        # bf7052b's guard-trace probe: isolate the earlier teardown window.
+        with patch.object(AgentWatchApp, "on_unmount", lambda self: None):
+            app = self.app_for()
+            async with app.run_test(size=(80, 35)) as pilot:
+                await pilot.pause()
+            self.assertTrue(app._ui_ready)
+            self.assertFalse(app.query("#clock"))
+            self.assertFalse(app._ui_is_live())
+            app.update_data()
+            self.assertFalse(app.ui_error)
 
 
 class SupersessionTests(unittest.TestCase):
