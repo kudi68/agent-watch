@@ -1848,7 +1848,7 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertFalse(watch.question_is_active(agent.question, agent.completion_time))
             self.assertNotEqual(app.state.bucket(agent, self.now), "attention")
 
-    async def test_x_clears_overdue_question_but_shift_x_leaves_it_alone(self):
+    async def test_x_and_shift_x_cannot_clear_overdue_unanswered_question(self):
         question_dir = tempfile.TemporaryDirectory(prefix="aw-question-overdue-x-")
         self.addCleanup(question_dir.cleanup)
         question_root = Path(question_dir.name)
@@ -1892,12 +1892,13 @@ class V10MainPageTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.state.dismiss_stale([agent], self.now), 0)
             await pilot.press("x")
             await pilot.pause()
-            self.assertIsInstance(app.screen, watch.DismissReasonScreen)
-            await pilot.press("enter")
-            await pilot.pause()
-            self.assertTrue(app.state.task(agent.key)["dismissed"])
-            self.assertEqual(app.state.bucket(agent, self.now), "history")
-            self.assertEqual(app.state.stale_info(agent, self.now), "已清除")
+            self.assertNotIsInstance(app.screen, watch.DismissReasonScreen)
+            self.assertEqual(
+                app.state_message, "尚未收到這題的有效 ANSWER.md，不能清除",
+            )
+            self.assertFalse(app.state.task(agent.key).get("dismissed", False))
+            self.assertEqual(app.state.bucket(agent, self.now), "attention")
+            self.assertEqual(app.state.stale_info(agent, self.now), "")
 
         self.assertEqual(
             before,

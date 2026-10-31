@@ -4852,11 +4852,6 @@ class WatchState:
     def stale_info(self, agent: AgentInfo, now: float) -> str:
         """Return the current history or review disposition label for a task."""
         if question_is_active(agent.question, agent.completion_time):
-            if (
-                self._dismissed(agent)
-                and question_wait_seconds(agent.question, now) >= QUESTION_CLEARABLE_SECONDS
-            ):
-                return "已清除"
             return ""
         if agent.status == "running":
             return ""
@@ -5030,11 +5025,7 @@ class WatchState:
 
     def bucket(self, agent: AgentInfo, now: float) -> str:
         if question_is_active(agent.question, agent.completion_time):
-            if (
-                not self._dismissed(agent)
-                or question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
-            ):
-                return "attention"
+            return "attention"
         if agent.status == "running":
             return "running"
         if agent.key in self._review_failures and not self._dismissed(agent):
@@ -5060,10 +5051,7 @@ class WatchState:
         """Return the existing refusal message, or an empty string if x is allowed."""
         bucket = self.bucket(agent, now)
         disposition = self.stale_info(agent, now)
-        if (
-            question_is_active(agent.question, agent.completion_time)
-            and question_wait_seconds(agent.question, now) < QUESTION_CLEARABLE_SECONDS
-        ):
+        if question_is_active(agent.question, agent.completion_time):
             return "尚未收到這題的有效 ANSWER.md，不能清除"
         if agent.status == "running" or bucket == "running":
             return "進行中的任務不能清除"
