@@ -3041,6 +3041,47 @@ class HandoffBucketTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         self.assertIn("已接手 →", html.unescape(svg).replace("\xa0", " "))
 
 
+class UpdateDataLifecycleTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
+    """UI-only lifecycle coverage from bf7052b; no N9 daily-column assertions."""
+
+    def app_for(self):
+        fixtures = Path(__file__).parent / "tests" / "fixtures"
+        directory = tempfile.TemporaryDirectory(prefix="agent-watch-lifecycle-")
+        self.addCleanup(directory.cleanup)
+        app = AgentWatchApp(
+            fixtures / "not-read-runs.tsv", fixtures / "not-read-done.tsv",
+            state_path=Path(directory.name) / "state.json",
+            decisions_path=Path(directory.name) / "decisions",
+            daily_stats_path=Path(directory.name) / "daily.tsv",
+        )
+        app.data_svc._has_snapshot = True
+        app.data_svc.snapshot = lambda: ([], [])
+        app.data_svc.refresh_in_background = lambda: False
+        app.quota_svc.refresh_in_background = lambda force=False: False
+        app.quota_svc.cached_raw = []
+        return app
+
+    async def test_update_data_after_the_app_closed_does_not_raise(self):
+        app = self.app_for()
+        async with app.run_test(size=(80, 35)) as pilot:
+            await pilot.pause()
+        self.assertEqual(app.screen_stack, [])
+        app.update_data()
+        self.assertFalse(app.ui_error)
+
+    async def test_teardown_before_unmount_checks_tree_membership(self):
+        # bf7052b's guard-trace probe: isolate the earlier teardown window.
+        with patch.object(AgentWatchApp, "on_unmount", lambda self: None):
+            app = self.app_for()
+            async with app.run_test(size=(80, 35)) as pilot:
+                await pilot.pause()
+            self.assertTrue(app._ui_ready)
+            self.assertFalse(app.query("#clock"))
+            self.assertFalse(app._ui_is_live())
+            app.update_data()
+            self.assertFalse(app.ui_error)
+
+
 class SupersessionTests(unittest.TestCase):
     def make_agent(self, name, status, *, project="agent-watch", start=100,
                    completion=None, question=None):

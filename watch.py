@@ -6500,6 +6500,7 @@ class AgentWatchApp(App):
         self.last_timer_snapshot: Any = None
         self.timer_update_count: int = 0
         self._ui_ready = False
+        self._clock_label: Optional[Label] = None
         self.ui_error = ""
         self.current_agents: List[AgentInfo] = []
         self.architecture_view_id = "now"
@@ -7219,6 +7220,8 @@ class AgentWatchApp(App):
 
     def on_mount(self) -> None:
         self._ui_ready = True
+        # Ported from bf7052b: keep the label while its compose screen is alive.
+        self._clock_label = self.query_one("#clock", Label)
         self.update_layout()
         self.action_switch_tab("tab-work")
         self.data_svc.on_ready = self._data_ready
@@ -7318,6 +7321,17 @@ class AgentWatchApp(App):
             self.query_one("#quota-display", Static).update(charts[1])
             self._last_quota_charts = charts
 
+    def _ui_is_live(self) -> bool:
+        """The compose screen drops its children before on_unmount runs.
+
+        Ported from bf7052b: is_mounted can remain true during teardown, so
+        tree membership is the guard for late poll or reader callbacks.
+        """
+        return self._clock_label is not None and bool(self.query("#clock"))
+
+    def on_unmount(self) -> None:
+        self._ui_ready = False
+
     def update_data(self, now: Optional[float] = None) -> bool:
         """
         Update static content only when its data changes; update elapsed numbers separately.
@@ -7326,14 +7340,15 @@ class AgentWatchApp(App):
         if now is None:
             now = time.time()
         self._now = now
-        if self._ui_ready:
-            self.query_one("#clock", Label).update(
+        ui_ready = self._ui_ready and self._ui_is_live()
+        if ui_ready:
+            self._clock_label.update(
                 time.strftime("%H:%M:%S", time.localtime(now))
             )
 
         registry_complete = False
         try:
-            if self._ui_ready:
+            if ui_ready:
                 registry_complete = self.data_svc.has_snapshot
                 agents, errors = self.data_svc.snapshot()
                 for agent in agents:
@@ -7431,9 +7446,9 @@ class AgentWatchApp(App):
                     "daily stats update failed: %s", exc
                 )
         if not data_changed:
-            if self._ui_ready:
+            if ui_ready:
                 self.update_quota_charts(quota_raw, quota_stale, now)
-            if timer_changed and self._ui_ready:
+            if timer_changed and ui_ready:
                 try:
                     self.update_board_timers(agents, now, self.size.width)
                 except Exception as e:
@@ -7449,9 +7464,9 @@ class AgentWatchApp(App):
             f"隱藏 {counts['hidden']} │ 總計 {len(agents)}"
             f" │ {project_other_summary(agents, now)}"
         )
-        width = self.size.width if self._ui_ready else 80
+        width = self.size.width if ui_ready else 80
 
-        if not self._ui_ready:
+        if not ui_ready:
             return True
 
         try:
