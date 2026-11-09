@@ -31,10 +31,12 @@ watch.write_daily_stats(
 
 # Logs every TSV read and lock call; "paused" waits on stdin after its read.
 RACE_IPC_WRITER = """
-import fcntl, sys, time
+import fcntl, os, sys, time
 from pathlib import Path
 import watch
 mode, target, column, value = sys.argv[1:5]
+# 346: keep the writer on the test's day instead of the machine's real today.
+day_start = float(os.environ["RACE_DAY_START"]) if os.environ.get("RACE_DAY_START") else None
 read, lock = Path.read_text, fcntl.flock
 def read_text(self, *args, **kwargs):
     text = read(self, *args, **kwargs)
@@ -46,8 +48,10 @@ def flock(fd, operation):
     print("flock", operation, time.time(), flush=True)
     return lock(fd, operation)
 Path.read_text, fcntl.flock = read_text, flock
-watch.write_daily_stats(Path(target), [], owned_columns=(column,),
-                        row={"date": time.strftime("%Y-%m-%d"), column: value})
+watch.write_daily_stats(Path(target), [], day_start=day_start,
+                        owned_columns=(column,),
+                        row={"date": time.strftime("%Y-%m-%d", time.localtime(day_start or time.time())),
+                             column: value})
 """
 
 
@@ -442,7 +446,9 @@ class DailyStatsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "daily.tsv"
             watch.write_daily_stats(
-                target, [], owned_columns=("base",),
+                # 346: pin the row to `now`; without day_start the merge compares it
+                # against the real today and silently skips the base row after 10/28.
+                target, [], day_start=now, owned_columns=("base",),
                 row={"date": time.strftime("%Y-%m-%d", time.localtime(now)), "base": "b0"},
             )
 
@@ -455,6 +461,7 @@ class DailyStatsTests(unittest.TestCase):
                      mode, str(target), column, value],
                     cwd=str(Path(__file__).resolve().parent), stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env={**os.environ, "RACE_DAY_START": str(now)},
                 )
             paused = start("paused", "writer_a", "a1")
             live = None

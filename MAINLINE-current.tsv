@@ -1,0 +1,12 @@
+# agent-watch 主線對照表（唯一分組來源；改這張表即可換組，不必改碼）
+# 欄位：mainline_id	label	card_prefixes	project_aliases	notes
+# card_prefixes＝卡片名稱的開頭文字（不分大小寫，p3 會涵蓋 p3a-…），逗號分隔。
+# project_aliases＝arch.json 的 project id，逗號分隔。
+# 都沒對到時退回 arch.json／infer_project；arch 也判不出來才是 other。
+# 這張表不含秘密；換 live 前要博元核准。
+mainline_id	label	card_prefixes	project_aliases	notes
+m1	主線1 Hermes＋PAI	hermes,hp0,pai,herdr,personal-ai	hermes,personal-ai-os,hermes-webui	Hermes 本體、cron／gateway、PAI／personal-ai-os
+m2	主線2 記帳	ab,qb,qbank,daak,bankhalf		帳本／回單／Daak／銀行半自動（目前無 arch project）
+m3	主線3 P3	p3,tier-p3	p3	P3 套件、離線整合、readiness
+paused	暫停：內科	med,g2-medical,clinical,textbook	medical-tools,medknowledge,clinical-notes,textbook-to-note	內科線暫停，卡片仍分組但不推進
+other	其他／基建			其他、agent-watch／night 派工等基建；未對到主線者的最後落點
