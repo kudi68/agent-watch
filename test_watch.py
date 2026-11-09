@@ -2470,20 +2470,20 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 40)) as pilot:
             await pilot.press("2", "g")
             self.assertTrue(app.history_grouped)
-            self.assertEqual(app.history_rows[0], ("project", "m1"))
+            self.assertEqual(app.history_rows[0], ("project", "m1-"))
             self.assertEqual(app.history_rows[1:4], [("task", a.key) for a in (agents[0], agents[2], agents[3])])
             # Switching to grouped mode keeps the cursor on the previously selected task,
             # so select the project header before exercising collapse/expand.
             table = app.query_one("#history-table", watch.DataTable)
-            table.move_cursor(row=app.history_rows.index(("project", "m1")))
+            table.move_cursor(row=app.history_rows.index(("project", "m1-")))
             await pilot.pause()
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1-"))
             await pilot.press("space")
-            self.assertIn("m1", app.history_collapsed)
+            self.assertIn("m1-", app.history_collapsed)
             self.assertNotIn(("task", agents[0].key), app.history_rows)
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1-"))
             await pilot.press("enter")
-            self.assertNotIn("m1", app.history_collapsed)
+            self.assertNotIn("m1-", app.history_collapsed)
             self.assertIn(("task", agents[0].key), app.history_rows)
             self.assertFalse(app.ui_error)
 
@@ -2495,9 +2495,9 @@ class V10HistoryScreenTests(IsolatedState, unittest.IsolatedAsyncioTestCase):
             # 切到分組模式會保留原本的任務游標，這次刻意不先移到專案列。
             self.assertEqual(app.history_rows[table.cursor_row], ("task", agents[0].key))
             await pilot.press("space")
-            self.assertIn("m1", app.history_collapsed)
+            self.assertIn("m1-", app.history_collapsed)
             self.assertNotIn(("task", agents[0].key), app.history_rows)
-            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1"))
+            self.assertEqual(app.history_rows[table.cursor_row], ("project", "m1-"))
             self.assertFalse(app.ui_error)
 
     async def test_grouped_search_input_filters_and_escape_clear(self):

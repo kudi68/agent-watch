@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 from rich.markup import escape
 from rich.text import Text
 
+import mainline_status
 import tok_speed
 
 # Textual imports (conditional for --once flag speed)
@@ -182,6 +183,39 @@ def mainline_group_key(agent: "AgentInfo", *, path: Optional[Path] = None) -> st
     if row is not None:
         return row["id"]
     return agent.project or PROJECT_OTHER
+
+
+# Read-only mainline status: the owner's MAINLINE-STATUS.md, one line per item.
+# The dashboard only reads it; rewriting the file is a separate (owner-run) job.
+MAINLINE_STATUS_FILENAME = "MAINLINE-STATUS.md"
+MAINLINE_STATUS_ENV = "AGENT_WATCH_MAINLINE_STATUS"
+
+
+def mainline_status_path() -> Path:
+    """Resolve MAINLINE-STATUS.md: env override, else the runs root (~/Projects/night)."""
+    return _env_path(MAINLINE_STATUS_ENV, ROOT_DIR / MAINLINE_STATUS_FILENAME)
+
+
+def mainline_status_text(width: int = 80, path: Optional[Path] = None) -> str:
+    """One line per item (狀態／離開條件／證據)；缺檔或讀不到時回明確占位，不拋例外。"""
+    target = Path(path) if path is not None else mainline_status_path()
+    board = mainline_status.load_status_board(target)
+    lines = [truncate_display(
+        f"主線現況 · {target.name} · {len(board.items)} 項 · {target}", width,
+    )]
+    if board.error:
+        # 占位不截斷：路徑與原因要看得到，Static 會自動換行。
+        lines.append(
+            f"讀不到 MAINLINE-STATUS（{board.error}）：{target} — 顯示占位，本面板唯讀、不改檔"
+        )
+        return "\n".join(lines)
+    for item in board.items:
+        lines.append(truncate_display(
+            f"{item.status:<9} {item.item} │ 離開：{item.exit_condition or '—'}"
+            f" │ 證據：{item.evidence or '—'}",
+            width,
+        ))
+    return "\n".join(lines)
 
 
 def daily_stats_path_from_env() -> Path:
@@ -888,7 +922,7 @@ def project_other_summary(
     denominator out instead of implying it matches.
 
     The count uses ``mainline_group_key`` (same rule as the board's groups), so a
-    card already folded into m1/m2/m3/paused is not counted as 其他 here even
+    card already folded into m1-/m2-/m3-/paused is not counted as 其他 here even
     when its raw arch project is still ``other``.
     """
     current = time.time() if now is None else now
@@ -5745,6 +5779,8 @@ def run_once_summary(
         for a in agents if task_bucket(a, now) != "history"
     ])
     print(Text.from_markup(render_work_board(agents, board_width, now)).plain)
+    print("【主線現況 · MAINLINE-STATUS · 唯讀】")
+    print(mainline_status_text(80))
 
     if errors:
         print("資料提示:")
@@ -5860,6 +5896,20 @@ TabPane {
     border: solid #444b59;
     padding: 0 1;
     border-title-color: #a9b1bd;
+}
+#mainline-status-box {
+    /* Bounded on purpose: 22 items must never push the work board off screen. */
+    height: 8;
+    border: solid #7aa2f7;
+    border-title-color: #7aa2f7;
+    padding: 0 1;
+}
+#mainline-status-scroll {
+    height: 1fr;
+    scrollbar-size: 1 1;
+}
+#mainline-status-body {
+    height: auto;
 }
 #attention-box {
     border: solid #f7768e;
@@ -6609,10 +6659,16 @@ class AgentWatchApp(App):
         decisions_path: Optional[Path] = None,
         toks_svc: Optional[tok_speed.TokSpeedService] = None,
         daily_stats_path: Optional[Path] = None,
+        mainline_status_file: Optional[Path] = None,
     ):
         super().__init__()
         self.runs_path = runs_path
         self.done_path = done_path
+        # Read-only 主線現況 source; tests can point it at a temp file.
+        self.mainline_status_path = (
+            Path(mainline_status_file) if mainline_status_file is not None
+            else mainline_status_path()
+        )
         self.state = WatchState(state_path)
         self.state_message = self.state.warning
         self.log_parser = LogParser()
@@ -6676,6 +6732,10 @@ class AgentWatchApp(App):
                 with Vertical(id="work-page"):
                     with VerticalScroll(id="work-scroll"):
                         yield Static(id="data-errors")
+                        with Vertical(id="mainline-status-box") as mainline_box:
+                            mainline_box.border_title = "主線現況 · MAINLINE-STATUS · 唯讀"
+                            with VerticalScroll(id="mainline-status-scroll"):
+                                yield Static("", id="mainline-status-body", markup=False)
                         with Vertical(id="attention-box") as attention:
                             attention.border_title = "需處理"
                             yield Vertical(id="attention-list")
@@ -7467,6 +7527,18 @@ class AgentWatchApp(App):
     def on_unmount(self) -> None:
         self._ui_ready = False
 
+    def update_mainline_status(self, width: Optional[int] = None) -> None:
+        """Refresh the read-only 主線現況 panel;每輪 poll 都重讀，檔案換了就跟上。"""
+        columns = self.size.width if width is None else width
+        try:
+            text = mainline_status_text(
+                max(40, (columns or 80) - 2),
+                path=self.mainline_status_path,
+            )
+            self.query_one("#mainline-status-body", Static).update(text)
+        except Exception as e:
+            self.ui_error = f"主線現況更新失敗：{e}"
+
     def update_data(self, now: Optional[float] = None) -> bool:
         """
         Update static content only when its data changes; update elapsed numbers separately.
@@ -7480,6 +7552,8 @@ class AgentWatchApp(App):
             self._clock_label.update(
                 time.strftime("%H:%M:%S", time.localtime(now))
             )
+            # Read once per poll: the status file is tiny and changes rarely.
+            self.update_mainline_status()
 
         registry_complete = False
         try:

@@ -583,7 +583,7 @@ class BoardRegressions(unittest.TestCase):
         ]
         text = watch.render_work_board(agents, now=now)
         # 346: personal-ai-os 屬主線1，主線標籤取代舊 project 名上板。
-        mainline = watch.project_label("m1")
+        mainline = watch.project_label("m1-")
         self.assertLess(text.index(mainline), text.index("agent-watch"))
         self.assertLess(text.index("agent-watch"), text.index("iOS 捷徑"))
         self.assertNotIn("old-result", text)
@@ -651,7 +651,7 @@ class BoardRegressions(unittest.TestCase):
             example_agent("result-b", "complete", now, "c1-runtime", completion_time=now - 50),
         ]
         text = watch.render_work_board(agents, now=now)
-        self.assertLess(text.index("c1-runtime"), text.index(watch.project_label("m1")))
+        self.assertLess(text.index("c1-runtime"), text.index(watch.project_label("m1-")))
         long = example_agent("Very long task name " * 5, "running", now)
         from rich.text import Text
         lines = Text.from_markup(watch.render_board_active([long], 80)).plain.splitlines()

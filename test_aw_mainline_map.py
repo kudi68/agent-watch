@@ -247,5 +247,65 @@ class OtherSummaryUsesMainlineTests(unittest.TestCase):
         self.assertEqual(row["other_ratio"], "0.0")
 
 
+class MainlinePrefixM1Tests(unittest.TestCase):
+    """2026-11-10: mainline ids and card prefixes share the m1-/m2-/m3- spelling."""
+
+    def setUp(self):
+        self.map_path = Path(watch.__file__).with_name(watch.MAINLINE_FILENAME)
+
+    def groups(self, agents):
+        with patch.dict(os.environ, {"AGENT_WATCH_MAINLINE": str(self.map_path)}):
+            return {
+                key: [a.key for a in value]
+                for key, value in watch.group_agents_by_project(agents).items()
+            }
+
+    def test_repo_map_ids_are_m_prefixed_and_claim_their_own_cards(self):
+        rows = watch.load_mainline_map(self.map_path)
+        self.assertEqual(list(rows), ["m1-", "m2-", "m3-", "paused", "other"])
+        for mainline_id in ("m1-", "m2-", "m3-"):
+            self.assertIn(mainline_id, rows[mainline_id]["card_prefixes"])
+            self.assertEqual(rows[mainline_id]["id"], mainline_id)
+
+    def test_todays_m_prefixed_cards_group_into_their_mainline(self):
+        # Red side of the rename: before the TSV change these three all fell to 其他.
+        grouped = self.groups([
+            agent("m1-13-agent-watch-mainline-view", "other"),
+            agent("m2-7-known-limits", "other"),
+            agent("m3-p3-golive-inventory", "other"),
+        ])
+        self.assertEqual(grouped, {
+            "m1-": ["m1-13-agent-watch-mainline-view"],
+            "m2-": ["m2-7-known-limits"],
+            "m3-": ["m3-p3-golive-inventory"],
+        })
+
+    def test_old_prefixes_and_project_aliases_still_group(self):
+        grouped = self.groups([
+            agent("hermes-cron-04", "hermes"),
+            agent("ab-v5-debt", "other"),
+            agent("p3a-inventory", "p3"),
+            agent("med-clinic-note", "other"),
+            agent("any-card", "personal-ai-os"),
+            agent("loose-card", "other"),
+        ])
+        self.assertEqual(grouped["m1-"], ["hermes-cron-04", "any-card"])
+        self.assertEqual(grouped["m2-"], ["ab-v5-debt"])
+        self.assertEqual(grouped["m3-"], ["p3a-inventory"])
+        self.assertEqual(grouped["paused"], ["med-clinic-note"])
+        self.assertEqual(grouped["other"], ["loose-card"])
+
+    def test_labels_and_sort_order_use_the_new_ids(self):
+        with patch.dict(os.environ, {"AGENT_WATCH_MAINLINE": str(self.map_path)}):
+            self.assertEqual(watch.project_label("m1-"), "主線1 Hermes＋PAI")
+            self.assertEqual(watch.project_label("m3-"), "主線3 P3")
+            grouped = watch.group_agents_by_project([
+                agent("agent-watch-thing", "agent-watch"),
+                agent("m3-p3-gold", "other"),
+                agent("m1-1-thing", "other"),
+            ])
+            self.assertEqual(list(grouped)[:2], ["m1-", "m3-"])
+
+
 if __name__ == "__main__":
     unittest.main()

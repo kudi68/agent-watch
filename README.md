@@ -293,6 +293,7 @@ Everything machine-specific is read from the environment. CLI flags `--runs` and
 | `AGENT_WATCH_CODEX_SESSIONS` | `~/.codex/sessions` | Codex session logs used for quota |
 | `AGENT_WATCH_ARCH` | `arch.json` next to `watch.py` | Architecture graph definition |
 | `AGENT_WATCH_MAINLINE` | `MAINLINE-current.tsv` next to `watch.py` (else `$AGENT_WATCH_RUNS_ROOT/MAINLINE-current.tsv`) | Mainline grouping table (see below) |
+| `AGENT_WATCH_MAINLINE_STATUS` | `$AGENT_WATCH_RUNS_ROOT/MAINLINE-STATUS.md` | Read-only 主線現況 source for the 工作 tab panel |
 | `AGENT_WATCH_DECISIONS` | `~/Projects/status/decisions` | Decision-node folder shown in the 專案樹 tab |
 | `AGENT_WATCH_MAGPIE` | `magpie` | Executable used for `quota --json` |
 | `AGENT_WATCH_GROK_QUOTA` | `~/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json` | Syrtis pace history read for the Grok Bot window |
@@ -345,6 +346,20 @@ is a one-file edit — no code change — and the file is re-read when its mtime
 changes. Columns: `mainline_id`, `label`, `card_prefixes`, `project_aliases`, `notes`.
 The live map stays at `~/Projects/night/MAINLINE-current.tsv` until 博元 approves the
 switch; this branch only ships the sample beside `watch.py` (換 live 要博元核准).
+
+`mainline_id` and the card prefixes share one spelling: `m1-`, `m2-`, `m3-` (plus the
+`paused` and `other` rows). Every row must list its own `m?-` prefix in
+`card_prefixes`, otherwise today's cards (`m1-13-…`, `m2-7-…`) fall through to
+`other`; the older prefixes (`hermes`, `ab`, `p3`, …) stay listed so renamed cards
+keep their group. `other` is the fallback and never claims a card.
+
+### 主線現況 panel
+
+The 工作 tab shows a read-only `MAINLINE-STATUS.md` panel above 需處理: one line per
+item with 狀態／離開條件／證據路徑 (`AGENT_WATCH_MAINLINE_STATUS` overrides the path,
+default `~/Projects/night/MAINLINE-STATUS.md`). A missing or unreadable file shows a
+placeholder line instead of failing; `--once` prints the same block. The panel never
+writes the status file.
 
 The bundled project table names the real projects this dashboard runs for:
 `personal-ai-os` (`pai`), `agent-watch` (`aw`, `awv10`, `awv9`), `ios-shortcuts`
