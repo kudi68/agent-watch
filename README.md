@@ -292,6 +292,7 @@ Everything machine-specific is read from the environment. CLI flags `--runs` and
 | `AGENT_WATCH_STATE` | `~/Projects/night/agent-watch-state.json` | Dashboard-owned state; independent of runs root |
 | `AGENT_WATCH_CODEX_SESSIONS` | `~/.codex/sessions` | Codex session logs used for quota |
 | `AGENT_WATCH_ARCH` | `arch.json` next to `watch.py` | Architecture graph definition |
+| `AGENT_WATCH_MAINLINE` | `MAINLINE-current.tsv` next to `watch.py` (else `$AGENT_WATCH_RUNS_ROOT/MAINLINE-current.tsv`) | Mainline grouping table (see below) |
 | `AGENT_WATCH_DECISIONS` | `~/Projects/status/decisions` | Decision-node folder shown in the 專案樹 tab |
 | `AGENT_WATCH_MAGPIE` | `magpie` | Executable used for `quota --json` |
 | `AGENT_WATCH_GROK_QUOTA` | `~/Library/Application Support/com.nyanako.tokenbar/quota-pace-history-v3.json` | Syrtis pace history read for the Grok Bot window |
@@ -332,6 +333,18 @@ docs pass	20261027/docs/run.log	20261027/docs/REPORT.md
 Project grouping and the architecture tab are configured in `arch.json`. Point
 `AGENT_WATCH_ARCH` at your own file to describe your projects and workers; the bundled
 file is an example and is validated at startup.
+
+### Mainlines (346)
+
+`MAINLINE-current.tsv` next to `watch.py` (override with `AGENT_WATCH_MAINLINE`)
+decides the top-level groups before `arch.json` is consulted: a card is matched by
+its literal name prefix first (`card_prefixes`, so `p3` also covers `p3a-…`), then by
+its inferred arch project id (`project_aliases`). Rows it does not claim keep the old
+arch grouping, and cards nothing can place still land in `other`. Changing a mainline
+is a one-file edit — no code change — and the file is re-read when its mtime/size
+changes. Columns: `mainline_id`, `label`, `card_prefixes`, `project_aliases`, `notes`.
+The live map stays at `~/Projects/night/MAINLINE-current.tsv` until 博元 approves the
+switch; this branch only ships the sample beside `watch.py` (換 live 要博元核准).
 
 The bundled project table names the real projects this dashboard runs for:
 `personal-ai-os` (`pai`), `agent-watch` (`aw`, `awv10`, `awv9`), `ios-shortcuts`
@@ -443,6 +456,7 @@ and switching tabs. It proves headless responsiveness, not a live ten-minute run
 ```text
 watch.py                  dashboard and status logic
 arch.json                 architecture views and the real project table
+MAINLINE-current.tsv      mainline grouping table read before arch.json
 agent-watch-v8            launcher using .venv/bin/python
 test_watch.py             UI and behaviour tests
 test_v8.py                status and quota regression tests

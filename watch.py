@@ -66,6 +66,123 @@ MAGPIE_COMMAND = os.environ.get("AGENT_WATCH_MAGPIE", "magpie")
 # Daily tok/s per model/tier, long format (see tok_speed.py).
 DEFAULT_TOKS_TSV = _env_path("AGENT_WATCH_TOKS_TSV", ROOT_DIR / "agent-watch-toks.tsv")
 
+# The mainline map replaces repo-era arch.json projects as the top-level grouping.
+# Cards are matched by name prefix first, then by their inferred arch project id,
+# so a new mainline only needs an edit to this one TSV. The map holds no secrets.
+MAINLINE_FILENAME = "MAINLINE-current.tsv"
+MAINLINE_ENV = "AGENT_WATCH_MAINLINE"
+# A card no mainline claims keeps its arch project; the arch `other` stays 其他.
+# (PROJECT_OTHER is defined below; the id is the same literal.)
+MAINLINE_OTHER = "other"
+_MAINLINE_LIST_SPLIT_RE = re.compile(r"[,，、]\s*")
+_MAINLINE_CACHE: Dict[str, Tuple[Tuple[int, int], Dict[str, Dict[str, Any]]]] = {}
+
+
+def mainline_path() -> Path:
+    """Resolve the mainline TSV: env override, beside watch.py, then runs root.
+
+    Both defaults are read-only for the dashboard; switching the live map still
+    needs the owner's approval, so nothing here writes the file.
+    """
+    override = os.environ.get(MAINLINE_ENV)
+    if override:
+        return Path(override).expanduser()
+    beside_repo = Path(__file__).with_name(MAINLINE_FILENAME)
+    if beside_repo.is_file():
+        return beside_repo
+    return ROOT_DIR / MAINLINE_FILENAME
+
+
+def _mainline_list(value: str) -> List[str]:
+    return [part.strip().casefold() for part in _MAINLINE_LIST_SPLIT_RE.split(value or "")
+            if part.strip()]
+
+
+def parse_mainline_tsv(text: str) -> Dict[str, Dict[str, Any]]:
+    """Read the TSV map; rows without an id or label are ignored, not fatal."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    lines = [
+        line for line in (text or "").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not lines:
+        return rows
+    header = [column.strip() for column in lines[0].split("\t")]
+    if "mainline_id" not in header or "label" not in header:
+        return rows
+    for line in lines[1:]:
+        values = dict(zip(header, line.split("\t")))
+        mainline_id = values.get("mainline_id", "").strip()
+        label = values.get("label", "").strip()
+        if not mainline_id or not label:
+            continue
+        rows[mainline_id] = {
+            "id": mainline_id,
+            "label": label,
+            "card_prefixes": _mainline_list(values.get("card_prefixes", "")),
+            "project_aliases": _mainline_list(values.get("project_aliases", "")),
+            "notes": values.get("notes", "").strip(),
+        }
+    return rows
+
+
+def load_mainline_map(path: Optional[Path] = None) -> Dict[str, Dict[str, Any]]:
+    """Load the map, re-reading it when the file's mtime or size changes."""
+    target = Path(path) if path is not None else mainline_path()
+    try:
+        info = target.stat()
+    except OSError:
+        return {}
+    signature = (info.st_mtime_ns, info.st_size)
+    cached = _MAINLINE_CACHE.get(str(target))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    rows = parse_mainline_tsv(text)
+    _MAINLINE_CACHE[str(target)] = (signature, rows)
+    return rows
+
+
+def mainline_for(
+    name: str,
+    project_id: Optional[str] = None,
+    *,
+    path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """The mainline that owns this card, or None to fall back to arch.json.
+
+    A card prefix is a literal case-insensitive name prefix (`p3` covers `p3a-…`).
+    The `other` row is documentation for the fallback and never claims a card.
+    """
+    rows = load_mainline_map(path)
+    if not rows:
+        return None
+    needle = (name or "").casefold()
+    for mainline_id, row in rows.items():
+        if mainline_id == MAINLINE_OTHER:
+            continue
+        if any(needle.startswith(prefix) for prefix in row["card_prefixes"]):
+            return row
+    project = (project_id or "").casefold()
+    if project:
+        for mainline_id, row in rows.items():
+            if mainline_id == MAINLINE_OTHER:
+                continue
+            if project in row["project_aliases"]:
+                return row
+    return None
+
+
+def mainline_group_key(agent: "AgentInfo", *, path: Optional[Path] = None) -> str:
+    """Grouping key for one card: its mainline when owned, else its arch project."""
+    row = mainline_for(agent.name, agent.project, path=path)
+    if row is not None:
+        return row["id"]
+    return agent.project or PROJECT_OTHER
+
 
 def daily_stats_path_from_env() -> Path:
     """Resolve the daily stats path without making tests write to the live root."""
@@ -769,6 +886,10 @@ def project_other_summary(
     out, and dropping them silently shrank the denominator. The window is not
     the board's 總計 (which also holds older history), so the label spells the
     denominator out instead of implying it matches.
+
+    The count uses ``mainline_group_key`` (same rule as the board's groups), so a
+    card already folded into m1/m2/m3/paused is not counted as 其他 here even
+    when its raw arch project is still ``other``.
     """
     current = time.time() if now is None else now
     cutoff = current - window_days * 86400
@@ -777,10 +898,7 @@ def project_other_summary(
         if agent_activity_time(agent) == 0 or agent_activity_time(agent) >= cutoff
     ]
     total = len(window)
-    other = sum(
-        1 for agent in window
-        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
-    )
+    other = sum(1 for agent in window if mainline_group_key(agent) == PROJECT_OTHER)
     ratio = (other / total * 100) if total else 0.0
     return f"其他 {other}（{ratio:.1f}%，近 {window_days} 天）"
 
@@ -817,10 +935,8 @@ def daily_stats_row(
         if day_start <= agent_activity_time(agent) < day_end
     ]
     total = len(window)
-    other = sum(
-        1 for agent in window
-        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
-    )
+    # Same rule as the board: a card folded into a mainline is not 其他.
+    other = sum(1 for agent in window if mainline_group_key(agent) == PROJECT_OTHER)
     row = {
         "date": day.strftime("%Y-%m-%d"),
         "total": str(total),
@@ -1042,6 +1158,9 @@ def write_daily_stats(
 
 
 def project_label(project_id: str) -> str:
+    rows = load_mainline_map()
+    if project_id in rows and project_id != MAINLINE_OTHER:
+        return rows[project_id]["label"]
     ensure_architecture_data()
     config = ARCHITECTURE_DATA.get("projects", {}).get(project_id)
     if isinstance(config, dict) and config.get("label"):
@@ -1050,6 +1169,14 @@ def project_label(project_id: str) -> str:
 
 
 def project_sort_key(project_id: str) -> Tuple[int, str]:
+    """Mainlines first in TSV order, then arch projects; arch order is unchanged."""
+    mainline_order = [
+        mainline_id for mainline_id in load_mainline_map()
+        if mainline_id != MAINLINE_OTHER
+    ]
+    if project_id in mainline_order:
+        # Negative ranks keep the arch indexes below untouched when no map is in use.
+        return mainline_order.index(project_id) - len(mainline_order), project_label(project_id)
     ensure_architecture_data()
     configured = list(ARCHITECTURE_DATA.get("projects", {}).keys())
     if project_id in configured:
@@ -1062,7 +1189,7 @@ def project_sort_key(project_id: str) -> Tuple[int, str]:
 def group_agents_by_project(agents: List["AgentInfo"]) -> Dict[str, List["AgentInfo"]]:
     groups: Dict[str, List[AgentInfo]] = {}
     for agent in agents:
-        groups.setdefault(agent.project or PROJECT_OTHER, []).append(agent)
+        groups.setdefault(mainline_group_key(agent), []).append(agent)
     return {
         project_id: groups[project_id]
         for project_id in sorted(groups, key=project_sort_key)
@@ -1524,7 +1651,11 @@ def parse_question(text: str) -> Dict[str, Any]:
 
 
 def parse_answer(text: str) -> Dict[str, Any]:
-    """Parse ANSWER.md; a mismatched id is treated as no answer."""
+    """Parse ANSWER.md; a mismatched id is treated as no answer.
+
+    `answer:` is accepted as an alias for `choice:` (both are read); when a file
+    carries both, the canonical `choice:` wins and the alias only fills a blank.
+    """
     answer: Dict[str, Any] = dict(
         id="", choice="", note="", answered_at="", escalate_to="", error="",
     )
@@ -1539,6 +1670,10 @@ def parse_answer(text: str) -> Dict[str, Any]:
         if pair is None:
             continue
         key, value = pair
+        if key == "answer":
+            key = "choice"
+            if answer["choice"]:
+                continue
         if key in ("id", "choice", "note", "answered_at", ESCALATE_FIELD):
             answer[key] = value
     if not answer["id"]:
@@ -6944,7 +7079,7 @@ class AgentWatchApp(App):
                 "已完成" if agent.status == "complete" else BOARD_STATUS_LABELS.get(agent.status, agent.status)
             )
             disposition = "隱藏 · " if entry.get("hidden") else ""
-            cells = (stamp, age, project_label(agent.project), ", ".join(entry.get("tags", [])),
+            cells = (stamp, age, project_label(mainline_group_key(agent)), ", ".join(entry.get("tags", [])),
                      agent.name, disposition + status + " · " + agent.latest,
                      "已讀" if entry.get("read") else "●未讀")
             table.add_row(*(Text(truncate_display(value, width),
@@ -7024,7 +7159,7 @@ class AgentWatchApp(App):
                 agent = next((a for a in self.current_agents if a.key == key), None)
                 if agent is None:
                     return
-                project = agent.project
+                project = mainline_group_key(agent)
             else:
                 project = key
             if project in self.history_collapsed:
