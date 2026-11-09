@@ -886,6 +886,10 @@ def project_other_summary(
     out, and dropping them silently shrank the denominator. The window is not
     the board's 總計 (which also holds older history), so the label spells the
     denominator out instead of implying it matches.
+
+    The count uses ``mainline_group_key`` (same rule as the board's groups), so a
+    card already folded into m1/m2/m3/paused is not counted as 其他 here even
+    when its raw arch project is still ``other``.
     """
     current = time.time() if now is None else now
     cutoff = current - window_days * 86400
@@ -894,10 +898,7 @@ def project_other_summary(
         if agent_activity_time(agent) == 0 or agent_activity_time(agent) >= cutoff
     ]
     total = len(window)
-    other = sum(
-        1 for agent in window
-        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
-    )
+    other = sum(1 for agent in window if mainline_group_key(agent) == PROJECT_OTHER)
     ratio = (other / total * 100) if total else 0.0
     return f"其他 {other}（{ratio:.1f}%，近 {window_days} 天）"
 
@@ -934,10 +935,8 @@ def daily_stats_row(
         if day_start <= agent_activity_time(agent) < day_end
     ]
     total = len(window)
-    other = sum(
-        1 for agent in window
-        if (agent.project or PROJECT_OTHER) == PROJECT_OTHER
-    )
+    # Same rule as the board: a card folded into a mainline is not 其他.
+    other = sum(1 for agent in window if mainline_group_key(agent) == PROJECT_OTHER)
     row = {
         "date": day.strftime("%Y-%m-%d"),
         "total": str(total),

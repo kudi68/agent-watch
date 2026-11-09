@@ -7,7 +7,11 @@ ago. It is deliberately conservative:
 
 * default is ``--dry-run``; ``--apply`` is required to write anything;
 * the TSV is backed up to ``<name>.bak-awclean-<TS>`` before the rewrite;
-* a row with no readable timestamp is never archived (unknown stays);
+* a row with no readable timestamp is never archived (unknown stays); a date is
+  only taken from a ``YYYYMMDD`` folder below the done TSV's own folder, never
+  from a dated workspace or TMPDIR component above it;
+* the archive is written before the source TSV is replaced, so a failed archive
+  write leaves the source rows untouched;
 * only the TSV, its backup and the archive file are touched — no card folder is
   deleted, moved, or renamed.
 
@@ -82,19 +86,52 @@ def path_timestamp(path: Path) -> Optional[float]:
     return info.st_mtime if info.st_mtime > 0 else None
 
 
-def date_timestamp(text: str) -> Optional[float]:
-    """Fallback: the first YYYYMMDD run folder in a path, at local midnight."""
-    match = DATE_IN_PATH_RE.search(text or "")
-    if match is None:
-        return None
-    try:
-        moment = datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    except ValueError:
-        return None
-    return time.mktime(moment.timetuple())
+def dated_ancestors(path: Path, root: Optional[Path]) -> List[Path]:
+    """Directories above ``path`` that may name its run folder, nearest first.
+
+    With a ``root`` (the folder that owns the done TSV) only the directories
+    strictly below that root count, so a dated workspace or TMPDIR component
+    above the runs root can never pass for the card's run date. Without a root
+    only the file's own directory and its parent are considered.
+    """
+    directory = path.parent
+    if root is not None:
+        try:
+            relative = directory.relative_to(root)
+        except ValueError:
+            return []  # outside the runs root: no dated folder we can trust
+        parts = relative.parts
+        return [root.joinpath(*parts[:depth]) for depth in range(len(parts), 0, -1)]
+    ancestors = [directory]
+    if directory.parent != directory:
+        ancestors.append(directory.parent)
+    return ancestors
 
 
-def row_timestamp(parts: Sequence[str]) -> Optional[float]:
+def date_timestamp(text: str, root: Optional[Path] = None) -> Optional[float]:
+    """Fallback: a ``YYYYMMDD`` run folder holding the file, at local midnight.
+
+    The folder name must be exactly eight digits; dated-looking names such as
+    ``20261025-k1-s6`` are card folders, not run folders, so they stay unknown
+    rather than guessing a date. See :func:`dated_ancestors` for the scope.
+    """
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    for ancestor in dated_ancestors(path, root):
+        match = DATE_IN_PATH_RE.fullmatch(ancestor.name)
+        if match is None:
+            continue
+        try:
+            moment = datetime(int(match.group(1)), int(match.group(2)),
+                              int(match.group(3)))
+        except ValueError:
+            continue
+        return time.mktime(moment.timetuple())
+    return None
+
+
+def row_timestamp(parts: Sequence[str], root: Optional[Path] = None) -> Optional[float]:
     """Completion evidence for a row: newest readable mtime, else a dated path."""
     stamps = [stamp for stamp in (path_timestamp(path) for path in row_paths(parts))
               if stamp is not None]
@@ -102,13 +139,15 @@ def row_timestamp(parts: Sequence[str]) -> Optional[float]:
         return max(stamps)
     for index in PATH_COLUMNS:
         if index < len(parts):
-            stamp = date_timestamp(parts[index])
+            stamp = date_timestamp(parts[index], root)
             if stamp is not None:
                 return stamp
     return None
 
 
-def split_rows(lines: Sequence[str], cutoff: float) -> Tuple[List[str], List[str], int]:
+def split_rows(
+    lines: Sequence[str], cutoff: float, root: Optional[Path] = None,
+) -> Tuple[List[str], List[str], int]:
     """Return (kept, stale, unknown) — comments and blank lines are always kept."""
     kept: List[str] = []
     stale: List[str] = []
@@ -118,7 +157,7 @@ def split_rows(lines: Sequence[str], cutoff: float) -> Tuple[List[str], List[str
             kept.append(line)
             continue
         parts = line.split("\t")
-        stamp = row_timestamp(parts)
+        stamp = row_timestamp(parts, root)
         if stamp is None:
             unknown += 1
             kept.append(line)
@@ -129,9 +168,9 @@ def split_rows(lines: Sequence[str], cutoff: float) -> Tuple[List[str], List[str
     return kept, stale, unknown
 
 
-def describe(line: str, now: float) -> str:
+def describe(line: str, now: float, root: Optional[Path] = None) -> str:
     parts = line.split("\t")
-    stamp = row_timestamp(parts)
+    stamp = row_timestamp(parts, root)
     age = "unknown" if stamp is None else f"{(now - stamp) / 86400:.1f}d"
     name = parts[0] if parts else line
     return f"  {age:>9}  {name}"
@@ -160,19 +199,27 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 def append_archive(path: Path, rows: Sequence[str], stamp: str) -> None:
+    """Append rows to the archive in one atomic replace.
+
+    A failed open/write (for example ``--archive`` pointing at a directory)
+    raises before the archive or the source TSV changes, so the caller can keep
+    the source intact instead of dropping rows.
+    """
     if not rows:
         return
     body = "".join(line.rstrip("\n") + "\n" for line in rows)
+    block = f"# archived {stamp}\n{body}"
     if path.exists():
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(f"# archived {stamp}\n{body}")
+        existing = path.read_text(encoding="utf-8")
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        atomic_write(path, existing + block)
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
         header = (
             "# agent-watch done rows archived by archive_stale_runs.py\n"
             "# Same columns as agent-runs-done.tsv; grouped by archive timestamp.\n"
         )
-        path.write_text(f"{header}# archived {stamp}\n{body}", encoding="utf-8")
+        atomic_write(path, f"{header}{block}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -192,7 +239,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     lines = done.read_text(encoding="utf-8", errors="replace").splitlines()
-    kept, stale, unknown = split_rows(lines, cutoff)
+    root = done.parent  # the run folders live at or below the done TSV's folder
+    kept, stale, unknown = split_rows(lines, cutoff, root)
     stamp = datetime.fromtimestamp(now).strftime(TS_FORMAT)
 
     mode = "APPLY" if args.apply else "DRY-RUN"
@@ -202,7 +250,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
           f"  days={args.days:g}")
     if not args.quiet:
         for line in stale:
-            print(describe(line, now))
+            print(describe(line, now, root))
     if not args.apply:
         print("  dry-run only; pass --apply to move these rows")
         return 0
@@ -220,8 +268,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     backup.write_text(original, encoding="utf-8")
     print(f"  backup: {backup}")
 
+    # Archive first: if the archive cannot be written the source stays whole.
+    try:
+        append_archive(archive, stale, stamp)
+    except OSError as exc:
+        print(f"error: archive write failed ({exc}); {done.name} left unchanged",
+              file=sys.stderr)
+        return 1
     atomic_write(done, "".join(line.rstrip("\n") + "\n" for line in kept))
-    append_archive(archive, stale, stamp)
     print(f"  archive: {archive}")
     print(f"  moved {len(stale)} row(s); card folders untouched")
     return 0

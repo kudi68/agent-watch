@@ -6,6 +6,7 @@ arch.json/infer_project path decide. Editing the TSV alone must change groups.
 """
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -193,6 +194,57 @@ class ParseAnswerAliasTests(unittest.TestCase):
             question = watch.read_task_question(folder)
             self.assertTrue(question["answered"])
             self.assertEqual(question["answer"]["choice"], "B")
+
+
+class OtherSummaryUsesMainlineTests(unittest.TestCase):
+    """F3: the 其他 summary counts mainline groups, not the raw arch project."""
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.map_path = self.base / "MAINLINE-current.tsv"
+        self.map_path.write_text(
+            HEADER
+            + "m1\t主線1\tpai,hp0\tpersonal-ai-os\t\n"
+            + "other\t其他\t\t\t\n",
+            encoding="utf-8",
+        )
+        patcher = patch.dict(os.environ, {"AGENT_WATCH_MAINLINE": str(self.map_path)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_other_summary_skips_cards_a_mainline_claims(self):
+        agents = [
+            agent("hp0-proof", project="other", start=self.NOW),
+            agent("loose-card", project="other", start=self.NOW),
+        ]
+        self.assertEqual(
+            watch.project_other_summary(agents, self.NOW), "其他 1（50.0%，近 14 天）"
+        )
+
+    def test_other_summary_is_zero_when_every_other_card_has_a_mainline(self):
+        agents = [agent("hp0-proof", project="other", start=self.NOW)]
+        self.assertEqual(
+            watch.project_other_summary(agents, self.NOW), "其他 0（0.0%，近 14 天）"
+        )
+        self.assertIn(
+            "其他 0（0.0%，近 14 天）",
+            watch.format_bucket_counts(agents, self.NOW),
+        )
+
+    def test_daily_stats_other_count_uses_mainline_groups(self):
+        day = time.mktime((2026, 11, 9, 0, 0, 0, 0, 0, -1))
+        row = watch.daily_stats_row(
+            [agent("hp0-proof", project="other", status="complete",
+                   start=day + 3600, completion_time=day + 3600)],
+            day, now=day + 86400,
+        )
+        self.assertEqual(row["total"], "1")
+        self.assertEqual(row["other_count"], "0")
+        self.assertEqual(row["other_ratio"], "0.0")
 
 
 if __name__ == "__main__":

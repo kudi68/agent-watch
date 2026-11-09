@@ -121,6 +121,67 @@ class ArchiveStaleRunsTests(unittest.TestCase):
             "--now", str(self.NOW),
         ]), 2)
 
+    def test_dated_workspace_above_the_runs_root_is_not_a_card_date(self):
+        # F1: the fixture lives under <tmp>/20261110/... like the real TMPDIR
+        # does; that outer date must never age an undated row out.
+        workspace = self.base / "20261110" / "workspace"
+        workspace.mkdir(parents=True)
+        done = workspace / "agent-runs-done.tsv"
+        done.write_text(
+            f"no-stamp-log\t{workspace}/nowhere/run.log\t{workspace}/missing/REPORT.md\n"
+            f"no-stamp-report\t{workspace}/also-missing/run.log\t{workspace}/gone/REPORT.md\n"
+            f"dated-card\t{workspace}/20220101/dated/run.log\t{workspace}/missing/REPORT.md\n",
+            encoding="utf-8",
+        )
+        before = done.read_text(encoding="utf-8")
+        rc = archive_stale_runs.main([
+            "--done", str(done), "--now", str(self.NOW), "--apply", "--quiet",
+        ])
+        self.assertEqual(rc, 0)
+        after = done.read_text(encoding="utf-8")
+        self.assertIn("no-stamp-log", after)  # undated rows are never archived
+        self.assertIn("no-stamp-report", after)
+        self.assertNotIn("dated-card", after)
+        self.assertEqual(len(after.splitlines()), 2)
+        archive = workspace / "agent-runs-done.tsv.archive.tsv"
+        self.assertIn("dated-card", archive.read_text(encoding="utf-8"))
+        backups = list(workspace.glob("agent-runs-done.tsv.bak-awclean-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), before)
+
+    def test_row_timestamp_needs_a_date_below_the_runs_root(self):
+        # F1: a bare call cannot borrow the temp folder's own date.
+        workspace = self.base / "20261110" / "workspace"
+        workspace.mkdir(parents=True)
+        parts = ["unknown", f"{workspace}/nowhere/run.log",
+                 f"{workspace}/missing/REPORT.md"]
+        self.assertIsNone(archive_stale_runs.row_timestamp(parts, workspace))
+        # Outside the runs root nothing is trusted either.
+        self.assertIsNone(archive_stale_runs.row_timestamp(
+            parts, workspace / "deeper"))
+        # A real run folder below the root still resolves.
+        inside = ["dated", f"{workspace}/20220101/card/run.log", ""]
+        stamp = archive_stale_runs.row_timestamp(inside, workspace)
+        self.assertEqual(stamp, time.mktime((2022, 1, 1, 0, 0, 0, 0, 0, -1)))
+
+    def test_failed_archive_write_keeps_every_source_row(self):
+        # F2: a directory as --archive must abort before the source is cut.
+        self.write_done()
+        original = self.done.read_text(encoding="utf-8")
+        archive_dir = self.base / "archive-is-a-directory"
+        archive_dir.mkdir()
+        rc = archive_stale_runs.main([
+            "--done", str(self.done), "--archive", str(archive_dir),
+            "--now", str(self.NOW), "--apply", "--quiet",
+        ])
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.done.read_text(encoding="utf-8"), original)
+        self.assertTrue(archive_dir.is_dir())
+        self.assertEqual(list(archive_dir.iterdir()), [])
+        backups = list(self.base.glob("agent-runs-done.tsv.bak-awclean-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
+
 
 if __name__ == "__main__":
     unittest.main()
