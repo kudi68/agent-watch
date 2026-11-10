@@ -196,13 +196,80 @@ def mainline_status_path() -> Path:
     return _env_path(MAINLINE_STATUS_ENV, ROOT_DIR / MAINLINE_STATUS_FILENAME)
 
 
+# Continuation lines of a wrapped 主線現況 item start under the item column, so a
+# wrapped evidence path still reads as one item. Only indentation is added; no
+# character of the status line is ever dropped (F1).
+MAINLINE_STATUS_INDENT = " " * 10
+
+
+def wrap_mainline_text(text: str, width: int, indent: str = "",
+                       first_indent: str = "") -> List[str]:
+    """Wrap ``text`` to ``width`` display columns without dropping any character.
+
+    A long path may not fit one terminal line, so it is split at '/' or ｜/＋
+    boundaries when possible; joining the returned lines (minus ``indent``/
+    ``first_indent``) gives back ``text`` exactly. Nothing is replaced with an
+    ellipsis.
+    """
+    if width <= 0:
+        return [first_indent + text]
+    if display_width(indent) >= width:
+        indent = ""
+    if display_width(first_indent) >= width:
+        first_indent = ""
+    lines: List[str] = []
+    remaining = text
+    first = True
+    while remaining:
+        prefix = first_indent if first else indent
+        available = max(1, width - display_width(prefix))
+        if display_width(remaining) <= available:
+            lines.append(prefix + remaining)
+            break
+        used = 0
+        cut = 0
+        last_break = 0
+        for index, char in enumerate(remaining):
+            char_width = 0 if unicodedata.combining(char) else (
+                2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+            )
+            if used + char_width > available:
+                break
+            used += char_width
+            cut = index + 1
+            if char in "/｜＋（":
+                last_break = cut
+        # Prefer a readable break point, but never fall back to a much shorter line.
+        if last_break and last_break >= max(1, available // 2):
+            cut = last_break
+        if cut <= 0:
+            cut = 1
+        lines.append(prefix + remaining[:cut])
+        remaining = remaining[cut:]
+        first = False
+    return lines or [first_indent + text]
+
+
+def unwrap_mainline_text(text: str, indent: str = MAINLINE_STATUS_INDENT) -> str:
+    """Undo :func:`wrap_mainline_text` indentation so the full line can be checked."""
+    restored = []
+    for line in text.splitlines():
+        restored.append(line[len(indent):] if indent and line.startswith(indent) else line)
+    return "\n".join(restored)
+
+
 def mainline_status_text(width: int = 80, path: Optional[Path] = None) -> str:
-    """One line per item (狀態／離開條件／證據)；缺檔或讀不到時回明確占位，不拋例外。"""
+    """One block per item (狀態／離開條件／證據)；缺檔或讀不到時回明確占位，不拋例外。
+
+    長行換行顯示而不截斷，所以 --once（80 欄）與 TUI 都還原得到完整證據路徑；
+    面板本身可捲動，換行不影響判讀。
+    """
     target = Path(path) if path is not None else mainline_status_path()
     board = mainline_status.load_status_board(target)
-    lines = [truncate_display(
+    lines = wrap_mainline_text(
         f"主線現況 · {target.name} · {len(board.items)} 項 · {target}", width,
-    )]
+        indent=MAINLINE_STATUS_INDENT,
+    )
     if board.error:
         # 占位不截斷：路徑與原因要看得到，Static 會自動換行。
         lines.append(
@@ -210,10 +277,17 @@ def mainline_status_text(width: int = 80, path: Optional[Path] = None) -> str:
         )
         return "\n".join(lines)
     for item in board.items:
-        lines.append(truncate_display(
-            f"{item.status:<9} {item.item} │ 離開：{item.exit_condition or '—'}"
-            f" │ 證據：{item.evidence or '—'}",
-            width,
+        head = f"{item.status:<9} {item.item} │ 離開：{item.exit_condition or '—'}"
+        evidence = f"證據：{item.evidence or '—'}"
+        if display_width(f"{head} │ {evidence}") <= width:
+            lines.append(f"{head} │ {evidence}")
+            continue
+        # Over-wide item: keep 狀態＋項目 and put the evidence on its own wrapped
+        # lines instead of cutting the path away.
+        lines.extend(wrap_mainline_text(head, width, indent=MAINLINE_STATUS_INDENT))
+        lines.extend(wrap_mainline_text(
+            evidence, width, indent=MAINLINE_STATUS_INDENT,
+            first_indent=MAINLINE_STATUS_INDENT,
         ))
     return "\n".join(lines)
 

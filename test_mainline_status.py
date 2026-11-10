@@ -141,8 +141,8 @@ class PanelTextTests(unittest.TestCase):
             )
 
 
-class PanelWiringTests(unittest.TestCase):
-    """The panel must reach both entry points: the 工作 tab and --once."""
+class _WiringFixture(unittest.TestCase):
+    """Temp runs/state files shared by the 工作 tab and --once entry points."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -157,6 +157,10 @@ class PanelWiringTests(unittest.TestCase):
         self.payload = (
             Path(__file__).parent / "tests/fixtures/magpie_quota.json"
         ).read_text()
+
+
+class PanelWiringTests(_WiringFixture):
+    """The panel must reach both entry points: the 工作 tab and --once."""
 
     def test_once_output_prints_the_read_only_block(self):
         output = io.StringIO()
@@ -194,3 +198,130 @@ class PanelWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LONG_FORMAT = """# 主線現況（MAINLINE-STATUS）
+
+| 項目 | 狀態 | 離開條件 | 證據路徑 |
+|---|---|---|---|
+| 1.4 通知 | VERIFIED | 已達成；日後改通知路徑需重驗 | `/Users/kudi68-15mba/Projects/night/20261110/m1-8-rerun-accept-served/REPORT.md`（§3，10 筆 `notified … target=grok`） |
+| 1.9 乾淨 ACCEPTANCE | UNVERIFIED | `accept.py` 第 7 行不再原樣印 m1-8 REPORT 首行 `PARTIAL`，重跑得到無尾巴的 `ACCEPTANCE_OK` | `/Users/kudi68-15mba/Projects/night/20261110/m1-9-clean-acceptance/REPORT.md`（§5）＋同卡 `evidence/m19-clean-verdict.txt` |
+"""
+
+
+class WrappedEvidenceTests(unittest.TestCase):
+    """F1: a long evidence path must survive the 80-column --once render."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.source = Path(self._tmp.name) / "MAINLINE-STATUS.md"
+        self.source.write_text(LONG_FORMAT, encoding="utf-8")
+
+    def test_long_evidence_path_is_recoverable_and_never_ellipsised(self):
+        text = watch.mainline_status_text(80, path=self.source)
+        self.assertNotIn("…", text)
+        for line in text.splitlines():
+            self.assertLessEqual(watch.display_width(line), 80, line)
+        flat = watch.unwrap_mainline_text(text).replace("\n", "")
+        board = mainline_status.load_status_board(self.source)
+        self.assertEqual(len(board.items), 2)
+        for item in board.items:
+            self.assertIn(item.evidence, flat)
+        self.assertEqual(text.count("證據："), 2)
+
+    def test_every_item_keeps_its_evidence_label_when_wrapped(self):
+        text = watch.mainline_status_text(80, path=self.source)
+        flat = watch.unwrap_mainline_text(text).replace("\n", "")
+        for item in mainline_status.load_status_board(self.source).items:
+            self.assertIn(f"證據：{item.evidence}", flat)
+
+    def test_wrap_round_trip_keeps_every_character(self):
+        line = (
+            "VERIFIED  1.4 通知 │ 離開：已達成；日後改通知路徑需重驗"
+            " │ 證據：" + "/Users/kudi68-15mba/Projects/night/" * 4 + "REPORT.md"
+        )
+        for width in (30, 40, 80, 120):
+            lines = watch.wrap_mainline_text(line, width)
+            for rendered in lines:
+                self.assertLessEqual(watch.display_width(rendered), width, rendered)
+            restored = watch.unwrap_mainline_text("\n".join(lines)).replace("\n", "")
+            self.assertEqual(restored, line)
+
+
+class NegatedStatusTests(unittest.TestCase):
+    """F2: a negated status word must not be promoted to the positive status."""
+
+    def test_negated_verified_forms_stay_as_written(self):
+        for value in (
+            "UNVERIFIED",
+            "NOT_VERIFIED",
+            "UN-VERIFIED",
+            "NOT VERIFIED",
+            "NON_VERIFIED",
+            "未VERIFIED",
+            "非VERIFIED",
+        ):
+            with self.subTest(value=value):
+                self.assertNotEqual(mainline_status.normalize_status(value), "VERIFIED")
+                self.assertEqual(mainline_status.normalize_status(value), value)
+
+    def test_canonical_statuses_and_legacy_words_are_unchanged(self):
+        self.assertEqual(mainline_status.normalize_status("VERIFIED"), "VERIFIED")
+        self.assertEqual(mainline_status.normalize_status("PARTIAL"), "PARTIAL")
+        self.assertEqual(mainline_status.normalize_status("UNKNOWN"), "UNKNOWN")
+        self.assertEqual(mainline_status.normalize_status("BLOCKED"), "BLOCKED")
+        self.assertEqual(mainline_status.normalize_status("**PARTIAL**"), "PARTIAL")
+        self.assertEqual(mainline_status.normalize_status("DONE"), "VERIFIED")
+        self.assertEqual(mainline_status.normalize_status("FAIL"), "BLOCKED")
+        self.assertEqual(mainline_status.normalize_status("跑中"), "PARTIAL")
+        self.assertEqual(mainline_status.normalize_status("待確認"), "待確認")
+        self.assertEqual(mainline_status.normalize_status(""), "UNKNOWN")
+
+    def test_unverified_table_cell_is_not_upgraded(self):
+        items = mainline_status.parse_status_document(LONG_FORMAT)
+        self.assertEqual([item.status for item in items], ["VERIFIED", "UNVERIFIED"])
+
+
+class WheelWiringTests(_WiringFixture):
+    """F1 through the real entry points: --once at 80 columns and the TUI panel."""
+
+    def test_once_summary_at_80_columns_still_prints_the_whole_path(self):
+        self.status.write_text(LONG_FORMAT, encoding="utf-8")
+        output = io.StringIO()
+        with patch.dict(os.environ, {"AGENT_WATCH_MAINLINE_STATUS": str(self.status)}), \
+                patch("watch.subprocess.run", return_value=Mock(returncode=0, stdout=self.payload)), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(watch.run_once_summary(self.runs, self.done), 0)
+        printed = output.getvalue()
+        restored = printed.replace("\n" + watch.MAINLINE_STATUS_INDENT, "")
+        for item in mainline_status.load_status_board(self.status).items:
+            self.assertIn(item.evidence, restored)
+        section = restored.split("【主線現況")[1].split("資料提示")[0]
+        self.assertNotIn("…", section)
+
+    def test_work_tab_panel_holds_the_whole_path_for_scrolling(self):
+        self.status.write_text(LONG_FORMAT, encoding="utf-8")
+
+        async def run():
+            app = watch.AgentWatchApp(
+                runs_path=self.runs,
+                done_path=self.done,
+                state_path=self.root / "state.json",
+                mainline_status_file=self.status,
+            )
+            app.quota_svc.sessions_path = self.root
+            app.quota_svc.refresh_in_background = lambda force=False: False
+            async with app.run_test(size=(100, 40)) as pilot:
+                await pilot.pause()
+                body = app.query_one("#mainline-status-body", watch.Static)
+                scroller = app.query_one("#mainline-status-scroll", watch.VerticalScroll)
+                content = body.content
+                self.assertIsInstance(content, str)
+                flat = watch.unwrap_mainline_text(content).replace("\n", "")
+                for item in mainline_status.load_status_board(self.status).items:
+                    self.assertIn(item.evidence, flat)
+                self.assertTrue(scroller.is_scrollable)
+                self.assertFalse(app.ui_error)
+
+        asyncio.run(run())

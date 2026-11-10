@@ -355,11 +355,13 @@ keep their group. `other` is the fallback and never claims a card.
 
 ### 主線現況 panel
 
-The 工作 tab shows a read-only `MAINLINE-STATUS.md` panel above 需處理: one line per
-item with 狀態／離開條件／證據路徑 (`AGENT_WATCH_MAINLINE_STATUS` overrides the path,
-default `~/Projects/night/MAINLINE-STATUS.md`). A missing or unreadable file shows a
-placeholder line instead of failing; `--once` prints the same block. The panel never
-writes the status file.
+The 工作 tab shows a read-only `MAINLINE-STATUS.md` panel above 需處理: one item per
+block with 狀態／離開條件／證據路徑 (`AGENT_WATCH_MAINLINE_STATUS` overrides the path,
+default `~/Projects/night/MAINLINE-STATUS.md`). A long evidence path is wrapped onto
+continuation lines under the item instead of being truncated, so `--once` at 80
+columns and the scrollable TUI panel both keep the whole path; nothing is replaced
+with an ellipsis. A missing or unreadable file shows a placeholder line instead of
+failing; `--once` prints the same block. The panel never writes the status file.
 
 The bundled project table names the real projects this dashboard runs for:
 `personal-ai-os` (`pai`), `agent-watch` (`aw`, `awv10`, `awv9`), `ios-shortcuts`

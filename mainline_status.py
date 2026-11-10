@@ -50,6 +50,31 @@ _PIPE_SPLIT_RE = re.compile(r"\s*[|｜]\s*")
 _SEPARATOR_RE = re.compile(r"^[\s:|-]+$")
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
 
+# F2: a status word only counts as itself. A negation attached to it
+# (UNVERIFIED／NOT_VERIFIED／UN-VERIFIED／未VERIFIED…) must never be promoted to
+# the positive status, and the cell is then shown exactly as written.
+_NEGATIONS = ("UN", "NON", "NOT", "未", "非")
+_NEGATION_SEPARATORS = ("", "_", "-", " ", "／", "/")
+
+
+def _carries_status(upper: str, word: str) -> bool:
+    """True when ``upper`` holds ``word`` as a standalone, non-negated status."""
+    start = upper.find(word)
+    while start != -1:
+        before = upper[:start]
+        after = upper[start + len(word):]
+        negated = any(
+            before.endswith(negation + separator)
+            for negation in _NEGATIONS
+            for separator in _NEGATION_SEPARATORS
+        )
+        next_char = after[:1]
+        standalone = not (next_char.isascii() and next_char.isalpha())
+        if not negated and standalone:
+            return True
+        start = upper.find(word, start + 1)
+    return False
+
 
 @dataclass(frozen=True)
 class StatusItem:
@@ -81,11 +106,15 @@ def clean_cell(value: str) -> str:
 
 
 def normalize_status(value: str) -> str:
-    """A canonical status word when the cell has one, else the cell as written."""
+    """A canonical status word when the cell has one, else the cell as written.
+
+    ``UNVERIFIED``／``NOT_VERIFIED`` stay as written: a negated word is not the
+    status it contains (F2).
+    """
     text = clean_cell(value)
     upper = text.upper()
     for word in STATUS_WORDS:
-        if word in upper:
+        if _carries_status(upper, word):
             return word
     if upper in LEGACY_STATUS:
         return LEGACY_STATUS[upper]
